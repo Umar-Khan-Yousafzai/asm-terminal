@@ -561,6 +561,12 @@ section .data
     cursor_show           db 27, "[?25h"
     cursor_show_len       equ $ - cursor_show
 
+    ; --- Git branch detection (direct .git/HEAD read, no fork) ---
+    str_git_head    db "/.git/HEAD", 0
+    str_ref_prefix  db "ref: refs/heads/", 0
+    git_prompt_pre  db 27, "[33m (", 0     ; " ("  in yellow
+    git_prompt_post db ")", 27, "[0m", 0   ; ")"
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -834,6 +840,9 @@ section .bss
     winch_sigaction_buf resb 32            ; sigaction struct for SIGWINCH
     merged_envp         resq 256            ; argv-style envp for child: 256 slots
     merged_envp_count   resd 1
+    git_scratch_path    resb 4096          ; for walking up looking for .git
+    git_head_buf        resb 512           ; contents of .git/HEAD
+    git_branch          resb 128           ; extracted branch name (or NUL)
     tab_dirent_pos      resd 1      ; current position in dirent buffer
     tab_dirent_end      resd 1      ; end of valid data in dirent buffer
     tab_dirent_offset   resd 1      ; alias for offset tracking
@@ -8347,6 +8356,8 @@ print_prompt:
     mov [prompt_total_len], eax
 
 .pp_done:
+    call print_git_branch_if_any
+
     ; OSC 133 B — prompt rendering finished, command entry begins
     lea rdi, [osc133_b]
     call print_cstring
@@ -8357,6 +8368,184 @@ print_prompt:
     pop rbp
     ret
 
+; ============================================================================
+; read_git_branch - walk up from cwd looking for .git/HEAD; on success,
+; write branch name (or short SHA) into git_branch + NUL. On failure,
+; git_branch[0] = 0.
+; ============================================================================
+read_git_branch:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 16
+
+    mov byte [git_branch], 0
+
+    lea rdi, [git_scratch_path]
+    mov esi, 4000
+    mov eax, SYS_GETCWD
+    syscall
+    test rax, rax
+    jle .rgb_done
+
+    ; r12 = length of cwd string
+    lea rdi, [git_scratch_path]
+    call str_len
+    mov r12d, eax
+
+.rgb_try_here:
+    ; Append "/.git/HEAD" at offset r12
+    lea rdi, [git_scratch_path + r12]
+    lea rsi, [str_git_head]
+    call str_copy
+
+    ; Open the candidate file
+    lea rdi, [git_scratch_path]
+    mov esi, O_RDONLY
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    jns .rgb_opened
+
+    ; Not here — truncate git_scratch_path at last '/' and retry
+    mov byte [git_scratch_path + r12], 0
+    mov r13d, r12d
+    test r13d, r13d
+    jz .rgb_done
+    dec r13d
+.rgb_trunc:
+    cmp r13d, 0
+    jl .rgb_done
+    cmp byte [git_scratch_path + r13], '/'
+    je .rgb_trunc_hit
+    dec r13d
+    jmp .rgb_trunc
+.rgb_trunc_hit:
+    ; don't slice off the leading '/' root itself
+    test r13d, r13d
+    jz .rgb_done
+    mov byte [git_scratch_path + r13], 0
+    mov r12d, r13d
+    jmp .rgb_try_here
+
+.rgb_opened:
+    mov ebx, eax                        ; fd
+    mov edi, ebx
+    lea rsi, [git_head_buf]
+    mov edx, 511
+    mov eax, SYS_READ
+    syscall
+    mov r14d, eax
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+
+    test r14d, r14d
+    jle .rgb_done
+    mov byte [git_head_buf + r14], 0
+
+    ; If starts with "ref: refs/heads/", copy branch name; else copy
+    ; first 8 chars of SHA for a detached HEAD.
+    lea rsi, [str_ref_prefix]
+    lea rdi, [git_head_buf]
+    call str_startswith
+    test eax, eax
+    jz .rgb_detached
+
+    lea rsi, [git_head_buf + 16]       ; skip prefix
+    lea rdi, [git_branch]
+    xor ecx, ecx
+.rgb_copy_branch:
+    movzx eax, byte [rsi + rcx]
+    cmp al, 0
+    je .rgb_cb_end
+    cmp al, 10
+    je .rgb_cb_end
+    cmp al, 13
+    je .rgb_cb_end
+    cmp ecx, 127
+    jge .rgb_cb_end
+    mov [rdi + rcx], al
+    inc ecx
+    jmp .rgb_copy_branch
+.rgb_cb_end:
+    mov byte [rdi + rcx], 0
+    jmp .rgb_done
+
+.rgb_detached:
+    ; Detached HEAD: copy first 8 chars
+    lea rsi, [git_head_buf]
+    lea rdi, [git_branch]
+    xor ecx, ecx
+.rgb_copy_sha:
+    movzx eax, byte [rsi + rcx]
+    cmp al, 0
+    je .rgb_sha_end
+    cmp al, 10
+    je .rgb_sha_end
+    cmp ecx, 8
+    jge .rgb_sha_end
+    mov [rdi + rcx], al
+    inc ecx
+    jmp .rgb_copy_sha
+.rgb_sha_end:
+    mov byte [rdi + rcx], 0
+
+.rgb_done:
+    add rsp, 16
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; str_startswith(rdi=haystack, rsi=prefix) -> eax=1 if haystack starts with prefix
+str_startswith:
+    xor eax, eax
+.ssw_loop:
+    movzx ecx, byte [rsi]
+    test cl, cl
+    jz .ssw_yes
+    movzx edx, byte [rdi]
+    cmp cl, dl
+    jne .ssw_no
+    inc rdi
+    inc rsi
+    jmp .ssw_loop
+.ssw_yes:
+    mov eax, 1
+    ret
+.ssw_no:
+    xor eax, eax
+    ret
+
+; ============================================================================
+; print_git_branch_if_any - emit " (branch)" in yellow if cwd is in a repo
+; ============================================================================
+print_git_branch_if_any:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+
+    call read_git_branch
+    cmp byte [git_branch], 0
+    je .pgb_done
+
+    lea rdi, [git_prompt_pre]
+    call print_cstring
+    lea rdi, [git_branch]
+    call print_cstring
+    lea rdi, [git_prompt_post]
+    call print_cstring
+
+.pgb_done:
+    leave
+    ret
 
 ; ============================================================================
 ; check_command_exists - Check if word matches any command in dispatch tables
