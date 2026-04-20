@@ -502,6 +502,12 @@ section .data
     err_source_open db "Error: source: could not open file.", 10, 0
     err_source_o_len equ $ - err_source_open - 1
 
+    ; --- Bracketed paste mode enable/disable sequences ---
+    bracketed_paste_on  db 27, "[?2004h"
+    bracketed_paste_on_len equ $ - bracketed_paste_on
+    bracketed_paste_off db 27, "[?2004l"
+    bracketed_paste_off_len equ $ - bracketed_paste_off
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -1011,6 +1017,12 @@ setup_raw_mode:
     lea rdx, [raw_termios]
     syscall
 
+    ; Enable bracketed paste mode so pasted content is wrapped in
+    ; ESC[200~ ... ESC[201~ markers we can consume in read_key.
+    lea rdi, [bracketed_paste_on]
+    mov esi, bracketed_paste_on_len
+    call print_string_len
+
     leave
     ret
 
@@ -1021,6 +1033,12 @@ setup_raw_mode:
 restore_terminal:
     push rbp
     mov rbp, rsp
+    sub rsp, 16
+
+    ; Disable bracketed paste mode before restoring termios
+    lea rdi, [bracketed_paste_off]
+    mov esi, bracketed_paste_off_len
+    call print_string_len
 
     ; ioctl(STDIN_FD, TCSETS, &orig_termios)
     mov eax, SYS_IOCTL
@@ -1213,9 +1231,43 @@ read_key:
     je .rk_maybe_home_ext
     cmp bl, '4'
     je .rk_maybe_end_ext
+    cmp bl, '2'
+    je .rk_maybe_paste
 
     ; Unknown CSI sequence
     jmp .rk_done
+
+.rk_maybe_paste:
+    ; Bracketed paste: ESC[200~ (start) or ESC[201~ (end). Consume
+    ; up to and including '~' so it never enters the edit buffer.
+    mov eax, SYS_READ
+    mov edi, STDIN_FD
+    lea rsi, [key_buf + 3]
+    mov edx, 1
+    syscall
+    cmp eax, 1
+    jne .rk_done
+    cmp byte [key_buf + 3], '0'
+    jne .rk_done                    ; not 20...; give up
+    mov eax, SYS_READ
+    mov edi, STDIN_FD
+    lea rsi, [key_buf + 4]
+    mov edx, 1
+    syscall
+    cmp eax, 1
+    jne .rk_done
+    ; Skip any remaining chars up to '~' (paste markers are short)
+.rk_paste_skip:
+    mov eax, SYS_READ
+    mov edi, STDIN_FD
+    lea rsi, [key_buf + 5]
+    mov edx, 1
+    syscall
+    cmp eax, 1
+    jne .rk_done
+    cmp byte [key_buf + 5], '~'
+    je .rk_done                     ; marker consumed, key was 0 → nothing inserted
+    jmp .rk_paste_skip
 
 .rk_maybe_delete:
     ; Read the tilde
