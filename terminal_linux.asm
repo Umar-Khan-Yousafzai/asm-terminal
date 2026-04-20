@@ -1743,6 +1743,7 @@ read_line:
     je .rl_ctrl_u
     cmp r12d, 18            ; Ctrl+R = reverse history search
     je .rl_ctrl_r
+<<<<<<< HEAD
     cmp r12d, 1             ; Ctrl+A = beginning of line (alias of Home)
     je .rl_home
     cmp r12d, 5             ; Ctrl+E = end of line (alias of End)
@@ -1759,6 +1760,8 @@ read_line:
     je .rl_ctrl_k
     cmp r12d, 25            ; Ctrl+Y = yank kill buffer at cursor
     je .rl_ctrl_y
+    cmp r12d, 4             ; Ctrl+D = EOF (empty) / delete-char
+    je .rl_ctrl_d
     cmp r12d, 32
     jb .rl_loop
     cmp r12d, 126
@@ -1939,11 +1942,9 @@ read_line:
     movzx eax, byte [rsi + r8]
     test al, al
     jz .rl_cy_done
-    ; Buffer full?
     mov ecx, [line_len]
     cmp ecx, MAX_INPUT - 2
     jge .rl_cy_done
-    ; Shift right from cursor to make room for 1 char
     mov edx, [line_cursor]
 .rl_cy_shift:
     cmp ecx, edx
@@ -1963,6 +1964,33 @@ read_line:
     inc r8d
     jmp .rl_cy_loop
 .rl_cy_done:
+    call redraw_line
+    jmp .rl_loop
+
+; --- Ctrl+D: EOF on empty line, else delete-char at cursor ---
+.rl_ctrl_d:
+    mov ecx, [line_len]
+    test ecx, ecx
+    jnz .rl_cd_delete
+    call print_newline
+    call restore_terminal
+    xor edi, edi
+    mov eax, SYS_EXIT
+    syscall
+.rl_cd_delete:
+    mov edx, [line_cursor]
+    cmp edx, ecx
+    jge .rl_loop
+    lea rdi, [line_buf]
+.rl_cd_shift:
+    mov al, [rdi + rdx + 1]
+    mov [rdi + rdx], al
+    inc edx
+    cmp edx, ecx
+    jl .rl_cd_shift
+    dec dword [line_len]
+    mov edx, [line_len]
+    mov byte [rdi + rdx], 0
     call redraw_line
     jmp .rl_loop
 
