@@ -526,6 +526,13 @@ section .data
     osc7_prefix_len equ $ - osc7_prefix - 1
     osc7_bel        db 7, 0
 
+    ; --- OSC 133 shell integration markers ---
+    osc133_a        db 27, "]133;A", 7, 0       ; prompt start
+    osc133_b        db 27, "]133;B", 7, 0       ; command start
+    osc133_c        db 27, "]133;C", 7, 0       ; output start
+    osc133_d_pre    db 27, "]133;D;", 0         ; end prefix
+    osc133_bel      db 7, 0
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -1027,8 +1034,20 @@ main:
     lea rdi, [input_buf]
     call history_save_entry
 
+    ; OSC 133 C — output region begins
+    lea rdi, [osc133_c]
+    call print_cstring
+
     ; Execute command (supports ; and && compound commands)
     call execute_compound
+
+    ; OSC 133 D;<exit_status> — end of command + exit code
+    lea rdi, [osc133_d_pre]
+    call print_cstring
+    mov eax, [last_exit_status]
+    call print_number
+    lea rdi, [osc133_bel]
+    call print_cstring
 
     jmp .main_loop
 
@@ -7736,6 +7755,11 @@ print_prompt:
     push r12
     sub rsp, 16
 
+    ; OSC 133 A — mark the start of a new prompt region
+    lea rdi, [osc133_a]
+    call print_cstring
+
+    ; OSC 7 — emit cwd for terminal integration
     call emit_osc7_cwd
 
     mov eax, [current_theme]
@@ -7839,6 +7863,10 @@ print_prompt:
     mov [prompt_total_len], eax
 
 .pp_done:
+    ; OSC 133 B — prompt rendering finished, command entry begins
+    lea rdi, [osc133_b]
+    call print_cstring
+
     add rsp, 16
     pop r12
     pop rbx
