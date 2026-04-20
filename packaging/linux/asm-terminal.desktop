@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ASM Terminal
+GenericName=Terminal
+Comment=x86-64 assembly shell — fully-featured bash alternative, zero libc dependencies
+TryExec=asm-terminal-launch
+Exec=asm-terminal-launch
+Icon=asm-terminal
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=shell;terminal;asm;assembly;
+StartupNotify=true
+StartupWMClass=asm-terminal
