@@ -782,6 +782,10 @@ section .bss
     interactive_mode    resb 1             ; 1 = stdin & stdout are tty
     color_enabled       resb 1             ; 1 = ANSI/color permitted
     termios_probe_buf   resb 60             ; scratch for ioctl probe
+    winch_pending       resb 1             ; set by SIGWINCH handler
+    term_rows           resw 1             ; cached from TIOCGWINSZ
+    term_cols           resw 1             ; cached from TIOCGWINSZ
+    winch_sigaction_buf resb 32            ; sigaction struct for SIGWINCH
     tab_dirent_pos      resd 1      ; current position in dirent buffer
     tab_dirent_end      resd 1      ; end of valid data in dirent buffer
     tab_dirent_offset   resd 1      ; alias for offset tracking
@@ -949,6 +953,7 @@ main:
 
     ; Install SIGINT handler
     call setup_sigint
+    call setup_sigwinch
 
     ; Initialize state variables
     mov byte [has_prev_dir], 0
@@ -982,6 +987,13 @@ main:
 .main_loop:
     ; --- Reap any finished background jobs ---
     call reap_finished_jobs
+
+    ; --- Refresh terminal size if a SIGWINCH was observed ---
+    cmp byte [winch_pending], 0
+    je .main_no_winch
+    mov byte [winch_pending], 0
+    call update_term_size
+.main_no_winch:
 
     cmp byte [interactive_mode], 0
     je .main_noninteractive
@@ -1253,6 +1265,69 @@ setup_sigint:
 ; ============================================================================
 sigint_handler:
     mov byte [ctrl_c_flag], 1
+    ret
+
+; ============================================================================
+; setup_sigwinch - install SIGWINCH handler so terminal resize is observable
+; ============================================================================
+setup_sigwinch:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+
+    lea rax, [winch_sigaction_buf]
+    lea rcx, [sigwinch_handler]
+    mov [rax], rcx
+    mov qword [rax + 8], SA_RESTORER | SA_RESTART
+    lea rcx, [sig_restorer]
+    mov [rax + 16], rcx
+    mov qword [rax + 24], 0
+
+    mov eax, SYS_RT_SIGACTION
+    mov edi, 28                     ; SIGWINCH
+    lea rsi, [winch_sigaction_buf]
+    xor edx, edx
+    mov r10d, 8
+    syscall
+
+    ; Prime the rows/cols cache
+    call update_term_size
+
+    leave
+    ret
+
+; ============================================================================
+; sigwinch_handler - signal handler for SIGWINCH; defers work to main loop
+; ============================================================================
+sigwinch_handler:
+    mov byte [winch_pending], 1
+    ret
+
+; ============================================================================
+; update_term_size - ioctl(TIOCGWINSZ) -> term_rows / term_cols
+; Async-signal unsafe; must be called from main loop after signal observed.
+; winsize layout: ushort row; ushort col; ushort xpix; ushort ypix.
+; ============================================================================
+update_term_size:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+
+    mov eax, SYS_IOCTL
+    mov edi, 1                      ; STDOUT
+    mov esi, TIOCGWINSZ
+    lea rdx, [winsize_buf]
+    syscall
+    test rax, rax
+    js .uts_done
+
+    movzx eax, word [winsize_buf]
+    mov [term_rows], ax
+    movzx eax, word [winsize_buf + 2]
+    mov [term_cols], ax
+
+.uts_done:
+    leave
     ret
 
 ; ============================================================================
