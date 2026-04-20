@@ -691,7 +691,7 @@ section .bss
     ; Path and general buffers
     path_buf            resb MAX_PATH_BUF
     cmd_line_buf        resb 1024
-    num_buf             resb 16
+    num_buf             resb 32            ; up to 20 digits for 64-bit + padding
     file_path_buf       resb MAX_PATH_BUF
     read_buffer         resb READ_BUF_SIZE
 
@@ -4762,7 +4762,8 @@ print_number_2digit:
     ret
 
 ; ---------- print_number_9pad ----------
-; Print eax right-aligned in a 9-character field (space-padded).
+; Print rax (64-bit unsigned) right-aligned. Field width is at least 9 chars
+; (space-padded); numbers longer than 9 digits extend the field naturally.
 print_number_9pad:
     push rbp
     mov rbp, rsp
@@ -4770,33 +4771,35 @@ print_number_9pad:
     push r12
     sub rsp, 16
 
-    ; Fill num_buf with 9 spaces + null
-    lea r12, [num_buf]
-    mov ecx, 9
-.np9_fill:
-    mov byte [r12 + rcx - 1], ' '
-    dec ecx
-    jnz .np9_fill
-    mov byte [r12 + 9], 0
-
-    ; Convert number right-to-left
-    lea r12, [num_buf + 8]
-    mov ebx, 10
-    test eax, eax
+    ; Convert number right-to-left starting from num_buf+23.
+    lea r12, [num_buf + 23]
+    mov byte [r12 + 1], 0           ; null-terminate at slot 24
+    mov rbx, 10
+    test rax, rax
     jnz .np9_loop
     mov byte [r12], '0'
-    jmp .np9_print
+    dec r12
+    jmp .np9_pad
 .np9_loop:
-    test eax, eax
-    jz .np9_print
+    test rax, rax
+    jz .np9_pad
     xor edx, edx
-    div ebx
+    div rbx                         ; 64-bit divide: rdx:rax / rbx → rax, rem rdx
     add dl, '0'
     mov [r12], dl
     dec r12
     jmp .np9_loop
+.np9_pad:
+    ; Pad to at least 9 chars by filling spaces to the left.
+    lea rcx, [num_buf + 14]         ; = num_buf + 23 - 9 = first of 9-char window
+.np9_pad_loop:
+    cmp r12, rcx
+    jb .np9_print                   ; already wider than 9 chars
+    mov byte [r12], ' '
+    dec r12
+    jmp .np9_pad_loop
 .np9_print:
-    lea rdi, [num_buf]
+    lea rdi, [r12 + 1]
     call print_cstring
 
     add rsp, 16
@@ -6236,7 +6239,7 @@ handler_ls:
     lea rdi, [str_two_spaces]
     call print_cstring
 
-    mov eax, [stat_buf + STAT_ST_SIZE]
+    mov rax, [stat_buf + STAT_ST_SIZE]   ; full 64-bit size
     call print_number_9pad
     lea rdi, [str_space]
     call print_cstring
@@ -6268,7 +6271,7 @@ handler_ls:
     lea rdi, [str_two_spaces]
     call print_cstring
 
-    mov eax, [stat_buf + STAT_ST_SIZE]
+    mov rax, [stat_buf + STAT_ST_SIZE]   ; full 64-bit size
     call print_number_9pad
     lea rdi, [str_space]
     call print_cstring
@@ -6300,7 +6303,7 @@ handler_ls:
     lea rdi, [str_two_spaces]
     call print_cstring
 
-    mov eax, [stat_buf + STAT_ST_SIZE]
+    mov rax, [stat_buf + STAT_ST_SIZE]   ; full 64-bit size
     call print_number_9pad
     lea rdi, [str_space]
     call print_cstring
