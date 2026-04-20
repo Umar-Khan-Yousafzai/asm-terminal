@@ -2512,7 +2512,9 @@ expand_env_vars:
     cmp al, '$'
     je .ev_dollar
 
-    ; Regular character -- copy through
+    ; Regular character -- copy through (bounded)
+    cmp r13, r14
+    jae .ev_done
     mov [r13], al
     inc r12
     inc r13
@@ -2588,14 +2590,20 @@ expand_env_vars:
     jmp .ev_loop
 
 .ev_literal_dollar:
+    cmp r13, r14
+    jae .ev_done
     mov byte [r13], '$'
     inc r13
     jmp .ev_loop
 
 .ev_literal_dollar_brace:
     ; Unterminated ${ -- copy literal "${" and continue
+    cmp r13, r14
+    jae .ev_done
     mov byte [r13], '$'
     inc r13
+    cmp r13, r14
+    jae .ev_done
     mov byte [r13], '{'
     inc r13
     jmp .ev_loop
@@ -2607,12 +2615,14 @@ expand_env_vars:
     test rax, rax
     jz .ev_loop                     ; variable not found, output nothing
 
-    ; Copy value to output
+    ; Copy value to output (bounded)
     mov rcx, rax
 .ev_cpval:
     movzx eax, byte [rcx]
     test al, al
     jz .ev_loop
+    cmp r13, r14
+    jae .ev_done
     mov [r13], al
     inc r13
     inc rcx
