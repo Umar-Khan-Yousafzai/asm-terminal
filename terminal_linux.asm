@@ -748,6 +748,7 @@ section .bss
     tab_dir_fd          resd 1      ; fd for opendir equivalent
     tab_find_handle     resq 1      ; alias for compatibility
     tab_dirent_buf      resb 8192
+    kill_buf            resb 512           ; Ctrl+K kill target / Ctrl+Y source
     tab_dirent_pos      resd 1      ; current position in dirent buffer
     tab_dirent_end      resd 1      ; end of valid data in dirent buffer
     tab_dirent_offset   resd 1      ; alias for offset tracking
@@ -1359,6 +1360,10 @@ read_line:
     je .rl_ctrl_u
     cmp r12d, 18            ; Ctrl+R = reverse history search
     je .rl_ctrl_r
+    cmp r12d, 11            ; Ctrl+K = kill from cursor to end of line
+    je .rl_ctrl_k
+    cmp r12d, 25            ; Ctrl+Y = yank kill buffer at cursor
+    je .rl_ctrl_y
     cmp r12d, 32
     jb .rl_loop
     cmp r12d, 126
@@ -1500,6 +1505,70 @@ read_line:
     call print_string_len
 .rl_ctrl_l_cur:
     call update_cursor_pos
+    jmp .rl_loop
+
+; --- Ctrl+K: Kill from cursor to end of line into kill_buf ---
+.rl_ctrl_k:
+    mov ecx, [line_cursor]
+    mov eax, [line_len]
+    cmp ecx, eax
+    jge .rl_loop                    ; nothing right of cursor
+    lea rdi, [line_buf]
+    lea rsi, [kill_buf]
+    mov edx, ecx                    ; src index
+    xor r8d, r8d                    ; dst index
+.rl_ck_copy:
+    cmp edx, eax
+    jge .rl_ck_done
+    mov r9b, [rdi + rdx]
+    mov [rsi + r8], r9b
+    inc edx
+    inc r8d
+    cmp r8d, 511
+    jge .rl_ck_done
+    jmp .rl_ck_copy
+.rl_ck_done:
+    mov byte [rsi + r8], 0
+    mov [line_len], ecx
+    mov byte [rdi + rcx], 0
+    call redraw_line
+    jmp .rl_loop
+
+; --- Ctrl+Y: Yank kill_buf at cursor position ---
+.rl_ctrl_y:
+    cmp byte [kill_buf], 0
+    je .rl_loop                    ; nothing to yank
+    lea rsi, [kill_buf]
+    xor r8d, r8d                    ; kill_buf index
+.rl_cy_loop:
+    movzx eax, byte [rsi + r8]
+    test al, al
+    jz .rl_cy_done
+    ; Buffer full?
+    mov ecx, [line_len]
+    cmp ecx, MAX_INPUT - 2
+    jge .rl_cy_done
+    ; Shift right from cursor to make room for 1 char
+    mov edx, [line_cursor]
+.rl_cy_shift:
+    cmp ecx, edx
+    jle .rl_cy_ins
+    lea rdi, [line_buf]
+    mov r9b, [rdi + rcx - 1]
+    mov [rdi + rcx], r9b
+    dec ecx
+    jmp .rl_cy_shift
+.rl_cy_ins:
+    lea rdi, [line_buf]
+    mov [rdi + rdx], al
+    inc dword [line_len]
+    inc dword [line_cursor]
+    mov ecx, [line_len]
+    mov byte [rdi + rcx], 0
+    inc r8d
+    jmp .rl_cy_loop
+.rl_cy_done:
+    call redraw_line
     jmp .rl_loop
 
 ; --- Ctrl+W: Delete word backward from cursor ---
