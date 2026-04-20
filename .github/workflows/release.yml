@@ -153,57 +153,27 @@ jobs:
 
       # ---- OPTIONAL signing steps (run only when the corresponding secret exists) ----
 
-      - name: Sign setup.exe with Azure Trusted Signing
-        if: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT != '' }}
-        uses: azure/trusted-signing-action@v0.4.0
-        env:
-          AZURE_TENANT_ID:                   ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID:                   ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET:               ${{ secrets.AZURE_CLIENT_SECRET }}
-        with:
-          endpoint:                ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_PROFILE }}
-          files-folder: dist
-          files-folder-filter: exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Sign setup.exe with a local .pfx (CODE_SIGN_PFX_BASE64 secret)
-        if: ${{ secrets.CODE_SIGN_PFX_BASE64 != '' && secrets.AZURE_TRUSTED_SIGNING_ACCOUNT == '' }}
+      # ---- Optional code-signing (runs only when a PFX secret is set) --------
+      # For Azure Trusted Signing, use AzureSignTool.exe externally or see
+      # packaging/windows/SIGNING.md. This workflow supports the simplest path:
+      # a base64-encoded PFX stored in CODE_SIGN_PFX_BASE64.
+      - name: Sign setup.exe with PFX (if secret is set)
+        if: ${{ secrets.CODE_SIGN_PFX_BASE64 != '' }}
         shell: pwsh
         env:
           CODE_SIGN_PFX_BASE64: ${{ secrets.CODE_SIGN_PFX_BASE64 }}
           CODE_SIGN_PFX_PASSWORD: ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
         run: |
-          $pfxPath = "$env:RUNNER_TEMP\codesign.pfx"
-          [System.IO.File]::WriteAllBytes(
-              $pfxPath,
-              [Convert]::FromBase64String($env:CODE_SIGN_PFX_BASE64))
-          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-          if (-not $signtool) { throw "signtool.exe not found" }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [System.IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODE_SIGN_PFX_BASE64))
+          $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          if (-not $signtool) { throw 'signtool.exe not found' }
           Get-ChildItem dist\*setup.exe | ForEach-Object {
-              & $signtool sign `
-                  /fd SHA256 `
-                  /tr http://timestamp.digicert.com `
-                  /td SHA256 `
-                  /f $pfxPath `
-                  /p $env:CODE_SIGN_PFX_PASSWORD `
-                  $_.FullName
+              & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfxPath /p $env:CODE_SIGN_PFX_PASSWORD $_.FullName
+              if ($LASTEXITCODE -ne 0) { throw "signtool exited $LASTEXITCODE" }
+              & $signtool verify /pa /all $_.FullName
           }
           Remove-Item $pfxPath -Force
-
-      - name: Verify signature (informational)
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-          if ($signtool) {
-              Get-ChildItem dist\*setup.exe | ForEach-Object {
-                  & $signtool verify /pa /all $_.FullName
-              }
-          }
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
