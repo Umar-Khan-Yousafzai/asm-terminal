@@ -3554,17 +3554,138 @@ handler_time:
 handler_echo:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
+    push rbx
+    push r12
+    sub rsp, 8
 
     test rdi, rdi
     jz .he_empty
     cmp byte [rdi], 0
     je .he_empty
 
+    mov rbx, rdi                    ; rbx = current arg ptr
+    xor r12d, r12d                  ; r12 bit 0 = -n, bit 1 = -e
+
+    ; --- Parse leading flags ---
+.he_flag_loop:
+    ; skip spaces between flags
+.he_skip_sp:
+    cmp byte [rbx], ' '
+    jne .he_check_flag
+    inc rbx
+    jmp .he_skip_sp
+.he_check_flag:
+    cmp byte [rbx], '-'
+    jne .he_parse_done
+    cmp byte [rbx + 1], 'n'
+    jne .he_try_e
+    cmp byte [rbx + 2], 0
+    je .he_set_n
+    cmp byte [rbx + 2], ' '
+    jne .he_parse_done
+.he_set_n:
+    or r12d, 1
+    add rbx, 2
+    jmp .he_flag_loop
+.he_try_e:
+    cmp byte [rbx + 1], 'e'
+    jne .he_parse_done
+    cmp byte [rbx + 2], 0
+    je .he_set_e
+    cmp byte [rbx + 2], ' '
+    jne .he_parse_done
+.he_set_e:
+    or r12d, 2
+    add rbx, 2
+    jmp .he_flag_loop
+
+.he_parse_done:
+    ; Skip one leading space after flags
+    cmp byte [rbx], ' '
+    jne .he_emit
+    inc rbx
+
+.he_emit:
+    ; If -e, expand backslash escapes into a temp buffer; else print as-is
+    test r12d, 2
+    jnz .he_expand
+    mov rdi, rbx
     call print_cstring
+    jmp .he_terminator
+
+.he_expand:
+    lea rdi, [env_expand_buf]       ; reuse 1 KB scratch
+    mov rsi, rbx
+.he_exp_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .he_exp_done
+    cmp al, '\'
+    jne .he_exp_copy
+    movzx eax, byte [rsi + 1]
+    cmp al, 'n'
+    je .he_exp_newline
+    cmp al, 't'
+    je .he_exp_tab
+    cmp al, 'r'
+    je .he_exp_cr
+    cmp al, '\'
+    je .he_exp_back
+    cmp al, '0'
+    je .he_exp_nul
+    ; unknown escape -> keep literal backslash
+    mov byte [rdi], '\'
+    inc rdi
+    inc rsi
+    jmp .he_exp_loop
+
+.he_exp_newline:
+    mov byte [rdi], 10
+    inc rdi
+    add rsi, 2
+    jmp .he_exp_loop
+.he_exp_tab:
+    mov byte [rdi], 9
+    inc rdi
+    add rsi, 2
+    jmp .he_exp_loop
+.he_exp_cr:
+    mov byte [rdi], 13
+    inc rdi
+    add rsi, 2
+    jmp .he_exp_loop
+.he_exp_back:
+    mov byte [rdi], '\'
+    inc rdi
+    add rsi, 2
+    jmp .he_exp_loop
+.he_exp_nul:
+    add rsi, 2
+    jmp .he_exp_loop                ; drop NULs silently (can't embed in cstring)
+
+.he_exp_copy:
+    mov byte [rdi], al
+    inc rdi
+    inc rsi
+    jmp .he_exp_loop
+
+.he_exp_done:
+    mov byte [rdi], 0
+    lea rdi, [env_expand_buf]
+    call print_cstring
+
+.he_terminator:
+    test r12d, 1
+    jnz .he_done                    ; -n suppresses trailing newline
+    call print_newline
+    jmp .he_done
 
 .he_empty:
     call print_newline
+.he_done:
+    add rsp, 8
+    pop r12
+    pop rbx
     leave
     ret
 
