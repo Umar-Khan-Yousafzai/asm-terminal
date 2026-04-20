@@ -113,7 +113,7 @@ default rel
 ; ============================================================================
 %define MAX_INPUT           512
 %define MAX_PATH_BUF        4096    ; Linux paths can be much longer than Windows
-%define HISTORY_COUNT       32
+%define HISTORY_COUNT       500
 %define HISTORY_ENTRY_SIZE  512
 %define ALIAS_COUNT         32
 %define ALIAS_NAME_SIZE     64
