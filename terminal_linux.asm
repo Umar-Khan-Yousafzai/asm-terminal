@@ -502,6 +502,12 @@ section .data
     err_source_open db "Error: source: could not open file.", 10, 0
     err_source_o_len equ $ - err_source_open - 1
 
+    ; --- Cursor shape reset (DECSCUSR 0) + show cursor (DECSET 25) ---
+    cursor_shape_reset    db 27, "[0 q"
+    cursor_shape_reset_len equ $ - cursor_shape_reset
+    cursor_show           db 27, "[?25h"
+    cursor_show_len       equ $ - cursor_show
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -1021,6 +1027,16 @@ setup_raw_mode:
 restore_terminal:
     push rbp
     mov rbp, rsp
+    sub rsp, 16
+
+    ; Restore cursor shape to user default and make sure it's visible.
+    ; A TUI child (helix, nvim, yazi, htop) may have changed either.
+    lea rdi, [cursor_shape_reset]
+    mov esi, cursor_shape_reset_len
+    call print_string_len
+    lea rdi, [cursor_show]
+    mov esi, cursor_show_len
+    call print_string_len
 
     ; ioctl(STDIN_FD, TCSETS, &orig_termios)
     mov eax, SYS_IOCTL
