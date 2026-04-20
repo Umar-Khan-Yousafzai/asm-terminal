@@ -19,8 +19,13 @@ fail=0
 failures=()
 
 strip_ansi() {
-    # Remove ANSI CSI + OSC + K/G codes so grep works on raw command output
-    sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b\][^\x07]*\x07//g'
+    # CSI sequences with optional intermediate bytes (e.g. DECSCUSR "0 q"),
+    # OSC 7 and OSC 133 markers, and stray BEL (0x07) terminators.
+    sed -E '
+        s/\x1b\[[0-9;?]*[ ]*[@A-Za-z~]//g;
+        s/\x1b\][^\x07\x1b]*(\x07|\x1b\\)//g;
+        s/\x07//g
+    '
 }
 
 run_case() {
