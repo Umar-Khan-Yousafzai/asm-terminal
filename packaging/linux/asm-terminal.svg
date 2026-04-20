@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a1a1a"/>
+      <stop offset="100%" stop-color="#0a0a0a"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="1.5"/>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="28" ry="28" fill="url(#bg)" stroke="#2f2f2f" stroke-width="2"/>
+  <!-- Title bar -->
+  <rect x="6" y="6" width="244" height="26" rx="10" ry="10" fill="#1f1f1f"/>
+  <circle cx="22" cy="19" r="5" fill="#ff5f56"/>
+  <circle cx="40" cy="19" r="5" fill="#ffbd2e"/>
+  <circle cx="58" cy="19" r="5" fill="#27c93f"/>
+  <!-- Prompt text -->
+  <g font-family="'Fira Code', 'Courier New', monospace" font-size="22" font-weight="bold" filter="url(#glow)">
+    <text x="22" y="82" fill="#27c93f">$</text>
+    <text x="46" y="82" fill="#e0e0e0">asm</text>
+    <text x="22" y="116" fill="#27c93f">_</text>
+  </g>
+  <!-- ASM label -->
+  <text x="128" y="210" font-family="'Fira Code', 'Courier New', monospace" font-size="42" font-weight="900" fill="#27c93f" text-anchor="middle" letter-spacing="4">ASM</text>
+  <text x="128" y="236" font-family="'Fira Code', 'Courier New', monospace" font-size="13" fill="#888" text-anchor="middle" letter-spacing="2">TERMINAL</text>
+</svg>
