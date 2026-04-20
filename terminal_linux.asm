@@ -3660,6 +3660,10 @@ handler_type:
 handler_mkdir:
     push rbp
     mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
     sub rsp, 16
 
     test rdi, rdi
@@ -3667,14 +3671,88 @@ handler_mkdir:
     cmp byte [rdi], 0
     je .hmk_err
 
-    ; mkdir(path, 0755)
+    mov rbx, rdi
+    xor r12d, r12d                  ; 0 = single, 1 = -p recursive
+
+    ; Detect leading -p
+    cmp byte [rbx], '-'
+    jne .hmk_go
+    cmp byte [rbx + 1], 'p'
+    jne .hmk_go
+    cmp byte [rbx + 2], ' '
+    jne .hmk_go
+    mov r12d, 1
+    add rbx, 3
+    ; skip extra spaces
+.hmk_skip_sp:
+    cmp byte [rbx], ' '
+    jne .hmk_go
+    inc rbx
+    jmp .hmk_skip_sp
+
+.hmk_go:
+    cmp byte [rbx], 0
+    je .hmk_err
+    test r12d, r12d
+    jnz .hmk_recursive
+
+    mov rdi, rbx
     mov esi, PERM_0755
     mov eax, SYS_MKDIR
     syscall
     test rax, rax
     jns .hmk_done
+    neg eax
+    mov edi, eax
+    call print_last_error
+    jmp .hmk_done
 
-    ; Error -- negate rax to get errno
+.hmk_recursive:
+    ; Copy path into file_path_buf character by character, calling mkdir at
+    ; every intermediate '/'. Index kept in r14 because syscall clobbers rcx;
+    ; source pointer read directly from rbx because syscall clobbers rsi
+    ; (as the 2nd syscall arg it gets overwritten with PERM_0755).
+    lea r13, [file_path_buf]
+    xor r14d, r14d
+.hmk_copy:
+    movzx eax, byte [rbx + r14]
+    test al, al
+    jz .hmk_finalize
+    mov [r13 + r14], al
+    cmp al, '/'
+    jne .hmk_advance
+    test r14d, r14d
+    jz .hmk_advance                 ; skip leading '/'
+    mov byte [r13 + r14], 0
+    mov rdi, r13
+    mov esi, PERM_0755
+    mov eax, SYS_MKDIR
+    syscall
+    test rax, rax
+    jns .hmk_restore_slash
+    cmp eax, -17
+    jne .hmk_rec_err
+.hmk_restore_slash:
+    mov byte [r13 + r14], '/'
+.hmk_advance:
+    inc r14d
+    cmp r14d, MAX_PATH_BUF - 1
+    jge .hmk_err
+    jmp .hmk_copy
+
+.hmk_finalize:
+    mov byte [r13 + r14], 0
+    test r14d, r14d
+    jz .hmk_err
+    mov rdi, r13
+    mov esi, PERM_0755
+    mov eax, SYS_MKDIR
+    syscall
+    test rax, rax
+    jns .hmk_done
+    cmp eax, -17
+    je .hmk_done
+.hmk_rec_err:
     neg eax
     mov edi, eax
     call print_last_error
@@ -3686,7 +3764,12 @@ handler_mkdir:
     call print_string_len
 
 .hmk_done:
-    leave
+    add rsp, 16
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
 ; ---------- handler_rmdir ----------
