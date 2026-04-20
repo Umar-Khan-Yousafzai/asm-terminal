@@ -1742,6 +1742,18 @@ read_line:
     je .rl_ctrl_u
     cmp r12d, 18            ; Ctrl+R = reverse history search
     je .rl_ctrl_r
+    cmp r12d, 1             ; Ctrl+A = beginning of line (alias of Home)
+    je .rl_home
+    cmp r12d, 5             ; Ctrl+E = end of line (alias of End)
+    je .rl_end
+    cmp r12d, 2             ; Ctrl+B = back one char (alias of Left)
+    je .rl_left
+    cmp r12d, 6             ; Ctrl+F = forward one char (alias of Right)
+    je .rl_right
+    cmp r12d, 16            ; Ctrl+P = previous history (alias of Up)
+    je .rl_up
+    cmp r12d, 14            ; Ctrl+N = next history (alias of Down)
+    je .rl_down
     cmp r12d, 32
     jb .rl_loop
     cmp r12d, 126
