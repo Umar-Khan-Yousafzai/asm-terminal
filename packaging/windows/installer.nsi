@@ -9,8 +9,11 @@
 ; a Start Menu shortcut that opens the shell, and wires up Add/Remove Programs.
 ; ===========================================================================
 
+!ifndef APP_VERSION
+    !define APP_VERSION "2.0.0"
+!endif
+
 !define APP_NAME        "ASM Terminal"
-!define APP_VERSION     "2.0.0"
 !define APP_PUBLISHER   "Umar Khan Yousafzai"
 !define APP_URL         "https://github.com/Umar-Khan-Yousafzai/asm-terminal"
 !define APP_EXE         "terminal.exe"
