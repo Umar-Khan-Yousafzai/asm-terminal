@@ -6677,10 +6677,18 @@ execute_compound:
     je .ec_found_semi
 
     cmp al, '&'
-    jne .ec_scan_next
+    jne .ec_check_or
     ; Check for '&&'
     cmp byte [r12 + 1], '&'
     je .ec_found_and
+    jmp .ec_scan_next
+
+.ec_check_or:
+    cmp al, '|'
+    jne .ec_scan_next
+    ; '||' acts as logical-or separator (skip next if prev succeeded)
+    cmp byte [r12 + 1], '|'
+    je .ec_found_or
 
 .ec_scan_next:
     inc r12
@@ -6698,6 +6706,13 @@ execute_compound:
     mov r15, r12                    ; save separator position
     mov byte [r12], 0              ; null-terminate this segment
     add r12, 2                      ; advance past '&&'
+    jmp .ec_execute_segment
+
+.ec_found_or:
+    mov r14d, 3                     ; type = '||'
+    mov r15, r12
+    mov byte [r12], 0
+    add r12, 2
     jmp .ec_execute_segment
 
 .ec_segment_end:
@@ -6737,18 +6752,26 @@ execute_compound:
     call dispatch_command
 
 .ec_check_continue:
-    ; If separator type == 0, we are done (was last segment)
+    ; type 0 = end, 1 = ';', 2 = '&&', 3 = '||'
     test r14d, r14d
     jz .ec_done
 
-    ; If separator was '&&' (type 2), check last_exit_status
     cmp r14d, 2
-    jne .ec_next_segment            ; ';' -> continue unconditionally
+    je .ec_and_check
+    cmp r14d, 3
+    je .ec_or_check
+    jmp .ec_next_segment            ; ';' -> unconditional continue
 
-    ; '&&': only continue if last command succeeded
+.ec_and_check:
+    ; '&&': continue only if previous succeeded
     cmp dword [last_exit_status], 0
-    jne .ec_done                    ; command failed, abort chain
+    jne .ec_done
+    jmp .ec_next_segment
 
+.ec_or_check:
+    ; '||': continue only if previous failed
+    cmp dword [last_exit_status], 0
+    je .ec_done
     jmp .ec_next_segment
 
 .ec_done:
