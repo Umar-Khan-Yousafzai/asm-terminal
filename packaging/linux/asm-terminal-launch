@@ -1,0 +1,60 @@
+#!/usr/bin/env sh
+# ---------------------------------------------------------------------------
+# asm-terminal-launch
+# Wrapper that spawns a GUI terminal emulator running the `asm` shell, so a
+# shell written in NASM can appear as a standalone application (like
+# Terminator, Konsole, etc.). Probes common emulators in preference order.
+# ---------------------------------------------------------------------------
+set -eu
+
+ASM_BIN="${ASM_BIN:-asm}"
+if ! command -v "$ASM_BIN" >/dev/null 2>&1; then
+    # Fallback install locations
+    for cand in \
+        /usr/local/bin/asm \
+        /usr/bin/asm \
+        "$HOME/.local/bin/asm"; do
+        if [ -x "$cand" ]; then
+            ASM_BIN="$cand"
+            break
+        fi
+    done
+fi
+
+if [ ! -x "$ASM_BIN" ] && ! command -v "$ASM_BIN" >/dev/null 2>&1; then
+    echo "asm-terminal-launch: could not locate the 'asm' binary." >&2
+    echo "Install it or set ASM_BIN to the full path." >&2
+    exit 1
+fi
+
+TITLE="ASM Terminal"
+CLASS="asm-terminal"
+
+# Try terminal emulators in order of ubiquity, using each one's CLI idiom.
+try() {
+    prog="$1"
+    shift
+    command -v "$prog" >/dev/null 2>&1 || return 1
+    exec "$prog" "$@"
+}
+
+# x-terminal-emulator is the Debian alternatives symlink.
+try x-terminal-emulator -T "$TITLE" -e "$ASM_BIN"
+try gnome-terminal --title="$TITLE" -- "$ASM_BIN"
+try konsole --title "$TITLE" -e "$ASM_BIN"
+try xfce4-terminal --title="$TITLE" --command="$ASM_BIN"
+try tilix --title="$TITLE" -e "$ASM_BIN"
+try mate-terminal --title="$TITLE" -e "$ASM_BIN"
+try lxterminal --title "$TITLE" -e "$ASM_BIN"
+try terminator -T "$TITLE" -e "$ASM_BIN"
+try alacritty --title "$TITLE" --class "$CLASS" -e "$ASM_BIN"
+try kitty --title "$TITLE" --class "$CLASS" "$ASM_BIN"
+try wezterm start --class "$CLASS" -- "$ASM_BIN"
+try foot --title="$TITLE" "$ASM_BIN"
+try st -T "$TITLE" -e "$ASM_BIN"
+try urxvt -title "$TITLE" -e "$ASM_BIN"
+try xterm -T "$TITLE" -e "$ASM_BIN"
+
+echo "asm-terminal-launch: no supported terminal emulator found on PATH." >&2
+echo "Install one of: gnome-terminal, konsole, xterm, alacritty, kitty, foot, wezterm." >&2
+exit 2
