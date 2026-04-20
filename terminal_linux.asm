@@ -516,6 +516,11 @@ section .data
     ; --- Timezone env var name ---
     tz_env_name_str db "ASM_TZ", 0
 
+    ; --- Color / TTY detection env var names ---
+    str_no_color    db "NO_COLOR", 0
+    str_term        db "TERM", 0
+    str_term_dumb   db "dumb", 0
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -774,6 +779,9 @@ section .bss
     ls_perms_buf        resb 16            ; rendered "drwxr-xr-x" + NUL
     tz_offset_cache     resq 1             ; cached TZ offset (seconds)
     tz_offset_resolved  resb 1             ; 0 = unresolved, 1 = resolved
+    interactive_mode    resb 1             ; 1 = stdin & stdout are tty
+    color_enabled       resb 1             ; 1 = ANSI/color permitted
+    termios_probe_buf   resb 60             ; scratch for ioctl probe
     tab_dirent_pos      resd 1      ; current position in dirent buffer
     tab_dirent_end      resd 1      ; end of valid data in dirent buffer
     tab_dirent_offset   resd 1      ; alias for offset tracking
@@ -930,8 +938,14 @@ main:
     push r12
     sub rsp, 32
 
-    ; Setup raw terminal mode (disable echo and canonical mode)
+    ; Detect whether we are running interactively + whether color is allowed
+    call init_io_modes
+
+    ; Only put the terminal in raw mode if we own the tty
+    cmp byte [interactive_mode], 0
+    je .main_skip_raw
     call setup_raw_mode
+.main_skip_raw:
 
     ; Install SIGINT handler
     call setup_sigint
@@ -969,12 +983,23 @@ main:
     ; --- Reap any finished background jobs ---
     call reap_finished_jobs
 
+    cmp byte [interactive_mode], 0
+    je .main_noninteractive
+
     ; --- Print themed prompt ---
     call print_prompt
 
     ; Read a line with full editing support
     call read_line
+    jmp .main_after_read
 
+.main_noninteractive:
+    ; Non-interactive: no prompt, no syntax highlight, just read a raw line
+    call read_line_plain
+    test rax, rax
+    jz .main_eof                    ; EOF -> exit
+
+.main_after_read:
     ; Skip empty lines
     cmp byte [input_buf], 0
     je .main_loop
@@ -989,6 +1014,131 @@ main:
     call execute_compound
 
     jmp .main_loop
+
+.main_eof:
+    xor edi, edi
+    mov eax, SYS_EXIT
+    syscall
+
+; ============================================================================
+; init_io_modes - Resolve interactive_mode and color_enabled flags
+; interactive = ioctl(0, TCGETS) succeeds  AND  ioctl(1, TCGETS) succeeds
+; color = interactive  AND  !$NO_COLOR  AND  $TERM != "dumb"
+; ============================================================================
+init_io_modes:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    ; Default: not interactive, no color
+    mov byte [interactive_mode], 0
+    mov byte [color_enabled], 0
+
+    ; ioctl(STDIN, TCGETS, &termios_probe_buf)
+    mov eax, SYS_IOCTL
+    mov edi, STDIN_FD
+    mov esi, TCGETS
+    lea rdx, [termios_probe_buf]
+    syscall
+    test rax, rax
+    js .iom_done                    ; stdin not a tty
+
+    ; ioctl(STDOUT, TCGETS, &termios_probe_buf)
+    mov eax, SYS_IOCTL
+    mov edi, 1
+    mov esi, TCGETS
+    lea rdx, [termios_probe_buf]
+    syscall
+    test rax, rax
+    js .iom_done                    ; stdout not a tty
+
+    mov byte [interactive_mode], 1
+
+    ; Start assuming color is ok; disable if NO_COLOR set or TERM=dumb
+    mov byte [color_enabled], 1
+
+    lea rdi, [str_no_color]
+    call getenv_internal
+    test rax, rax
+    jz .iom_check_term
+    ; NO_COLOR must be non-empty per no-color.org spec
+    cmp byte [rax], 0
+    je .iom_check_term
+    mov byte [color_enabled], 0
+    jmp .iom_done
+
+.iom_check_term:
+    lea rdi, [str_term]
+    call getenv_internal
+    test rax, rax
+    jz .iom_done
+    mov rbx, rax
+    lea rsi, [str_term_dumb]
+    mov rdi, rbx
+    call str_icompare
+    test eax, eax
+    jnz .iom_done
+    mov byte [color_enabled], 0
+
+.iom_done:
+    add rsp, 8
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
+; read_line_plain - Read one line (terminated by LF or EOF) into input_buf
+; Used when interactive_mode = 0. Returns rax = 1 if a line was read,
+; rax = 0 on EOF with no bytes.
+; ============================================================================
+read_line_plain:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 16
+
+    lea rbx, [input_buf]
+    xor r12d, r12d                   ; r12 = offset (syscall preserves r12)
+
+.rlp_loop:
+    cmp r12d, MAX_INPUT - 1
+    jge .rlp_terminate              ; full; discard rest of line silently
+    mov edi, STDIN_FD
+    mov rsi, rbx
+    add rsi, r12
+    mov edx, 1
+    mov eax, SYS_READ
+    syscall
+    test rax, rax
+    jz .rlp_eof
+    js .rlp_eof
+    movzx edx, byte [rbx + r12]
+    cmp dl, 10                       ; LF ends the line
+    je .rlp_terminate
+    cmp dl, 13                       ; drop CR (CRLF line endings)
+    je .rlp_loop
+    inc r12d
+    jmp .rlp_loop
+
+.rlp_terminate:
+    mov byte [rbx + r12], 0
+    mov eax, 1
+    jmp .rlp_done
+
+.rlp_eof:
+    test r12d, r12d
+    jnz .rlp_terminate              ; flush pending bytes
+    mov byte [rbx], 0
+    xor eax, eax
+
+.rlp_done:
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
+    ret
 
 ; ============================================================================
 ; setup_raw_mode - Switch terminal to raw mode
