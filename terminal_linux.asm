@@ -113,6 +113,28 @@ default rel
 ; ============================================================================
 %define MAX_INPUT           512
 %define MAX_PATH_BUF        4096    ; Linux paths can be much longer than Windows
+
+; ---------------------------------------------------------------------------
+; Convenience macros for common patterns throughout the codebase.
+; These do not change semantics — they just compact repetitive sequences.
+; ---------------------------------------------------------------------------
+
+%macro PRINT_BYTES 2
+    lea rdi, [%1]
+    mov esi, %2
+    call print_string_len
+%endmacro
+
+%macro PRINT_CSTR 1
+    lea rdi, [%1]
+    call print_cstring
+%endmacro
+
+%macro SYSCALL_N 1
+    mov eax, %1
+    syscall
+%endmacro
+
 %define HISTORY_COUNT       500
 %define HISTORY_ENTRY_SIZE  512
 %define ALIAS_COUNT         32
@@ -1743,7 +1765,6 @@ read_line:
     je .rl_ctrl_u
     cmp r12d, 18            ; Ctrl+R = reverse history search
     je .rl_ctrl_r
-<<<<<<< HEAD
     cmp r12d, 1             ; Ctrl+A = beginning of line (alias of Home)
     je .rl_home
     cmp r12d, 5             ; Ctrl+E = end of line (alias of End)
