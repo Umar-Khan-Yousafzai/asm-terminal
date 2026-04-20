@@ -502,6 +502,10 @@ section .data
     err_source_open db "Error: source: could not open file.", 10, 0
     err_source_o_len equ $ - err_source_open - 1
 
+    ; --- Prompt exit-status indicator: ' [N]' in red ---
+    exit_prompt_pre  db 27, "[31m [", 0
+    exit_prompt_post db "]", 27, "[0m", 0
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -7100,6 +7104,19 @@ print_prompt:
     push rbx
     push r12
     sub rsp, 16
+
+    ; Show exit status of last command in red when non-zero (fish-style hint)
+    mov eax, [last_exit_status]
+    test eax, eax
+    jz .pp_no_exit
+    lea rdi, [exit_prompt_pre]
+    call print_cstring
+    mov eax, [last_exit_status]
+    call print_number
+    lea rdi, [exit_prompt_post]
+    call print_cstring
+    call print_newline
+.pp_no_exit:
 
     mov eax, [current_theme]
     mov r12d, eax
