@@ -694,6 +694,7 @@ section .bss
     num_buf             resb 16
     file_path_buf       resb MAX_PATH_BUF
     read_buffer         resb READ_BUF_SIZE
+    history_read_buf    resb 262144         ; 256KB for full history file load
 
     ; Directory listing
     dirent_buf          resb 8192   ; buffer for getdents64
@@ -5260,13 +5261,25 @@ load_history:
     js .lh_done                     ; file doesn't exist, OK
     mov ebx, eax                    ; fd
 
-    ; Read file (up to READ_BUF_SIZE - 1 bytes)
+    ; Read file in a loop into a 256KB buffer (handles multi-chunk files).
+    lea r13, [history_read_buf]     ; current write position
+    xor r12d, r12d                  ; total bytes
+.lh_read_chunk:
+    mov eax, 262144
+    sub eax, r12d
+    cmp eax, 1
+    jle .lh_read_done               ; buffer full
     mov edi, ebx
-    lea rsi, [read_buffer]
-    mov edx, READ_BUF_SIZE - 1
+    mov rsi, r13
+    mov edx, eax
     mov eax, SYS_READ
     syscall
-    mov r12d, eax                   ; bytes read
+    test rax, rax
+    jle .lh_read_done               ; EOF or error
+    add r12d, eax
+    add r13, rax
+    jmp .lh_read_chunk
+.lh_read_done:
 
     ; Close file
     mov edi, ebx
@@ -5276,11 +5289,11 @@ load_history:
     ; Null-terminate
     test r12d, r12d
     jle .lh_done
-    lea rcx, [read_buffer]
+    lea rcx, [history_read_buf]
     mov byte [rcx + r12], 0
 
     ; Parse lines and add to history buffer
-    lea r13, [read_buffer]
+    lea r13, [history_read_buf]
 .lh_line:
     cmp byte [r13], 0
     je .lh_done
