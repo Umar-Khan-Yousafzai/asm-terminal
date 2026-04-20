@@ -4764,7 +4764,9 @@ hex_to_int:
     ret
 
 ; ---------- print_number ----------
-; Print unsigned integer in eax as decimal string.
+; Print unsigned integer in rax as decimal string. Callers that set eax
+; get automatic zero-extension of the high 32 bits, so pre-existing call
+; sites remain correct.
 print_number:
     push rbp
     mov rbp, rsp
@@ -4772,19 +4774,19 @@ print_number:
     push r12
     sub rsp, 16
 
-    lea r12, [num_buf + 15]
+    lea r12, [num_buf + 31]
     mov byte [r12], 0
-    mov ebx, 10
-    test eax, eax
+    mov rbx, 10
+    test rax, rax
     jnz .pn_loop
     dec r12
     mov byte [r12], '0'
     jmp .pn_print
 .pn_loop:
-    test eax, eax
+    test rax, rax
     jz .pn_print
     xor edx, edx
-    div ebx
+    div rbx                         ; 64-bit: rdx:rax / rbx
     add dl, '0'
     dec r12
     mov [r12], dl
@@ -7149,7 +7151,7 @@ handler_calc:
     neg r13
 
 .calc_print_positive:
-    mov eax, r13d
+    mov rax, r13                    ; full 64-bit result
     call print_number
     call print_newline
     jmp .calc_done
