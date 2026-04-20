@@ -1359,6 +1359,8 @@ read_line:
     je .rl_ctrl_u
     cmp r12d, 18            ; Ctrl+R = reverse history search
     je .rl_ctrl_r
+    cmp r12d, 4             ; Ctrl+D = EOF (empty) / delete-char
+    je .rl_ctrl_d
     cmp r12d, 32
     jb .rl_loop
     cmp r12d, 126
@@ -1500,6 +1502,34 @@ read_line:
     call print_string_len
 .rl_ctrl_l_cur:
     call update_cursor_pos
+    jmp .rl_loop
+
+; --- Ctrl+D: EOF on empty line, else delete-char at cursor ---
+.rl_ctrl_d:
+    mov ecx, [line_len]
+    test ecx, ecx
+    jnz .rl_cd_delete
+    ; Empty line -- treat as EOF: newline, restore, exit
+    call print_newline
+    call restore_terminal
+    xor edi, edi
+    mov eax, SYS_EXIT
+    syscall
+.rl_cd_delete:
+    mov edx, [line_cursor]
+    cmp edx, ecx
+    jge .rl_loop
+    lea rdi, [line_buf]
+.rl_cd_shift:
+    mov al, [rdi + rdx + 1]
+    mov [rdi + rdx], al
+    inc edx
+    cmp edx, ecx
+    jl .rl_cd_shift
+    dec dword [line_len]
+    mov edx, [line_len]
+    mov byte [rdi + rdx], 0
+    call redraw_line
     jmp .rl_loop
 
 ; --- Ctrl+W: Delete word backward from cursor ---
