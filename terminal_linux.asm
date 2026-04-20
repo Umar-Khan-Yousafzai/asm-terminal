@@ -3497,7 +3497,31 @@ handler_cd:
     jmp .hcd_done
 
 .hcd_show:
-    ; No args: print current directory
+    ; No args: go to $HOME (POSIX behaviour). Fall back to printing cwd if HOME unset.
+    lea rdi, [str_home]
+    call getenv_internal
+    test rax, rax
+    jz .hcd_print_cwd
+
+    ; Save current dir to prev_dir_buf before changing
+    lea rdi, [prev_dir_buf]
+    mov esi, MAX_PATH_BUF
+    mov eax, SYS_GETCWD
+    syscall
+    mov byte [has_prev_dir], 1
+
+    mov rdi, rax
+    ; rax already holds HOME value ptr; move into rdi for chdir
+    lea rdi, [str_home]
+    call getenv_internal
+    mov rdi, rax
+    mov eax, SYS_CHDIR
+    syscall
+    test rax, rax
+    js .hcd_err
+    jmp .hcd_done
+
+.hcd_print_cwd:
     lea rdi, [path_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
