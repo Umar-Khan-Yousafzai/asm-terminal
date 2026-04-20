@@ -27,6 +27,7 @@ default rel
 %define SYS_WAIT4           61
 %define SYS_KILL            62
 %define SYS_UNAME           63
+%define SYS_KILL            62
 %define SYS_GETCWD          79
 %define SYS_CHDIR           80
 %define SYS_RENAME          82
@@ -66,6 +67,7 @@ default rel
 %define SIGTERM             15
 %define SA_RESTORER         0x04000000
 %define SA_RESTART          0x10000000
+%define SIGCONT             18
 
 ; File open flags
 %define O_RDONLY            0
@@ -454,6 +456,7 @@ section .data
         dq cmd_s_calc,   handler_calc,   4
         dq cmd_s_theme,  handler_theme,  5
         dq cmd_s_fg,       handler_fg,       2
+        dq cmd_s_bg,       handler_bg,       2
         dq cmd_s_unset,    handler_unset,    5
         dq cmd_s_export,   handler_set,      6
         dq cmd_s_unalias,  handler_unalias,  7
@@ -646,6 +649,11 @@ section .data
     cmd_s_theme      db "theme", 0
     cmd_s_jobs       db "jobs", 0
     cmd_s_fg         db "fg", 0
+    cmd_s_bg         db "bg", 0
+
+    bg_resumed_msg   db "[bg] resumed job ", 0
+    bg_noarg_msg     db "Usage: bg JOBNUM", 10, 0
+    bg_noarg_len     equ $ - bg_noarg_msg - 1
 
     ; Theme name strings
     theme_name_default  db "default", 0
@@ -8748,6 +8756,86 @@ handler_fg:
 
 .hfg_done:
     add rsp, 16
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
+; handler_bg - resume a stopped background job (SIGCONT), do NOT wait
+; ============================================================================
+handler_bg:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    test rdi, rdi
+    jz .hbg_noarg
+    cmp byte [rdi], 0
+    je .hbg_noarg
+
+    ; Parse job number
+    xor ecx, ecx
+.hbg_parse:
+    movzx edx, byte [rdi]
+    test dl, dl
+    jz .hbg_parsed
+    cmp dl, ' '
+    je .hbg_parsed
+    sub dl, '0'
+    cmp dl, 9
+    ja .hbg_noarg
+    imul ecx, ecx, 10
+    movzx edx, dl
+    add ecx, edx
+    inc rdi
+    jmp .hbg_parse
+.hbg_parsed:
+    test ecx, ecx
+    jz .hbg_noarg
+
+    xor r12d, r12d
+    xor r13d, r13d
+.hbg_find:
+    cmp r12d, JOB_MAX
+    jge .hbg_noarg
+    lea rbx, [job_pids]
+    mov rax, [rbx + r12*8]
+    test rax, rax
+    jz .hbg_next
+    inc r13d
+    cmp r13d, ecx
+    je .hbg_found
+.hbg_next:
+    inc r12d
+    jmp .hbg_find
+
+.hbg_found:
+    lea rbx, [job_pids]
+    mov rbx, [rbx + r12*8]
+    mov edi, ebx
+    mov esi, SIGCONT
+    mov eax, SYS_KILL
+    syscall
+
+    lea rdi, [bg_resumed_msg]
+    call print_cstring
+    mov eax, ecx
+    call print_number
+    call print_newline
+    jmp .hbg_done
+
+.hbg_noarg:
+    lea rdi, [bg_noarg_msg]
+    mov esi, bg_noarg_len
+    call print_string_len
+
+.hbg_done:
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
