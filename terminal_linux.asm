@@ -557,6 +557,15 @@ section .data
     %define S_IXUSR  0o100
     %define S_IXGRP  0o010
     %define S_IXOTH  0o001
+    %define S_IWGRP  0o020
+    %define S_IWOTH  0o002
+    %define S_IFMT   0o170000
+    %define S_IFLNK  0o120000
+    %define S_IFREG  0o100000
+    %define S_IFBLK  0o060000
+    %define S_IFCHR  0o020000
+    %define S_IFIFO  0o010000
+    %define S_IFSOCK 0o140000
 
     ; ======== Batch 4 Data ========
 
@@ -748,6 +757,7 @@ section .bss
     tab_dir_fd          resd 1      ; fd for opendir equivalent
     tab_find_handle     resq 1      ; alias for compatibility
     tab_dirent_buf      resb 8192
+    ls_perms_buf        resb 16            ; rendered "drwxr-xr-x" + NUL
     tab_dirent_pos      resd 1      ; current position in dirent buffer
     tab_dirent_end      resd 1      ; end of valid data in dirent buffer
     tab_dirent_offset   resd 1      ; alias for offset tracking
@@ -6077,6 +6087,114 @@ reverse_history_search:
 ; ============================================================================
 
 ; ============================================================================
+; print_ls_perms(ecx = st_mode) - Render "drwxr-xr-x" style permission string
+; Uses the ls_perms_buf in .bss. Preserves caller registers except rax.
+; ============================================================================
+print_ls_perms:
+    push rbp
+    mov rbp, rsp
+    push rcx
+    push rdi
+    push rsi
+
+    lea rdi, [ls_perms_buf]
+    mov esi, ecx
+
+    ; --- Byte 0: file type ---
+    mov eax, esi
+    and eax, S_IFMT
+    cmp eax, S_IFDIR
+    je .plp_dir
+    cmp eax, S_IFLNK
+    je .plp_lnk
+    cmp eax, S_IFCHR
+    je .plp_chr
+    cmp eax, S_IFBLK
+    je .plp_blk
+    cmp eax, S_IFIFO
+    je .plp_fifo
+    cmp eax, S_IFSOCK
+    je .plp_sock
+    mov byte [rdi], '-'
+    jmp .plp_perm
+.plp_dir:
+    mov byte [rdi], 'd'
+    jmp .plp_perm
+.plp_lnk:
+    mov byte [rdi], 'l'
+    jmp .plp_perm
+.plp_chr:
+    mov byte [rdi], 'c'
+    jmp .plp_perm
+.plp_blk:
+    mov byte [rdi], 'b'
+    jmp .plp_perm
+.plp_fifo:
+    mov byte [rdi], 'p'
+    jmp .plp_perm
+.plp_sock:
+    mov byte [rdi], 's'
+
+.plp_perm:
+    ; Byte 1: owner read
+    mov byte [rdi + 1], '-'
+    test esi, S_IRUSR
+    jz .plp_wu
+    mov byte [rdi + 1], 'r'
+.plp_wu:
+    mov byte [rdi + 2], '-'
+    test esi, S_IWUSR
+    jz .plp_xu
+    mov byte [rdi + 2], 'w'
+.plp_xu:
+    mov byte [rdi + 3], '-'
+    test esi, S_IXUSR
+    jz .plp_rg
+    mov byte [rdi + 3], 'x'
+.plp_rg:
+    mov byte [rdi + 4], '-'
+    test esi, S_IRGRP
+    jz .plp_wg
+    mov byte [rdi + 4], 'r'
+.plp_wg:
+    mov byte [rdi + 5], '-'
+    test esi, S_IWGRP
+    jz .plp_xg
+    mov byte [rdi + 5], 'w'
+.plp_xg:
+    mov byte [rdi + 6], '-'
+    test esi, S_IXGRP
+    jz .plp_ro
+    mov byte [rdi + 6], 'x'
+.plp_ro:
+    mov byte [rdi + 7], '-'
+    test esi, S_IROTH
+    jz .plp_wo
+    mov byte [rdi + 7], 'r'
+.plp_wo:
+    mov byte [rdi + 8], '-'
+    test esi, S_IWOTH
+    jz .plp_xo
+    mov byte [rdi + 8], 'w'
+.plp_xo:
+    mov byte [rdi + 9], '-'
+    test esi, S_IXOTH
+    jz .plp_emit
+    mov byte [rdi + 9], 'x'
+.plp_emit:
+    mov byte [rdi + 10], 0
+    ; Print the 10-byte string
+    lea rdi, [ls_perms_buf]
+    mov esi, 10
+    call print_string_len
+
+    pop rsi
+    pop rdi
+    pop rcx
+    pop rbp
+    ret
+
+; ============================================================================
 ; handler_ls - List directory contents with optional -l, -a flags and colors
 ; ============================================================================
 handler_ls:
@@ -6231,8 +6349,8 @@ handler_ls:
     test byte [ls_flags], 1
     jz .ls_dir_short
 
-    lea rdi, [ls_perm_dir]
-    call print_cstring
+    mov ecx, [stat_buf + STAT_ST_MODE]
+    call print_ls_perms
     lea rdi, [str_two_spaces]
     call print_cstring
 
@@ -6263,8 +6381,8 @@ handler_ls:
     test byte [ls_flags], 1
     jz .ls_exec_short
 
-    lea rdi, [ls_perm_exec]
-    call print_cstring
+    mov ecx, [stat_buf + STAT_ST_MODE]
+    call print_ls_perms
     lea rdi, [str_two_spaces]
     call print_cstring
 
@@ -6295,8 +6413,8 @@ handler_ls:
     test byte [ls_flags], 1
     jz .ls_reg_short
 
-    lea rdi, [ls_perm_file]
-    call print_cstring
+    mov ecx, [stat_buf + STAT_ST_MODE]
+    call print_ls_perms
     lea rdi, [str_two_spaces]
     call print_cstring
 
