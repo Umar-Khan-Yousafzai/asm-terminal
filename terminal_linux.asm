@@ -539,6 +539,12 @@ section .data
     bracketed_paste_off db 27, "[?2004l"
     bracketed_paste_off_len equ $ - bracketed_paste_off
 
+    ; --- Cursor shape reset (DECSCUSR 0) + show cursor (DECSET 25) ---
+    cursor_shape_reset    db 27, "[0 q"
+    cursor_shape_reset_len equ $ - cursor_shape_reset
+    cursor_show           db 27, "[?25h"
+    cursor_show_len       equ $ - cursor_show
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -1255,6 +1261,14 @@ restore_terminal:
     ; Disable bracketed paste mode before restoring termios
     lea rdi, [bracketed_paste_off]
     mov esi, bracketed_paste_off_len
+    call print_string_len
+
+    ; Restore cursor shape + make sure cursor visible (TUI children may have changed)
+    lea rdi, [cursor_shape_reset]
+    mov esi, cursor_shape_reset_len
+    call print_string_len
+    lea rdi, [cursor_show]
+    mov esi, cursor_show_len
     call print_string_len
 
     ; ioctl(STDIN_FD, TCSETS, &orig_termios)
