@@ -502,6 +502,9 @@ section .data
     err_source_open db "Error: source: could not open file.", 10, 0
     err_source_o_len equ $ - err_source_open - 1
 
+    ; --- Timezone env var name ---
+    tz_env_name_str db "ASM_TZ", 0
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -748,6 +751,8 @@ section .bss
     tab_dir_fd          resd 1      ; fd for opendir equivalent
     tab_find_handle     resq 1      ; alias for compatibility
     tab_dirent_buf      resb 8192
+    tz_offset_cache     resq 1             ; cached TZ offset (seconds)
+    tz_offset_resolved  resb 1             ; 0 = unresolved, 1 = resolved
     tab_dirent_pos      resd 1      ; current position in dirent buffer
     tab_dirent_end      resd 1      ; end of valid data in dirent buffer
     tab_dirent_offset   resd 1      ; alias for offset tracking
@@ -2964,9 +2969,10 @@ handler_date:
     mov eax, SYS_CLOCK_GETTIME
     syscall
 
-    ; Add PKT timezone offset (UTC+5) before conversion
+    ; Add timezone offset (configurable via $ASM_TZ, default PKT UTC+5)
+    call resolve_tz_offset
     mov rdi, [timespec_buf]
-    add rdi, TZ_OFFSET_SECONDS
+    add rdi, rax
     call epoch_to_datetime
 
     ; Save 24h hour in rbx for AM/PM decision later
@@ -3066,6 +3072,78 @@ handler_date:
     add rsp, 8
     pop rbx
     pop rbp
+    ret
+
+; ============================================================================
+; resolve_tz_offset — return tz offset in seconds (rax)
+; Reads $ASM_TZ once, caches result. Accepts decimal integer with optional
+; leading '-'. Falls back to TZ_OFFSET_SECONDS if unset or unparseable.
+; ============================================================================
+resolve_tz_offset:
+    cmp byte [tz_offset_resolved], 0
+    jne .rto_cached
+
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    lea rdi, [tz_env_name_str]
+    call getenv_internal
+    test rax, rax
+    jz .rto_default
+
+    ; Parse signed integer from [rax]
+    mov rbx, rax
+    xor r8d, r8d                    ; sign flag (0 = +, 1 = -)
+    cmp byte [rbx], '-'
+    jne .rto_plus
+    mov r8d, 1
+    inc rbx
+    jmp .rto_parse
+.rto_plus:
+    cmp byte [rbx], '+'
+    jne .rto_parse
+    inc rbx
+.rto_parse:
+    xor rax, rax
+    xor r9d, r9d                    ; digits seen
+.rto_digit:
+    movzx ecx, byte [rbx]
+    cmp cl, '0'
+    jb .rto_done_parse
+    cmp cl, '9'
+    ja .rto_done_parse
+    sub cl, '0'
+    imul rax, rax, 10
+    add rax, rcx
+    inc rbx
+    inc r9d
+    jmp .rto_digit
+.rto_done_parse:
+    test r9d, r9d
+    jz .rto_default
+    test r8d, r8d
+    jz .rto_store
+    neg rax
+.rto_store:
+    mov [tz_offset_cache], rax
+    mov byte [tz_offset_resolved], 1
+    add rsp, 8
+    pop rbx
+    pop rbp
+    ret
+
+.rto_default:
+    mov qword [tz_offset_cache], TZ_OFFSET_SECONDS
+    mov byte [tz_offset_resolved], 1
+    add rsp, 8
+    pop rbx
+    pop rbp
+    ; fall through
+
+.rto_cached:
+    mov rax, [tz_offset_cache]
     ret
 
 ; ---------- handler_time ----------
