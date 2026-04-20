@@ -398,6 +398,11 @@ section .data
     cmd_s_set       db "set", 0
     cmd_s_pushd     db "pushd", 0
     cmd_s_alias     db "alias", 0
+    cmd_s_unset     db "unset", 0
+    cmd_s_export    db "export", 0
+
+    err_unset_usage db "Usage: unset VAR", 10, 0
+    err_unset_usage_len equ $ - err_unset_usage - 1
 
 ; ============================================================================
 ; Command dispatch tables
@@ -444,6 +449,8 @@ section .data
         dq cmd_s_calc,   handler_calc,   4
         dq cmd_s_theme,  handler_theme,  5
         dq cmd_s_fg,     handler_fg,     2
+        dq cmd_s_unset,  handler_unset,  5
+        dq cmd_s_export, handler_set,    6
         dq 0, 0, 0
 
 ; ============================================================================
@@ -810,6 +817,8 @@ section .bss
     term_rows           resw 1             ; cached from TIOCGWINSZ
     term_cols           resw 1             ; cached from TIOCGWINSZ
     winch_sigaction_buf resb 32            ; sigaction struct for SIGWINCH
+    merged_envp         resq 256            ; argv-style envp for child: 256 slots
+    merged_envp_count   resd 1
     tab_dirent_pos      resd 1      ; current position in dirent buffer
     tab_dirent_end      resd 1      ; end of valid data in dirent buffer
     tab_dirent_offset   resd 1      ; alias for offset tracking
@@ -5036,10 +5045,14 @@ execute_external:
     mov [rax + 16], rcx             ; argv[2] = command string
     mov qword [rax + 24], 0         ; argv[3] = NULL
 
-    ; execve("/bin/sh", argv, envp)
+    ; Build merged envp = overlay entries first, then inherited envp.
+    ; Ensures 'set NAME=VAL' is visible to child processes (POSIX export).
+    call build_merged_envp
+
+    ; execve("/bin/sh", argv, merged_envp)
     lea rdi, [sh_path]
     lea rsi, [exec_argv]
-    mov rdx, [saved_envp]
+    lea rdx, [merged_envp]
     mov eax, SYS_EXECVE
     syscall
 
@@ -5802,6 +5815,125 @@ setenv_internal:
 
 .se_done:
     add rsp, 16
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
+; build_merged_envp - Fill merged_envp[] with overlay entries + inherited envp
+; Cap at 256 slots including terminating NULL. Overlay entries appear first
+; so getenv() in children returns overridden values.
+; ============================================================================
+build_merged_envp:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    lea r12, [merged_envp]
+    xor r13d, r13d                  ; slot index
+
+    ; --- Copy overlay entries ---
+    mov ecx, [env_overlay_count]
+    test ecx, ecx
+    jz .bme_inherited
+    lea rbx, [env_overlay]
+.bme_overlay_loop:
+    cmp r13d, 255
+    jge .bme_terminate
+    ; Skip empty slots (first byte NUL)
+    cmp byte [rbx], 0
+    je .bme_next_overlay
+    mov [r12 + r13*8], rbx
+    inc r13d
+.bme_next_overlay:
+    add rbx, ENV_OVERLAY_SIZE
+    dec ecx
+    jnz .bme_overlay_loop
+
+.bme_inherited:
+    ; --- Copy inherited envp pointers ---
+    mov rbx, [saved_envp]
+    test rbx, rbx
+    jz .bme_terminate
+.bme_env_loop:
+    mov rax, [rbx]
+    test rax, rax
+    jz .bme_terminate
+    cmp r13d, 255
+    jge .bme_terminate
+    mov [r12 + r13*8], rax
+    inc r13d
+    add rbx, 8
+    jmp .bme_env_loop
+
+.bme_terminate:
+    mov qword [r12 + r13*8], 0
+    mov [merged_envp_count], r13d
+
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
+; handler_unset - Remove a name from env_overlay (env vars set via 'set')
+; ============================================================================
+handler_unset:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
+
+    test rdi, rdi
+    jz .hun_usage
+    cmp byte [rdi], 0
+    je .hun_usage
+
+    ; Use caller's arg as the name; length via str_len
+    mov r12, rdi
+    call str_len
+    mov r13d, eax
+
+    lea rbx, [env_overlay]
+    xor r14d, r14d
+.hun_scan:
+    cmp r14d, [env_overlay_count]
+    jge .hun_done
+    cmp byte [rbx], 0
+    je .hun_next
+    mov rdi, r12
+    mov rsi, rbx
+    mov edx, r13d
+    call str_icompare_n
+    test eax, eax
+    jnz .hun_next
+    cmp byte [rbx + r13], '='
+    jne .hun_next
+    ; Found -- clear slot
+    mov byte [rbx], 0
+    jmp .hun_done
+.hun_next:
+    add rbx, ENV_OVERLAY_SIZE
+    inc r14d
+    jmp .hun_scan
+
+.hun_usage:
+    lea rdi, [err_unset_usage]
+    mov esi, err_unset_usage_len
+    call print_string_len
+.hun_done:
+    add rsp, 8
     pop r14
     pop r13
     pop r12
