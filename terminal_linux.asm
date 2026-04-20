@@ -5190,10 +5190,21 @@ run_autoexec:
     je .ra_skip_cr
     cmp al, 10                      ; LF = end of line
     je .ra_exec
+    cmp ecx, MAX_INPUT - 1          ; bounds check
+    jge .ra_truncate
     mov [rdi + rcx], al
     inc ecx
     inc r13
     jmp .ra_cpy
+
+.ra_truncate:
+    inc r13
+    movzx eax, byte [r13]
+    cmp al, 0
+    je .ra_exec
+    cmp al, 10
+    je .ra_exec
+    jmp .ra_truncate
 
 .ra_skip_cr:
     inc r13
@@ -5746,10 +5757,22 @@ handler_source:
     je .hsrc_skip_cr
     cmp al, 10                      ; LF = end of line
     je .hsrc_exec
+    cmp ecx, MAX_INPUT - 1          ; bounds check
+    jge .hsrc_truncate
     mov [rdi + rcx], al
     inc ecx
     inc r13
     jmp .hsrc_cpy
+
+.hsrc_truncate:
+    ; Skip remaining bytes on this oversized line (discard to LF/NUL)
+    inc r13
+    movzx eax, byte [r13]
+    cmp al, 0
+    je .hsrc_exec
+    cmp al, 10
+    je .hsrc_exec
+    jmp .hsrc_truncate
 
 .hsrc_skip_cr:
     inc r13
