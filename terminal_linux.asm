@@ -2503,6 +2503,7 @@ expand_env_vars:
     lea r12, [input_buf]           ; source pointer
     lea r13, [env_expand_buf]      ; destination pointer
     lea r14, [env_expand_buf + 1000] ; rough end guard
+    mov byte [rbp - 8], 1          ; at-word-start flag
 
 .ev_loop:
     movzx eax, byte [r12]
@@ -2512,10 +2513,53 @@ expand_env_vars:
     cmp al, '$'
     je .ev_dollar
 
+    cmp al, '~'
+    jne .ev_regular
+    cmp byte [rbp - 8], 0          ; only expand at word start
+    je .ev_regular
+    movzx ecx, byte [r12 + 1]
+    test cl, cl
+    jz .ev_tilde
+    cmp cl, '/'
+    je .ev_tilde
+    cmp cl, ' '
+    je .ev_tilde
+    jmp .ev_regular
+
+.ev_regular:
     ; Regular character -- copy through
     mov [r13], al
     inc r12
     inc r13
+    mov byte [rbp - 8], 0
+    cmp al, ' '
+    jne .ev_loop
+    mov byte [rbp - 8], 1
+    jmp .ev_loop
+
+.ev_tilde:
+    inc r12                         ; consume the tilde
+    lea rdi, [str_home]
+    call getenv_internal
+    test rax, rax
+    jz .ev_tilde_literal
+    mov rcx, rax
+.ev_tilde_cp:
+    movzx eax, byte [rcx]
+    test al, al
+    jz .ev_tilde_done
+    mov [r13], al
+    inc r13
+    inc rcx
+    jmp .ev_tilde_cp
+.ev_tilde_done:
+    mov byte [rbp - 8], 0
+    jmp .ev_loop
+
+.ev_tilde_literal:
+    mov byte [r13], '~'
+    inc r13
+    mov byte [rbp - 8], 0
     jmp .ev_loop
 
 .ev_dollar:
