@@ -5036,20 +5036,26 @@ setenv_internal:
     inc dword [env_overlay_count]
 
 .se_write_entry:
-    ; Write "NAME=VALUE\0" into the overlay slot at rbx
+    ; Write "NAME=VALUE\0" into the overlay slot at rbx (bounded)
     mov rdi, rbx
+    mov r14, rbx
+    add r14, ENV_OVERLAY_SIZE - 1   ; r14 = last writable byte (reserve NUL slot)
     mov rsi, r12
     ; Copy name
 .se_cp_name:
     movzx eax, byte [rsi]
     test al, al
     jz .se_eq
+    cmp rdi, r14
+    jae .se_terminate
     mov [rdi], al
     inc rdi
     inc rsi
     jmp .se_cp_name
 
 .se_eq:
+    cmp rdi, r14
+    jae .se_terminate
     mov byte [rdi], '='
     inc rdi
 
@@ -5057,12 +5063,17 @@ setenv_internal:
     mov rsi, r13
 .se_cp_value:
     movzx eax, byte [rsi]
-    mov [rdi], al
     test al, al
-    jz .se_done
+    jz .se_terminate
+    cmp rdi, r14
+    jae .se_terminate
+    mov [rdi], al
     inc rdi
     inc rsi
     jmp .se_cp_value
+
+.se_terminate:
+    mov byte [rdi], 0               ; ensure NUL termination within slot
 
 .se_done:
     add rsp, 16
