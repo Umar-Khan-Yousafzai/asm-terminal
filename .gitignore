@@ -1,19 +1,9 @@
-# Build artifacts
-*.o
-*.obj
+dist/
+packaging/appimage/_tools/
+packaging/appimage/AppDir/
+packaging/debian/_stage/
+asm-terminal-*.AppImage
 terminal
 terminal.exe
-
-# Editor / IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# AI tooling (local only)
-.claude/
-.aider*
-
-# OS junk
-.DS_Store
-Thumbs.db
+terminal.obj
+terminal_linux.o
