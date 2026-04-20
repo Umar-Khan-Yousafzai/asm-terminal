@@ -343,6 +343,10 @@ section .data
     err_exec_msg    db "Error: Could not execute command.", 10, 0
     err_exec_len    equ $ - err_exec_msg - 1
     err_file_msg    db "Error: Could not open file.", 10, 0
+    err_copy_read_msg db "copy: read error from source.", 10, 0
+    err_copy_read_len equ $ - err_copy_read_msg - 1
+    err_copy_write_msg db "copy: write error to destination.", 10, 0
+    err_copy_write_len equ $ - err_copy_write_msg - 1
     err_file_len    equ $ - err_file_msg - 1
     err_args_msg    db "Error: Missing arguments.", 10, 0
     err_args_len    equ $ - err_args_msg - 1
@@ -3778,6 +3782,8 @@ handler_copy:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
     sub rsp, 24
 
     test rdi, rdi
@@ -3820,15 +3826,36 @@ handler_copy:
     mov eax, SYS_READ
     syscall
     test rax, rax
-    jle .hcp_close_both             ; EOF or error
+    jz .hcp_close_both              ; EOF
+    js .hcp_read_err                ; read error
 
-    ; write(dst_fd, read_buffer, bytes_read)
-    mov edx, eax                    ; bytes to write
+    ; write(dst_fd, read_buffer, bytes_read) — handle partial writes
+    mov r14, rax                    ; r14 = total bytes remaining
+    lea r15, [read_buffer]          ; r15 = current write pointer
+.hcp_write_loop:
     mov edi, r12d
-    lea rsi, [read_buffer]
+    mov rsi, r15
+    mov rdx, r14
     mov eax, SYS_WRITE
     syscall
+    test rax, rax
+    js .hcp_write_err               ; EIO, ENOSPC, EPIPE etc.
+    add r15, rax                    ; advance pointer by bytes written
+    sub r14, rax                    ; decrement remaining
+    jnz .hcp_write_loop             ; loop until all bytes written
     jmp .hcp_loop
+
+.hcp_read_err:
+    lea rdi, [err_copy_read_msg]
+    mov esi, err_copy_read_len
+    call print_string_len
+    jmp .hcp_close_both
+
+.hcp_write_err:
+    lea rdi, [err_copy_write_msg]
+    mov esi, err_copy_write_len
+    call print_string_len
+    jmp .hcp_close_both
 
 .hcp_close_both:
     ; Close dst
@@ -3855,6 +3882,8 @@ handler_copy:
 
 .hcp_done:
     add rsp, 24
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
