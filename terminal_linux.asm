@@ -25,6 +25,7 @@ default rel
 %define SYS_EXECVE          59
 %define SYS_EXIT            60
 %define SYS_WAIT4           61
+%define SYS_KILL            62
 %define SYS_UNAME           63
 %define SYS_GETCWD          79
 %define SYS_CHDIR           80
@@ -59,6 +60,10 @@ default rel
 
 ; Signal constants
 %define SIGINT              2
+%define SIGCONT             18
+%define SIGTSTP             20
+%define SIGHUP              1
+%define SIGTERM             15
 %define SA_RESTORER         0x04000000
 %define SA_RESTART          0x10000000
 
@@ -7585,6 +7590,12 @@ handler_fg:
     call print_newline
 
     call restore_terminal
+
+    ; Resume the job if stopped (SIGCONT). Harmless if already running.
+    mov edi, ebx
+    mov esi, SIGCONT
+    mov eax, SYS_KILL
+    syscall
 
     ; Wait on the child
     mov edi, ebx
