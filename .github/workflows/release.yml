@@ -98,18 +98,31 @@ jobs:
         shell: pwsh
         run: |
           choco install -y mingw --no-progress
-          # choco installs to C:\ProgramData\mingw64\mingw64\bin on current runners
+          # Locate the real MinGW install dir and pin ld.exe to it; other
+          # toolchains on the runner (e.g. Strawberry Perl) ship an ld.exe
+          # that doesn't know about Windows import libs, so PATH order alone
+          # is unsafe. Store explicit paths as env vars for build.bat.
           $candidates = @(
-            'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin',
-            'C:\ProgramData\mingw64\mingw64\bin',
-            'C:\tools\mingw64\bin'
+            'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin\ld.exe',
+            'C:\ProgramData\mingw64\mingw64\bin\ld.exe',
+            'C:\tools\mingw64\bin\ld.exe',
+            'C:\msys64\mingw64\bin\ld.exe'
           )
-          foreach ($c in $candidates) {
-              if (Test-Path (Join-Path $c 'ld.exe')) {
-                  Add-Content -Path $env:GITHUB_PATH -Value $c
-                  break
-              }
+          $ldExe = $null
+          foreach ($c in $candidates) { if (Test-Path $c) { $ldExe = $c; break } }
+          if (-not $ldExe) {
+              $ldExe = (Get-ChildItem 'C:\ProgramData\chocolatey\lib\mingw' -Recurse -Filter ld.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
           }
+          if (-not $ldExe) { throw 'MinGW ld.exe not found after install.' }
+          $ldDir = Split-Path $ldExe -Parent
+          $ldLib = Join-Path (Split-Path $ldDir -Parent) 'x86_64-w64-mingw32\lib'
+          if (-not (Test-Path $ldLib)) { $ldLib = Join-Path (Split-Path $ldDir -Parent) 'lib' }
+          Write-Host "MinGW ld.exe = $ldExe"
+          Write-Host "MinGW libdir = $ldLib"
+          # Prepend to PATH and export for build.bat
+          Add-Content -Path $env:GITHUB_PATH -Value $ldDir
+          "LD_EXE=$ldExe"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "LD_LIBDIR=$ldLib"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install NSIS (chocolatey)
         shell: pwsh
@@ -121,7 +134,9 @@ jobs:
         shell: pwsh
         run: |
           nasm -v
-          (Get-Command ld.exe -ErrorAction SilentlyContinue).Source
+          Write-Host "LD_EXE    = $env:LD_EXE"
+          Write-Host "LD_LIBDIR = $env:LD_LIBDIR"
+          & $env:LD_EXE --version | Select-Object -First 1
           & "C:\Program Files (x86)\NSIS\makensis.exe" /VERSION
 
       - name: Build terminal.exe
