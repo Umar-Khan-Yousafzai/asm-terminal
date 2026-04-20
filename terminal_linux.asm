@@ -510,6 +510,8 @@ section .data
     err_source_len  equ $ - err_source_msg - 1
     err_source_open db "Error: source: could not open file.", 10, 0
     err_source_o_len equ $ - err_source_open - 1
+    err_source_depth_msg db "Error: source: recursion depth exceeded.", 10, 0
+    err_source_depth_len equ $ - err_source_depth_msg - 1
 
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
@@ -821,6 +823,7 @@ section .bss
 
     ; --- Source command ---
     source_read_buf     resb READ_BUF_SIZE  ; dedicated buffer for source
+    source_depth        resd 1              ; recursion depth counter
 
     ; --- Reverse history search ---
     search_buf          resb 256    ; characters typed during search
@@ -5757,6 +5760,11 @@ handler_source:
     cmp byte [rdi], 0
     je .hsrc_noargs
 
+    ; Cap recursion depth to prevent stack growth from self-sourcing
+    cmp dword [source_depth], 10
+    jge .hsrc_depth_err
+    inc dword [source_depth]
+
     ; rdi already points to the filename -- open it
     mov esi, O_RDONLY
     xor edx, edx
@@ -5850,14 +5858,23 @@ handler_source:
     lea rdi, [err_source_msg]
     mov esi, err_source_len
     call print_string_len
-    jmp .hsrc_done
+    jmp .hsrc_done_nodepth
 
 .hsrc_open_err:
     lea rdi, [err_source_open]
     mov esi, err_source_o_len
     call print_string_len
+    jmp .hsrc_done
+
+.hsrc_depth_err:
+    lea rdi, [err_source_depth_msg]
+    mov esi, err_source_depth_len
+    call print_string_len
+    jmp .hsrc_done_nodepth
 
 .hsrc_done:
+    dec dword [source_depth]
+.hsrc_done_nodepth:
     add rsp, 24
     pop r13
     pop r12
