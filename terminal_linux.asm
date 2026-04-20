@@ -400,9 +400,14 @@ section .data
     cmd_s_alias     db "alias", 0
     cmd_s_unset     db "unset", 0
     cmd_s_export    db "export", 0
+    cmd_s_unalias   db "unalias", 0
 
     err_unset_usage db "Usage: unset VAR", 10, 0
     err_unset_usage_len equ $ - err_unset_usage - 1
+    err_unalias_usage db "Usage: unalias NAME", 10, 0
+    err_unalias_usage_len equ $ - err_unalias_usage - 1
+    err_unalias_notfound db "unalias: not found.", 10, 0
+    err_unalias_notfound_len equ $ - err_unalias_notfound - 1
 
 ; ============================================================================
 ; Command dispatch tables
@@ -448,9 +453,10 @@ section .data
         dq cmd_s_grep,   handler_grep,   4
         dq cmd_s_calc,   handler_calc,   4
         dq cmd_s_theme,  handler_theme,  5
-        dq cmd_s_fg,     handler_fg,     2
-        dq cmd_s_unset,  handler_unset,  5
-        dq cmd_s_export, handler_set,    6
+        dq cmd_s_fg,       handler_fg,       2
+        dq cmd_s_unset,    handler_unset,    5
+        dq cmd_s_export,   handler_set,      6
+        dq cmd_s_unalias,  handler_unalias,  7
         dq 0, 0, 0
 
 ; ============================================================================
@@ -4938,6 +4944,61 @@ handler_alias:
 
 .hal_done:
     add rsp, 24
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
+; handler_unalias - Remove an alias by name (soft-delete: clear first byte)
+; ============================================================================
+handler_unalias:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    test rdi, rdi
+    jz .hua_usage
+    cmp byte [rdi], 0
+    je .hua_usage
+
+    mov r12, rdi
+    lea rbx, [alias_table]
+    xor r13d, r13d                   ; r13 = index (str_icompare clobbers rcx)
+.hua_scan:
+    cmp r13d, [alias_count]
+    jge .hua_notfound
+    cmp byte [rbx], 0
+    je .hua_next
+    mov rdi, r12
+    mov rsi, rbx
+    call str_icompare
+    test eax, eax
+    jnz .hua_next
+    mov byte [rbx], 0
+    jmp .hua_done
+.hua_next:
+    add rbx, ALIAS_ENTRY_SIZE
+    inc r13d
+    jmp .hua_scan
+
+.hua_usage:
+    lea rdi, [err_unalias_usage]
+    mov esi, err_unalias_usage_len
+    call print_string_len
+    jmp .hua_done
+
+.hua_notfound:
+    lea rdi, [err_unalias_notfound]
+    mov esi, err_unalias_notfound_len
+    call print_string_len
+
+.hua_done:
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
