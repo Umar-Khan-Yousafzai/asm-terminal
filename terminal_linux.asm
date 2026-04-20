@@ -2735,6 +2735,24 @@ parse_redirection:
     movzx eax, byte [r12]
     test al, al
     jz .pr_finish
+
+    ; Detect '2>' / '2>>' / '2>&1' / '&>' (stderr redirect) — these are
+    ; passed through unchanged so /bin/sh interprets them for external
+    ; commands. Builtins don't support stderr redirect.
+    cmp al, '2'
+    jne .pr_check_amp
+    cmp byte [r12 + 1], '>'
+    jne .pr_normal
+    jmp .pr_passthrough_redir
+
+.pr_check_amp:
+    cmp al, '&'
+    jne .pr_normal
+    cmp byte [r12 + 1], '>'
+    jne .pr_normal
+    jmp .pr_passthrough_redir
+
+.pr_normal:
     cmp al, '>'
     je .pr_out
     cmp al, '<'
@@ -2745,6 +2763,46 @@ parse_redirection:
     inc r12
     inc r13
     jmp .pr_loop
+
+.pr_passthrough_redir:
+    ; Copy the fd digit ('2' or '&'), the '>' (and maybe second '>'),
+    ; then whatever comes until whitespace/EOL (could be '&1', filename, etc.)
+    mov [r13], al                   ; copy fd digit or '&'
+    inc r12
+    inc r13
+    mov [r13], byte '>'
+    inc r12
+    inc r13
+    cmp byte [r12], '>'
+    jne .pr_pt_after_op
+    mov [r13], byte '>'
+    inc r12
+    inc r13
+.pr_pt_after_op:
+    ; Optional spaces
+.pr_pt_sp:
+    cmp byte [r12], ' '
+    jne .pr_pt_copy_target
+    mov [r13], byte ' '
+    inc r12
+    inc r13
+    jmp .pr_pt_sp
+.pr_pt_copy_target:
+    ; Copy target bytes up to next whitespace or EOL or '>' / '<'
+.pr_pt_tgt:
+    movzx eax, byte [r12]
+    test al, al
+    jz .pr_loop
+    cmp al, ' '
+    je .pr_loop
+    cmp al, '>'
+    je .pr_loop
+    cmp al, '<'
+    je .pr_loop
+    mov [r13], al
+    inc r12
+    inc r13
+    jmp .pr_pt_tgt
 
 .pr_out:
     inc r12
