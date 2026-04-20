@@ -521,6 +521,11 @@ section .data
     str_term        db "TERM", 0
     str_term_dumb   db "dumb", 0
 
+    ; --- OSC 7 (cwd notification) prefix + terminator ---
+    osc7_prefix     db 27, "]7;file://", 0
+    osc7_prefix_len equ $ - osc7_prefix - 1
+    osc7_bel        db 7, 0
+
     ; --- Compound command error ---
     err_compound_msg db "Error: command failed, aborting &&-chain.", 10, 0
     err_compound_len equ $ - err_compound_msg - 1
@@ -7628,6 +7633,39 @@ calc_parse_number:
 ; ============================================================================
 
 ; ============================================================================
+; ============================================================================
+; emit_osc7_cwd - emit ESC]7;file://host/path BEL so modern terminals
+; (Ghostty, WezTerm, iTerm2, kitty, Warp, VS Code) track the shell's cwd.
+; ============================================================================
+emit_osc7_cwd:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+
+    lea rdi, [osc7_prefix]
+    mov esi, osc7_prefix_len
+    call print_string_len
+
+    lea rdi, [cached_hostname]
+    call print_cstring
+
+    lea rdi, [path_buf]
+    mov esi, MAX_PATH_BUF
+    mov eax, SYS_GETCWD
+    syscall
+    test rax, rax
+    jle .osc7_done
+
+    lea rdi, [path_buf]
+    call print_cstring
+
+.osc7_done:
+    lea rdi, [osc7_bel]
+    call print_cstring
+
+    leave
+    ret
+
 ; init_prompt_cache - Cache username and hostname at startup
 ; ============================================================================
 init_prompt_cache:
@@ -7697,6 +7735,8 @@ print_prompt:
     push rbx
     push r12
     sub rsp, 16
+
+    call emit_osc7_cwd
 
     mov eax, [current_theme]
     mov r12d, eax
