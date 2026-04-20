@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.obj
+terminal
+terminal.exe
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# AI tooling (local only)
+.claude/
+.aider*
+
+# OS junk
+.DS_Store
+Thumbs.db
