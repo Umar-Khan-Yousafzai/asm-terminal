@@ -992,11 +992,15 @@ setup_raw_mode:
     dec ecx
     jnz .copy_termios
 
-    ; Clear ICANON and ECHO in c_lflag (offset 12 in termios)
-    ; Keep ISIG set so signals still work at kernel level
+    ; Clear ICANON, ECHO, and ISIG in c_lflag (offset 12 in termios)
+    ; Clearing ISIG prevents Ctrl+Z (SIGTSTP) from suspending the shell
+    ; and Ctrl+C (SIGINT) from being handled at kernel level — we handle
+    ; Ctrl+C in software via read_key, and Ctrl+Z is now consumed as a
+    ; regular keystroke (no-op) to avoid dropping the shell into the
+    ; background.
     lea rax, [raw_termios]
     mov edx, [rax + TERMIOS_C_LFLAG]
-    and edx, ~(ICANON | ECHO_FLAG)  ; clear ICANON and ECHO
+    and edx, ~(ICANON | ECHO_FLAG | ISIG)  ; clear ICANON, ECHO, ISIG
     mov [rax + TERMIOS_C_LFLAG], edx
 
     ; Set VMIN=1 (minimum 1 char for read), VTIME=0 (no timeout)
