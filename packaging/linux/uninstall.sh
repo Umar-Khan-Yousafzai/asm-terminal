@@ -15,10 +15,12 @@ SUDO=""
 
 for f in \
     "$PREFIX/bin/asm" \
+    "$PREFIX/bin/asm-terminal" \
     "$PREFIX/bin/asm-terminal-launch" \
     "$PREFIX/share/applications/asm-terminal.desktop" \
-    "$PREFIX/share/icons/hicolor/scalable/apps/asm-terminal.svg"; do
-    if [ -e "$f" ]; then
+    "$PREFIX/share/icons/hicolor/scalable/apps/asm-terminal.svg" \
+    "$PREFIX"/share/icons/hicolor/*x*/apps/asm-terminal.png; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
         $SUDO rm -f "$f"
         echo "removed $f"
     fi

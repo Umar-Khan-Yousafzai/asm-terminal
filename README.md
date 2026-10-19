@@ -87,11 +87,13 @@ make
 ```
 Produces `terminal` — a statically linked ELF64 binary (~73 KB).
 
-Install for convenience:
+Install with an app-launcher entry and icon (search "ASM" in GNOME, KDE, COSMIC, etc.):
 ```bash
-cp terminal ~/.local/bin/asm
+make install-desktop        # ~/.local/bin/asm-terminal + asm symlink, .desktop file, icons
 ```
-Then run from anywhere with `asm`.
+Or just the binary: `make install`. Run it from anywhere with `asm-terminal` (or `asm`).
+
+If `asm` runs a different program (pwntools ships `/usr/bin/asm` on Fedora), use `asm-terminal`, or put `~/.local/bin` first in your `PATH`. `make install` warns when this happens.
 
 ### Windows
 Requires NASM and MinGW `ld`.

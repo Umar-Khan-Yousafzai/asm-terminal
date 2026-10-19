@@ -29,11 +29,17 @@ bash packaging/linux/uninstall.sh
 
 | Path | Purpose |
 |------|---------|
-| `<prefix>/bin/asm` | The shell itself (~73 KB, static ELF64) |
+| `<prefix>/bin/asm-terminal` | The shell itself (static ELF64) |
+| `<prefix>/bin/asm` | Symlink to `asm-terminal` |
 | `<prefix>/bin/asm-terminal-launch` | Wrapper that opens a terminal emulator running `asm` |
 | `<prefix>/share/applications/asm-terminal.desktop` | Desktop entry (shows in app menu) |
-| `<prefix>/share/icons/hicolor/scalable/apps/asm-terminal.svg` | Icon |
+| `<prefix>/share/icons/hicolor/scalable/apps/asm-terminal.svg` | Icon (vector) |
+| `<prefix>/share/icons/hicolor/<N>x<N>/apps/asm-terminal.png` | Icon, 16 to 512 px |
+
+The `.desktop` file is installed with an absolute `Exec=` path, because the desktop session's `PATH` often lacks `~/.local/bin`.
+
+To change the icon, edit `asm-terminal.svg` and run `sh packaging/linux/render-icons.sh` to regenerate the PNGs.
 
 ## How the "app" experience works
 
-`asm` itself is a shell, not a terminal emulator. The `.desktop` file's `Exec=` runs `asm-terminal-launch`, which probes for an installed terminal emulator (gnome-terminal, konsole, kitty, alacritty, foot, xterm, …) and launches it with `asm` as the command. The net effect: clicking the icon opens a fresh terminal window running the ASM shell, exactly like launching Terminator or Konsole.
+`asm` itself is a shell, not a terminal emulator. The `.desktop` file's `Exec=` runs `asm-terminal-launch`, which uses the desktop's own terminal (cosmic-term on COSMIC, Ptyxis or gnome-terminal on GNOME, konsole on KDE), then probes for any other (kitty, alacritty, foot, xterm, …), and runs the shell in it. Set `ASM_TERMINAL_EMULATOR` to force one. The net effect: clicking the icon opens a fresh terminal window running the ASM shell, exactly like launching Terminator or Konsole.

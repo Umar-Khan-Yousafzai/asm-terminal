@@ -20,11 +20,13 @@ install -d "$APPDIR/usr/bin"
 install -d "$APPDIR/usr/share/applications"
 install -d "$APPDIR/usr/share/icons/hicolor/scalable/apps"
 
-install -m 0755 "$BIN"                             "$APPDIR/usr/bin/asm"
+install -m 0755 "$BIN"                             "$APPDIR/usr/bin/asm-terminal"
+ln -sf asm-terminal                                "$APPDIR/usr/bin/asm"
 install -m 0755 "$HERE/../linux/asm-terminal-launch" "$APPDIR/usr/bin/asm-terminal-launch"
 install -m 0644 "$HERE/../linux/asm-terminal.desktop" "$APPDIR/asm-terminal.desktop"
 install -m 0644 "$HERE/../linux/asm-terminal.svg"  "$APPDIR/asm-terminal.svg"
 install -m 0644 "$HERE/../linux/asm-terminal.svg"  "$APPDIR/usr/share/icons/hicolor/scalable/apps/asm-terminal.svg"
+cp -r "$HERE/../linux/icons/hicolor/."             "$APPDIR/usr/share/icons/hicolor/"
 cp "$APPDIR/asm-terminal.desktop" "$APPDIR/usr/share/applications/asm-terminal.desktop"
 
 cat >"$APPDIR/AppRun" <<'RUN'
