@@ -296,6 +296,7 @@ section .data
                     db "  SYSTEM", 10
                     db "  ---------------------------------------------------", 10
                     db "    ver             Show version info", 10
+                    db "    about           About ASM Terminal and its developer", 10
                     db "    date            Show current date and time", 10
                     db "                    date   -> Fri Apr  3 08:14:01 PM PKT 2026", 10
                     db "    time            Same as date", 10
@@ -360,8 +361,17 @@ section .data
                     db 10, 0
     help_len        equ $ - help_msg - 1
 
-    ver_msg         db "ASM Terminal v2.0 [x86-64 NASM/Linux]", 10, 0
+    ver_msg         db "ASM Terminal v2.0 [x86-64 NASM/Linux] - developed by Omar Farooq Khan", 10, 0
     ver_len         equ $ - ver_msg - 1
+    about_msg       db 10
+                    db "  ASM Terminal v2.0 with ASH (Assembly Shell)", 10
+                    db "  A terminal shell written entirely in x86-64 assembly (NASM).", 10
+                    db "  No libc, no runtime: raw Linux syscalls only.", 10
+                    db 10
+                    db "  Developed by: Omar Farooq Khan", 10
+                    db "  Source:       https://github.com/Umar-Khan-Yousafzai/asm-terminal", 10
+                    db 10, 0
+    about_len       equ $ - about_msg - 1
     err_cd_msg      db "Error: Could not change directory.", 10, 0
     err_cd_len      equ $ - err_cd_msg - 1
     err_exec_msg    db "Error: Could not execute command.", 10, 0
@@ -402,6 +412,7 @@ section .data
     cmd_s_cls       db "cls", 0
     cmd_s_exit      db "exit", 0
     cmd_s_ver       db "ver", 0
+    cmd_s_about     db "about", 0
     cmd_s_date      db "date", 0
     cmd_s_time      db "time", 0
     cmd_s_pwd       db "pwd", 0
@@ -443,6 +454,7 @@ section .data
         dq cmd_s_cls,    handler_cls
         dq cmd_s_exit,   handler_exit
         dq cmd_s_ver,    handler_ver
+        dq cmd_s_about,  handler_about
         dq cmd_s_date,   handler_date
         dq cmd_s_time,   handler_time
         dq cmd_s_pwd,    handler_pwd
@@ -3574,6 +3586,19 @@ handler_ver:
 
     lea rdi, [ver_msg]
     mov esi, ver_len
+    call print_string_len
+
+    leave
+    ret
+
+; ---------- handler_about ----------
+handler_about:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+
+    lea rdi, [about_msg]
+    mov esi, about_len
     call print_string_len
 
     leave

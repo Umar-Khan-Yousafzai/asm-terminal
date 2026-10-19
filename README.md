@@ -62,6 +62,12 @@ Three presets: `default`, `minimal`, `classic`. Switch with `theme <name>`.
 
 ---
 
+## Author
+
+Developed by **Omar Farooq Khan**. Run `about` inside the terminal for details.
+
+---
+
 ## Build
 
 ### Linux
