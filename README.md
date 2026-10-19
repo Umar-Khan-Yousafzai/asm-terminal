@@ -164,7 +164,7 @@ asm-terminal/
 
 **Dispatch**
 - `dispatch_command` — expand env vars, check aliases, parse redirection, match exact/prefix tables, fall back to `execute_external`
-- `execute_compound` — split on `;` and `&&`, dispatch each segment
+- `ash_eval` — ASH script engine (`ash/script.asm`): runs `;` `&&` `||`, `if`, `while`, `for` natively
 - Handlers: `handler_*(rdi=args)`
 
 ### Memory layout (`.bss`, ~120 KB)
