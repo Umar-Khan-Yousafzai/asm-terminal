@@ -5275,6 +5275,19 @@ execute_external:
 
 .ee_bg_trimmed:
 .ee_no_bg:
+    ; ASH: run foreground commands and pipelines natively when the
+    ; parser understands the whole line; otherwise fall back to /bin/sh.
+    test r14d, r14d
+    jnz .ee_legacy
+    lea rdi, [input_buf]
+    call ash_parse
+    test eax, eax
+    jz .ee_legacy
+    mov edi, eax
+    call ash_run
+    jmp .ee_done
+
+.ee_legacy:
     ; Restore terminal to cooked mode so child process gets sane terminal
     call restore_terminal
 
@@ -9501,3 +9514,6 @@ align 1
 ; ============================================================================
 ; End of Part 2
 ; ============================================================================
+
+; ASH native executor (milestone 1)
+%include "ash/ash_exec.asm"
