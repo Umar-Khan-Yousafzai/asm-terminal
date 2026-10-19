@@ -347,6 +347,8 @@ section .data
                     db "                    echo hi ; echo bye", 10
                     db "    cmd1 && cmd2    Run next only if prev succeeded", 10
                     db "                    mkdir d && cd d", 10
+                    db "    cmd1 || cmd2    Run next only if prev failed", 10
+                    db "                    cd /x || echo no such dir", 10
                     db "    cmd > file      Redirect output to file", 10
                     db "                    ls > files.txt", 10
                     db "    cmd >> file     Append output to file", 10
@@ -356,6 +358,19 @@ section .data
                     db "                    ls | grep .asm", 10
                     db "    $VAR            Expand environment variable", 10
                     db "                    echo $HOME", 10
+                    db "    $? $$ $((1+2))  Last status, shell PID, arithmetic", 10
+                    db "    NAME=value      Set a variable", 10
+                    db 10
+                    db "  SCRIPTING (ASH)", 10
+                    db "  ---------------------------------------------------", 10
+                    db "    if CMD; then ...; elif CMD; then ...; else ...; fi", 10
+                    db "    while CMD; do ...; done     until CMD; do ...; done", 10
+                    db "    for x in a b c; do echo $x; done", 10
+                    db "    break / continue / ! CMD / { cmd1; cmd2; }", 10
+                    db "    name() { echo $1 $#; return 0; }   define a function", 10
+                    db "    test EXPR, [ EXPR ]  -f -d -e -z -n = != -eq -lt -gt ...", 10
+                    db "                    i=0; while [ $i -lt 3 ]; do i=$((i+1)); done", 10
+                    db "    Blocks can span lines; ASH shows '> ' until it is complete.", 10
                     db "    Tab             Filename completion", 10
                     db "    Up/Down         Browse command history", 10
                     db "    Ctrl+R          Reverse search history", 10
@@ -469,6 +484,9 @@ section .data
         dq bi_s_false,   handler_false
         dq bi_s_clear,   handler_cls
         dq bi_s_history, handler_history
+        dq ash_s_test,   handler_test
+        dq ash_s_lbracket, handler_bracket
+        dq ash_s_colon,  handler_true
         dq cmd_s_date,   handler_date
         dq cmd_s_time,   handler_time
         dq cmd_s_pwd,    handler_pwd
@@ -504,6 +522,9 @@ section .data
         dq bi_s_which,   handler_which,  5
         dq bi_s_history, handler_history, 7
         dq bi_s_kill,    handler_kill,   4
+        dq ash_s_test,   handler_test,   4
+        dq ash_s_lbracket, handler_bracket, 1
+        dq ash_s_colon,  handler_true,   1
         dq cmd_s_ls,     handler_ls,     2
         dq cmd_s_grep,   handler_grep,   4
         dq cmd_s_calc,   handler_calc,   4
@@ -961,7 +982,6 @@ section .bss
 
     ; --- Compound command execution ---
     last_exit_status    resd 1      ; 0 = success, nonzero = failure
-    compound_buf        resb MAX_INPUT  ; temp copy of full input for splitting
 
     ; --- Source command ---
     source_read_buf     resb READ_BUF_SIZE  ; dedicated buffer for source
@@ -1144,8 +1164,9 @@ main:
     lea rdi, [osc133_c]
     call print_cstring
 
-    ; Execute command (supports ; and && compound commands)
-    call execute_compound
+    ; Run it through the ASH script engine (; && || if while for ...).
+    ; An open block waits for more lines behind a "> " prompt.
+    call ash_feed_line
 
     ; OSC 133 D;<exit_status> — end of command + exit code
     lea rdi, [osc133_d_pre]
@@ -1158,7 +1179,8 @@ main:
     jmp .main_loop
 
 .main_eof:
-    xor edi, edi
+    call ash_feed_eof               ; run or report an unfinished block
+    mov edi, [last_exit_status]
     mov eax, SYS_EXIT
     syscall
 
@@ -2122,6 +2144,8 @@ read_line:
 
 .rl_ctrlc:
     mov byte [ctrl_c_flag], 0
+    mov byte [ash_cont], 0          ; Ctrl+C also drops an unfinished block
+    mov dword [ash_pending_len], 0
     mov dword [line_len], 0
     mov dword [line_cursor], 0
     mov byte [line_buf], 0
@@ -2928,11 +2952,12 @@ dispatch_command:
     push r14
     sub rsp, 32
 
-    ; Assume success by default (overwritten on failure)
-    mov dword [last_exit_status], 0
-
-    ; Expand environment variables ($VAR, ${VAR})
+    ; Expand environment variables ($VAR, ${VAR}, $?, $((...)))
     call expand_env_vars
+
+    ; Assume success by default (overwritten on failure). Done after the
+    ; expansion so "$?" still sees the previous command's status.
+    mov dword [last_exit_status], 0
 
     ; Check aliases
     call check_alias
@@ -2945,6 +2970,13 @@ dispatch_command:
     jz .dc_no_pipe
     cmp al, '|'
     je .dc_external
+    cmp al, '`'                     ; command substitution -> /bin/sh
+    je .dc_external
+    cmp al, '$'
+    jne .dc_pipe_next
+    cmp byte [rdi + 1], '('
+    je .dc_external
+.dc_pipe_next:
     inc rdi
     jmp .dc_pipe_check
 
@@ -3051,20 +3083,49 @@ expand_env_vars:
 
     lea r12, [input_buf]           ; source pointer
     lea r13, [env_expand_buf]      ; destination pointer
-    lea r14, [env_expand_buf + 1000] ; rough end guard
-    mov byte [rbp - 8], 1          ; at-word-start flag
+    lea r14, [env_expand_buf + MAX_INPUT - 1] ; result goes back to input_buf
+    mov byte [rbp - 40], 1          ; at-word-start flag
+    mov byte [rbp - 48], 0          ; inside "..."
 
 .ev_loop:
     movzx eax, byte [r12]
     test al, al
     jz .ev_done
 
+    cmp al, '"'
+    jne .ev_not_dq
+    xor byte [rbp - 48], 1
+    jmp .ev_regular
+.ev_not_dq:
+    cmp al, 0x27                    ; '...' is copied as-is (no expansion)
+    jne .ev_not_sq
+    cmp byte [rbp - 48], 0
+    jne .ev_regular
+.ev_sq_copy:
+    cmp r13, r14
+    jae .ev_done
+    mov [r13], al
+    inc r13
+    inc r12
+    movzx eax, byte [r12]
+    test al, al
+    jz .ev_done
+    cmp al, 0x27
+    jne .ev_sq_copy
+    cmp r13, r14
+    jae .ev_done
+    mov [r13], al
+    inc r13
+    inc r12
+    mov byte [rbp - 40], 0
+    jmp .ev_loop
+.ev_not_sq:
     cmp al, '$'
     je .ev_dollar
 
     cmp al, '~'
     jne .ev_regular
-    cmp byte [rbp - 8], 0          ; only expand at word start
+    cmp byte [rbp - 40], 0          ; only expand at word start
     je .ev_regular
     movzx ecx, byte [r12 + 1]
     test cl, cl
@@ -3082,10 +3143,10 @@ expand_env_vars:
     mov [r13], al
     inc r12
     inc r13
-    mov byte [rbp - 8], 0
+    mov byte [rbp - 40], 0
     cmp al, ' '
     jne .ev_loop
-    mov byte [rbp - 8], 1
+    mov byte [rbp - 40], 1
     jmp .ev_loop
 
 .ev_tilde:
@@ -3106,7 +3167,7 @@ expand_env_vars:
     inc rcx
     jmp .ev_tilde_cp
 .ev_tilde_done:
-    mov byte [rbp - 8], 0
+    mov byte [rbp - 40], 0
     jmp .ev_loop
 
 .ev_tilde_literal:
@@ -3114,13 +3175,57 @@ expand_env_vars:
     jae .ev_done
     mov byte [r13], '~'
     inc r13
-    mov byte [rbp - 8], 0
+    mov byte [rbp - 40], 0
     jmp .ev_loop
 
 .ev_dollar:
     inc r12                         ; skip '$'
     movzx eax, byte [r12]
 
+    cmp al, '?'
+    je .ev_status
+    cmp al, '$'
+    je .ev_pid
+    cmp al, '#'                     ; $# $@ $* (function arguments)
+    je .ev_special
+    cmp al, '@'
+    je .ev_special
+    cmp al, '*'
+    jne .ev_not_special
+    mov al, '@'
+.ev_special:
+    inc r12
+    lea rdi, [env_var_name]
+    mov [rdi], al
+    mov byte [rdi + 1], 0
+    jmp .ev_lookup
+.ev_not_special:
+    cmp al, '('
+    jne .ev_not_arith
+    cmp byte [r12 + 1], '('
+    jne .ev_not_arith
+    lea rdi, [r12 + 2]
+    call ash_expand_arith           ; result in ash_num_buf
+    test rax, rax
+    jz .ev_literal_dollar           ; no closing "))"
+    mov r12, rax
+    lea rcx, [ash_num_buf]
+    jmp .ev_cpval
+.ev_status:
+    inc r12
+    movsxd rsi, dword [last_exit_status]
+    jmp .ev_emit_num
+.ev_pid:
+    inc r12
+    mov eax, 39                     ; getpid
+    syscall
+    mov rsi, rax
+.ev_emit_num:
+    lea rdi, [ash_num_buf]
+    call ash_fmt_int
+    lea rcx, [ash_num_buf]
+    jmp .ev_cpval
+.ev_not_arith:
     ; Check for ${VAR} form
     cmp al, '{'
     je .ev_brace
@@ -3134,7 +3239,7 @@ expand_env_vars:
     cmp al, '_'
     je .ev_name_ok
     cmp al, 'A'
-    jb .ev_name_end
+    jb .ev_name_check_digit         ; digits sort below 'A'
     cmp al, 'Z'
     jbe .ev_name_ok
     cmp al, 'a'
@@ -3596,8 +3701,8 @@ handler_exit:
     ; Restore terminal to cooked mode before exiting
     call restore_terminal
 
-    ; sys_exit(0)
-    xor edi, edi
+    ; exit with the status of the last command (like sh)
+    mov edi, [last_exit_status]
     mov eax, SYS_EXIT
     syscall
     ; Does not return
@@ -6374,57 +6479,10 @@ run_autoexec:
     lea rcx, [read_buffer]
     mov byte [rcx + r12], 0
 
-    ; Process line by line
-    lea r13, [read_buffer]
-
-.ra_line:
-    cmp byte [r13], 0
-    je .ra_done
-
-    ; Copy one line to input_buf
-    lea rdi, [input_buf]
-    xor ecx, ecx
-.ra_cpy:
-    movzx eax, byte [r13]
-    cmp al, 0
-    je .ra_exec
-    cmp al, 13                      ; skip CR
-    je .ra_skip_cr
-    cmp al, 10                      ; LF = end of line
-    je .ra_exec
-    cmp ecx, MAX_INPUT - 1          ; bounds check
-    jge .ra_truncate
-    mov [rdi + rcx], al
-    inc ecx
-    inc r13
-    jmp .ra_cpy
-
-.ra_truncate:
-    inc r13
-    movzx eax, byte [r13]
-    cmp al, 0
-    je .ra_exec
-    cmp al, 10
-    je .ra_exec
-    jmp .ra_truncate
-
-.ra_skip_cr:
-    inc r13
-    jmp .ra_cpy
-
-.ra_exec:
-    ; Skip past LF if present
-    cmp byte [r13], 10
-    jne .ra_no_lf
-    inc r13
-.ra_no_lf:
-    mov byte [rdi + rcx], 0
-    test ecx, ecx
-    jz .ra_line                     ; empty line, skip
-
-    ; Dispatch the command
-    call dispatch_command
-    jmp .ra_line
+    ; Run the whole file through the ASH script engine
+    lea rdi, [read_buffer]
+    mov esi, 1
+    call ash_eval
 
 .ra_done:
     add rsp, 24
@@ -6683,38 +6741,10 @@ run_asmrc:
     lea rcx, [read_buffer]
     mov byte [rcx + r12], 0
 
-    ; Process line by line
-    lea r13, [read_buffer]
-.rc_line:
-    cmp byte [r13], 0
-    je .rc_done
-    lea rdi, [input_buf]
-    xor ecx, ecx
-.rc_cpy:
-    movzx eax, byte [r13]
-    cmp al, 0
-    je .rc_exec
-    cmp al, 13
-    je .rc_skip_cr
-    cmp al, 10
-    je .rc_exec
-    mov [rdi + rcx], al
-    inc ecx
-    inc r13
-    jmp .rc_cpy
-.rc_skip_cr:
-    inc r13
-    jmp .rc_cpy
-.rc_exec:
-    cmp byte [r13], 10
-    jne .rc_no_lf
-    inc r13
-.rc_no_lf:
-    mov byte [rdi + rcx], 0
-    test ecx, ecx
-    jz .rc_line
-    call dispatch_command
-    jmp .rc_line
+    ; Run the whole file through the ASH script engine
+    lea rdi, [read_buffer]
+    mov esi, 1
+    call ash_eval
 
 .rc_done:
     add rsp, 8
@@ -6764,166 +6794,6 @@ check_wildcard_in_args:
 
 .cwa_not_found:
     xor eax, eax
-    ret
-
-
-; ============================================================================
-; execute_compound - Split input_buf on ';' and '&&', execute each segment
-; ============================================================================
-execute_compound:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    sub rsp, 24
-
-    ; Initialize exit status
-    mov dword [last_exit_status], 0
-
-    ; Copy input_buf -> compound_buf (we will scan compound_buf)
-    lea rdi, [compound_buf]
-    lea rsi, [input_buf]
-    call str_copy
-
-    ; r12 = current scan position in compound_buf
-    lea r12, [compound_buf]
-
-.ec_next_segment:
-    ; Skip leading spaces
-    cmp byte [r12], ' '
-    jne .ec_find_sep
-    inc r12
-    jmp .ec_next_segment
-
-    ; Check if we're at end of string (no more segments)
-.ec_find_sep:
-    cmp byte [r12], 0
-    je .ec_done                     ; nothing left
-
-    ; r13 = start of this segment (after skipping spaces)
-    mov r13, r12
-
-    ; Scan forward for ';' or '&&'
-    ; r14 will store: 0 = end of string, 1 = found ';', 2 = found '&&'
-    xor r14d, r14d                  ; separator type
-    ; r15 = pointer to the separator character
-.ec_scan:
-    movzx eax, byte [r12]
-    test al, al
-    jz .ec_segment_end              ; end of string, last segment
-
-    cmp al, ';'
-    je .ec_found_semi
-
-    cmp al, '&'
-    jne .ec_check_or
-    ; Check for '&&'
-    cmp byte [r12 + 1], '&'
-    je .ec_found_and
-    jmp .ec_scan_next
-
-.ec_check_or:
-    cmp al, '|'
-    jne .ec_scan_next
-    ; '||' acts as logical-or separator (skip next if prev succeeded)
-    cmp byte [r12 + 1], '|'
-    je .ec_found_or
-
-.ec_scan_next:
-    inc r12
-    jmp .ec_scan
-
-.ec_found_semi:
-    mov r14d, 1                     ; type = semicolon
-    mov r15, r12                    ; save separator position
-    mov byte [r12], 0              ; null-terminate this segment
-    inc r12                         ; advance past ';'
-    jmp .ec_execute_segment
-
-.ec_found_and:
-    mov r14d, 2                     ; type = '&&'
-    mov r15, r12                    ; save separator position
-    mov byte [r12], 0              ; null-terminate this segment
-    add r12, 2                      ; advance past '&&'
-    jmp .ec_execute_segment
-
-.ec_found_or:
-    mov r14d, 3                     ; type = '||'
-    mov r15, r12
-    mov byte [r12], 0
-    add r12, 2
-    jmp .ec_execute_segment
-
-.ec_segment_end:
-    ; No separator found -- this is the last (or only) segment
-    xor r14d, r14d                  ; type = none (last segment)
-
-.ec_execute_segment:
-    ; r13 = start of segment, null-terminated
-    ; Trim trailing spaces from the segment
-    mov rdi, r13
-    call str_len
-    test eax, eax
-    jz .ec_check_continue           ; empty segment, skip
-
-    ; Trim trailing spaces
-    lea rbx, [r13 + rax]           ; rbx = points to the null terminator
-.ec_trim_trail:
-    cmp rbx, r13
-    je .ec_trim_done
-    cmp byte [rbx - 1], ' '
-    jne .ec_trim_done
-    dec rbx
-    jmp .ec_trim_trail
-.ec_trim_done:
-    mov byte [rbx], 0
-
-    ; Check if segment is empty after trimming
-    cmp byte [r13], 0
-    je .ec_check_continue
-
-    ; Copy segment to input_buf for dispatch
-    lea rdi, [input_buf]
-    mov rsi, r13
-    call str_copy
-
-    ; Dispatch this segment
-    call dispatch_command
-
-.ec_check_continue:
-    ; type 0 = end, 1 = ';', 2 = '&&', 3 = '||'
-    test r14d, r14d
-    jz .ec_done
-
-    cmp r14d, 2
-    je .ec_and_check
-    cmp r14d, 3
-    je .ec_or_check
-    jmp .ec_next_segment            ; ';' -> unconditional continue
-
-.ec_and_check:
-    ; '&&': continue only if previous succeeded
-    cmp dword [last_exit_status], 0
-    jne .ec_done
-    jmp .ec_next_segment
-
-.ec_or_check:
-    ; '||': continue only if previous failed
-    cmp dword [last_exit_status], 0
-    je .ec_done
-    jmp .ec_next_segment
-
-.ec_done:
-    add rsp, 24
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
     ret
 
 
@@ -6980,64 +6850,11 @@ handler_source:
     lea rcx, [source_read_buf]
     mov byte [rcx + r12], 0
 
-    ; Process line by line
-    lea r13, [source_read_buf]
-
-.hsrc_line:
-    cmp byte [r13], 0
-    je .hsrc_done
-
-    ; Copy one line to input_buf
-    lea rdi, [input_buf]
-    xor ecx, ecx
-
-.hsrc_cpy:
-    movzx eax, byte [r13]
-    cmp al, 0
-    je .hsrc_exec
-    cmp al, 13                      ; skip CR
-    je .hsrc_skip_cr
-    cmp al, 10                      ; LF = end of line
-    je .hsrc_exec
-    cmp ecx, MAX_INPUT - 1          ; bounds check
-    jge .hsrc_truncate
-    mov [rdi + rcx], al
-    inc ecx
-    inc r13
-    jmp .hsrc_cpy
-
-.hsrc_truncate:
-    ; Skip remaining bytes on this oversized line (discard to LF/NUL)
-    inc r13
-    movzx eax, byte [r13]
-    cmp al, 0
-    je .hsrc_exec
-    cmp al, 10
-    je .hsrc_exec
-    jmp .hsrc_truncate
-
-.hsrc_skip_cr:
-    inc r13
-    jmp .hsrc_cpy
-
-.hsrc_exec:
-    ; Skip past LF if present
-    cmp byte [r13], 10
-    jne .hsrc_no_lf
-    inc r13
-.hsrc_no_lf:
-    mov byte [rdi + rcx], 0
-    test ecx, ecx
-    jz .hsrc_line                   ; empty line, skip
-
-    ; Skip comment lines (starting with '#')
-    lea rax, [input_buf]
-    cmp byte [rax], '#'
-    je .hsrc_line
-
-    ; Dispatch the command
-    call dispatch_command
-    jmp .hsrc_line
+    ; Run the whole file through the ASH script engine
+    lea rdi, [source_read_buf]
+    mov esi, 1
+    call ash_eval
+    jmp .hsrc_done
 
 .hsrc_noargs:
     lea rdi, [err_source_msg]
@@ -8526,6 +8343,15 @@ print_prompt:
     push r12
     sub rsp, 16
 
+    ; Inside an unfinished if/while/for block: short "> " prompt
+    cmp byte [ash_cont], 0
+    je .pp_primary
+    lea rdi, [ash_ps2]
+    call print_cstring
+    mov dword [prompt_total_len], 2
+    jmp .pp_ret
+.pp_primary:
+
     ; "took 2.31s, peak 45.2 MB" after slow commands
     call print_cmd_stats
 
@@ -8655,6 +8481,7 @@ print_prompt:
     ; OSC 133 B — prompt rendering finished, command entry begins
     lea rdi, [osc133_b]
     call print_cstring
+.pp_ret:
 
     add rsp, 16
     pop r12
@@ -8899,6 +8726,10 @@ check_command_exists:
     jmp .cce_prefix_loop
 
 .cce_not_found:
+    mov rdi, r12                    ; if / then / done ... are valid too
+    call ash_kw_match
+    test eax, eax
+    jnz .cce_found
     xor eax, eax
     jmp .cce_done
 
@@ -9572,3 +9403,4 @@ align 1
 %include "ash/ash_exec.asm"
 %include "ash/update.asm"
 %include "ash/builtins.asm"
+%include "ash/script.asm"
