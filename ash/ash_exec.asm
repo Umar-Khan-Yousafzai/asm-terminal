@@ -555,11 +555,15 @@ ash_run:
     mov rdi, r13
     mov rsi, rsp
     xor edx, edx
-    xor r10d, r10d
+    lea r10, [ash_rusage]
     mov eax, SYS_WAIT4
     syscall
     cmp rax, -EINTR
     je .ar_wait_again
+    test rax, rax
+    js .ar_no_rusage
+    call stats_note_rusage          ; keep the biggest peak RSS
+.ar_no_rusage:
     mov eax, [rsp]
     mov edx, eax
     and edx, 0x7F                   ; WTERMSIG

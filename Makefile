@@ -1,5 +1,5 @@
 # ============================================================================
-# ASM Terminal v2.0 — Linux Build
+# ASM Terminal — Linux Build
 # Requires: nasm, ld (binutils)
 #
 # Build targets:
@@ -38,11 +38,13 @@ APPDIR        ?= $(SHAREDIR)/applications
 ICONDIR       ?= $(SHAREDIR)/icons/hicolor/scalable/apps
 INSTALL_NAME  ?= asm
 
-VERSION   ?= 2.0.0
+# Single source of truth: version.inc
+VERSION   ?= $(shell sed -n 's/.*ASM_VERSION "\(.*\)".*/\1/p' version.inc)
+export APP_VERSION ?= $(VERSION)
 DIST_NAME  = asm-terminal-$(VERSION)-linux-x86_64
 WIN_DIST   = asm-terminal-$(VERSION)-windows-x86_64
 
-.PHONY: all clean install install-desktop install-gui uninstall \
+.PHONY: version all clean install install-desktop install-gui uninstall \
         test size dist deb appimage zip-windows release
 
 all: $(TARGET)
@@ -50,8 +52,11 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(LD) $(OBJ) -o $(TARGET) -e _start
 
-$(OBJ): $(SRC) $(wildcard ash/*.asm)
+$(OBJ): $(SRC) version.inc $(wildcard ash/*.asm)
 	$(NASM) -f elf64 $(SRC) -o $(OBJ)
+
+version:
+	@echo $(VERSION)
 
 clean:
 	rm -f $(OBJ) $(TARGET)

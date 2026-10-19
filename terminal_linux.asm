@@ -1,10 +1,12 @@
 ; ============================================================================
-; ASM Terminal v2.0 - Full-featured terminal in x86-64 Assembly (NASM)
+; ASM Terminal - Full-featured terminal in x86-64 Assembly (NASM)
 ; Target: Linux x86-64, using raw syscalls (no libc)
 ; Port of the Windows version to Linux
 ; ============================================================================
 bits 64
 default rel
+
+%include "version.inc"
 
 ; ============================================================================
 ; Linux syscall numbers
@@ -218,13 +220,13 @@ section .data
                     db "   / ___ \ ___) | |  | |", 10
                     db "  /_/   \_\____/|_|  |_|", 10
                     db 10
-                    db "  ASM Terminal v2.0 - x86-64 Assembly Shell", 10
+                    db "  ASM Terminal v", ASM_VERSION, " - x86-64 Assembly Shell", 10
                     db "  Type 'help' for available commands", 10
                     db 10, 0
     welcome_len     equ $ - welcome_msg - 1
 
     help_msg        db 10
-                    db "  ASM Terminal v2.0 - Command Reference", 10
+                    db "  ASM Terminal v", ASM_VERSION, " - Command Reference", 10
                     db "  =====================================================", 10
                     db 10
                     db "  NAVIGATION", 10
@@ -296,6 +298,8 @@ section .data
                     db "  SYSTEM", 10
                     db "  ---------------------------------------------------", 10
                     db "    ver             Show version info", 10
+                    db "    about           About ASM Terminal and its developer", 10
+                    db "    update          Check for a new version ('update install' installs it)", 10
                     db "    date            Show current date and time", 10
                     db "                    date   -> Fri Apr  3 08:14:01 PM PKT 2026", 10
                     db "    time            Same as date", 10
@@ -310,7 +314,12 @@ section .data
                     db "    source <file>   Execute commands from a file", 10
                     db "                    source setup.sh", 10
                     db "    help            This help message", 10
-                    db "    exit            Exit the terminal", 10
+                    db "    exit [N]        Exit the terminal (with status N)", 10
+                    db "    true / false    Set status 0 / 1", 10
+                    db "    clear           Clear screen (same as cls)", 10
+                    db "    which NAME      Show if NAME is a builtin, alias or program", 10
+                    db "    history [-c]    List command history (-c clears it)", 10
+                    db "    kill [-SIG] ID  Send a signal to a PID or %job", 10
                     db 10
                     db "  CUSTOMIZATION", 10
                     db "  ---------------------------------------------------", 10
@@ -360,8 +369,17 @@ section .data
                     db 10, 0
     help_len        equ $ - help_msg - 1
 
-    ver_msg         db "ASM Terminal v2.0 [x86-64 NASM/Linux]", 10, 0
+    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Linux] - developed by Omar Farooq Khan", 10, 0
     ver_len         equ $ - ver_msg - 1
+    about_msg       db 10
+                    db "  ASM Terminal v", ASM_VERSION, " with ASH (Assembly Shell)", 10
+                    db "  A terminal shell written entirely in x86-64 assembly (NASM).", 10
+                    db "  No libc, no runtime: raw Linux syscalls only.", 10
+                    db 10
+                    db "  Developed by: Omar Farooq Khan", 10
+                    db "  Source:       https://github.com/Umar-Khan-Yousafzai/asm-terminal", 10
+                    db 10, 0
+    about_len       equ $ - about_msg - 1
     err_cd_msg      db "Error: Could not change directory.", 10, 0
     err_cd_len      equ $ - err_cd_msg - 1
     err_exec_msg    db "Error: Could not execute command.", 10, 0
@@ -402,6 +420,8 @@ section .data
     cmd_s_cls       db "cls", 0
     cmd_s_exit      db "exit", 0
     cmd_s_ver       db "ver", 0
+    cmd_s_about     db "about", 0
+    cmd_s_update    db "update", 0
     cmd_s_date      db "date", 0
     cmd_s_time      db "time", 0
     cmd_s_pwd       db "pwd", 0
@@ -443,6 +463,12 @@ section .data
         dq cmd_s_cls,    handler_cls
         dq cmd_s_exit,   handler_exit
         dq cmd_s_ver,    handler_ver
+        dq cmd_s_about,  handler_about
+        dq cmd_s_update, handler_update
+        dq bi_s_true,    handler_true
+        dq bi_s_false,   handler_false
+        dq bi_s_clear,   handler_cls
+        dq bi_s_history, handler_history
         dq cmd_s_date,   handler_date
         dq cmd_s_time,   handler_time
         dq cmd_s_pwd,    handler_pwd
@@ -473,6 +499,11 @@ section .data
         dq cmd_s_alias,  handler_alias,  5
         dq cmd_s_source, handler_source, 6
         dq cmd_s_cat,    handler_type,   3
+        dq cmd_s_update, handler_update, 6
+        dq cmd_s_exit,   handler_exit_code, 4
+        dq bi_s_which,   handler_which,  5
+        dq bi_s_history, handler_history, 7
+        dq bi_s_kill,    handler_kill,   4
         dq cmd_s_ls,     handler_ls,     2
         dq cmd_s_grep,   handler_grep,   4
         dq cmd_s_calc,   handler_calc,   4
@@ -1055,6 +1086,9 @@ main:
     lea rdi, [welcome_msg]
     mov esi, welcome_len
     call print_string_len
+
+    ; Flag a newer release (cached), refresh the cache in the background
+    call update_startup
 
     ; Run autoexec.txt if present
     call run_autoexec
@@ -2987,7 +3021,9 @@ dispatch_command:
     jmp .dc_done
 
 .dc_external:
+    call stats_begin
     call execute_external
+    call stats_end
 
 .dc_done:
     call restore_redirection
@@ -3574,6 +3610,19 @@ handler_ver:
 
     lea rdi, [ver_msg]
     mov esi, ver_len
+    call print_string_len
+
+    leave
+    ret
+
+; ---------- handler_about ----------
+handler_about:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+
+    lea rdi, [about_msg]
+    mov esi, about_len
     call print_string_len
 
     leave
@@ -8477,6 +8526,9 @@ print_prompt:
     push r12
     sub rsp, 16
 
+    ; "took 2.31s, peak 45.2 MB" after slow commands
+    call print_cmd_stats
+
     ; Show exit status of last command in red when non-zero (fish-style hint)
     mov eax, [last_exit_status]
     test eax, eax
@@ -9518,3 +9570,5 @@ align 1
 
 ; ASH native executor (milestone 1)
 %include "ash/ash_exec.asm"
+%include "ash/update.asm"
+%include "ash/builtins.asm"

@@ -92,6 +92,8 @@ run_case "unalias removes"            "alias pp=echo aa; pp; unalias pp" "^aa$"
 # --- Timezone env ----
 run_case "ASM_TZ=0 shows UTC-ish"     "set ASM_TZ=0; date"            "[0-9]+"
 
+run_case "about shows developer"     "about"                                     "Developed by: Omar Farooq Khan"
+
 # --- ASH native executor (no /bin/sh) ----
 run_case "ash pipeline"               "printf 'b\\na\\nc\\n' | sort | head -1"   "^a$"
 run_case "ash quotes"                 "printf '%s|%s\\n' 'x y' \"q \\\"z\\\"\""    '^x y\|q "z"$'
@@ -111,6 +113,64 @@ if command -v strace >/dev/null 2>&1; then
         fail=$((fail + 1)); failures+=("ash pipeline spawns no /bin/sh"); echo "  [FAIL] ash pipeline spawned /bin/sh $sh_execs time(s)"
     fi
 fi
+
+# --- Builtins (milestone 2A) ----
+run_case "which builtin"              "which cd"                                  "^cd: shell builtin$"
+run_case "which program"              "which sh"                                  "^/.*/sh$"
+run_case "which alias"                "alias ll=ls -la; which ll"                 "^ll: alias for ls -la$"
+run_case "which missing"              "which nosuch_ash_zz"                       "^nosuch_ash_zz: not found$"
+run_case "false then ||"              "false || echo after-false"                 "^after-false$"
+run_case "true then &&"               "true && echo after-true"                   "^after-true$"
+run_case "kill bad signal"            "kill -NOPE 1"                              "^kill: unknown signal: NOPE$"
+run_case "kill missing job"           "kill %7"                                   "^kill: no such job: %7$"
+run_case "exit needs a number"        "exit abc"                                  "^exit: numeric argument required$"
+printf 'exit 7\n' | "$BIN" >/dev/null 2>&1; code=$?
+if [[ $code == 7 ]]; then
+    pass=$((pass + 1)); echo "  [pass] exit 7 sets status"
+else
+    fail=$((fail + 1)); failures+=("exit 7 sets status"); echo "  [FAIL] exit 7 gave status $code"
+fi
+HTMP=$(mktemp -d)
+hist_out=$(printf 'echo one\necho two\nhistory\nhistory -c\nhistory\nexit\n' | HOME="$HTMP" "$BIN" 2>&1 | strip_ansi)
+if grep -qE '^ +1  echo one$' <<<"$hist_out" && grep -q '^History cleared.$' <<<"$hist_out" && [[ ! -s "$HTMP/.asm_history" || $(wc -l < "$HTMP/.asm_history") -le 2 ]]; then
+    pass=$((pass + 1)); echo "  [pass] history lists and clears"
+else
+    fail=$((fail + 1)); failures+=("history lists and clears"); echo "  [FAIL] history lists and clears"; echo "    got: $(tail -c 300 <<<"$hist_out")"
+fi
+rm -rf "$HTMP"
+
+# --- Version + update (fake curl, no network) ----
+VER=$(sed -n 's/.*ASM_VERSION "\(.*\)".*/\1/p' "$HERE/../version.inc")
+run_case "ver shows version.inc"      "ver"                                       "v$VER "
+UPD=$(mktemp -d)
+mkdir -p "$UPD/bin" "$UPD/srv" "$UPD/inst"
+cp "$BIN" "$UPD/srv/asm-terminal-linux-x86_64"; printf X >> "$UPD/srv/asm-terminal-linux-x86_64"
+(cd "$UPD/srv" && sha256sum asm-terminal-linux-x86_64 > SHA256SUMS)
+echo '{"tag_name": "v99.0.0"}' > "$UPD/srv/latest"
+cat > "$UPD/bin/curl" <<CURL
+#!/usr/bin/env bash
+out=""; url=""
+while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift;; --max-time|-H) shift;; -*) ;; *) url="\$1";; esac; shift; done
+f="$UPD/srv/\$(basename "\$url")"
+[ -f "\$f" ] || exit 22
+if [ -n "\$out" ]; then cp "\$f" "\$out"; else cat "\$f"; fi
+CURL
+chmod +x "$UPD/bin/curl"
+upd_out=$(printf 'update\nexit\n' | env PATH="$UPD/bin:$PATH" HOME="$UPD" "$BIN" 2>&1 | strip_ansi)
+if grep -q "Update available: v$VER -> v99.0.0" <<<"$upd_out"; then
+    pass=$((pass + 1)); echo "  [pass] update detects newer release"
+else
+    fail=$((fail + 1)); failures+=("update detects newer release"); echo "  [FAIL] update detects newer release"; echo "    got: $(tail -c 200 <<<"$upd_out")"
+fi
+# install: run a copy so the real binary is untouched
+cp "$BIN" "$UPD/inst/asm"
+printf 'update install\nexit\n' | env PATH="$UPD/bin:$PATH" HOME="$UPD" "$UPD/inst/asm" >/dev/null 2>&1
+if cmp -s "$UPD/inst/asm" "$UPD/srv/asm-terminal-linux-x86_64" && [[ ! -e "$UPD/inst/asm.new" ]]; then
+    pass=$((pass + 1)); echo "  [pass] update install replaces binary"
+else
+    fail=$((fail + 1)); failures+=("update install replaces binary"); echo "  [FAIL] update install replaces binary"
+fi
+rm -rf "$UPD"
 
 echo
 echo "=== $pass passed, $fail failed ==="
