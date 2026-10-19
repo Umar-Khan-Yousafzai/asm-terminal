@@ -55,7 +55,7 @@ echo [*] LD   : %LD_EXE%
 echo [*] LIB  : %LD_LIBDIR%
 echo.
 echo [*] Assembling terminal.asm ...
-"%NASM_EXE%" -f win64 terminal.asm -o terminal.obj
+"%NASM_EXE%" -I"%~dp0" -f win64 terminal.asm -o terminal.obj
 if errorlevel 1 (
     echo [!] Assembly failed!
     exit /b 1

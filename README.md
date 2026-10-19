@@ -62,6 +62,22 @@ Three presets: `default`, `minimal`, `classic`. Switch with `theme <name>`.
 
 ---
 
+## Versioning and updates
+
+The current version is in [`version.inc`](version.inc) (see [CHANGELOG.md](CHANGELOG.md)). Inside the terminal:
+
+```
+ver               # ASM Terminal v2.1.0 ...
+update            # check GitHub for a newer release
+update install    # download it, verify SHA-256, replace the binary
+```
+
+When a newer release exists, the terminal says so at startup. It checks in the background at most once a day; set `ASM_NO_UPDATE_CHECK=1` to turn that off. Updating needs `curl` and `sha256sum` (present on all mainstream distros). If you installed with a package manager (.deb), update through it instead.
+
+To release: bump `version.inc`, add a CHANGELOG entry, then push a tag `vX.Y.Z`. The release workflow refuses a tag that does not match `version.inc`.
+
+---
+
 ## Build
 
 ### Linux
@@ -217,4 +233,4 @@ MIT — do whatever you want, just don't blame me if you learn too much about th
 
 ## Author
 
-Built by [Umar Khan Yousafzai](https://github.com/Umar-Khan-Yousafzai).
+Developed by **Omar Farooq Khan** ([@Umar-Khan-Yousafzai](https://github.com/Umar-Khan-Yousafzai)). Run `about` inside the terminal for details.
