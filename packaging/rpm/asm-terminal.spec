@@ -37,12 +37,15 @@ for d in icons/hicolor/*x*; do
     s="$(basename "$d")"
     install -Dm0644 "$d/apps/asm-terminal.png" %{buildroot}%{_datadir}/icons/hicolor/$s/apps/asm-terminal.png
 done
+install -Dm0644 icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg \
+    %{buildroot}%{_datadir}/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg
 
 %files
 %{_bindir}/asm-terminal
 %{_bindir}/asm-terminal-launch
 %{_datadir}/applications/asm-terminal.desktop
 %{_datadir}/icons/hicolor/*/apps/asm-terminal.*
+%{_datadir}/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg
 
 %changelog
 * Mon Oct 19 2026 Umar Khan Yousafzai <ionkhan@gmail.com> - 2.1.0-1

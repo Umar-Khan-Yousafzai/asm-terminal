@@ -12,7 +12,7 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SVG="$HERE/asm-terminal.svg"
 OUT="$HERE/icons/hicolor"
-SIZES="16 24 32 48 64 128 256 512"
+SIZES="16 22 24 32 48 64 96 128 192 256 512"
 
 if command -v rsvg-convert >/dev/null 2>&1; then
     for s in $SIZES; do
