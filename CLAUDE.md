@@ -10,6 +10,7 @@ asm-terminal/
   terminal_linux.asm    # Linux version (9,500+ lines, full-featured port)
   ash/ash_exec.asm      # ASH native executor (%included by terminal_linux.asm)
   ash/script.asm        # ASH script engine: if/while/for, && ||, test, $((...))
+  ash/tools.asm         # bench, undo (+ safe del/move/copy wrappers, ~/.asm_trash)
   build.bat             # Windows build script (NASM + MinGW ld)
   Makefile              # Linux build: make / make clean
   terminal.exe          # Windows binary (38KB)

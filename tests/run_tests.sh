@@ -202,6 +202,15 @@ run_case "function over lines"        $'add() {\n  echo $(( $1 + $2 ))\n}\nadd 2
 run_case "case via sh"                "x=b; case \$x in a) echo isA;; b) echo isB;; esac" "^isB$"
 run_case "loop piped via sh"          "for i in 3 1 2; do echo \$i; done | sort | head -1" "^1$"
 run_case "pipe into while read"       "printf 'l1\\nl2\\n' | while read l; do echo got-\$l; done" "^got-l2$"
+run_case "bench reports timing"       "bench -n 3 true"                           "^  mean .* min .* max "
+run_case "bench counts failures"      "bench -n 2 false"                          "failed 2$"
+UT=$(mktemp -d)
+printf 'one\n' > "$UT/a.txt"; printf 'two\n' > "$UT/b.txt"
+HOME="$UT" run_case "undo del"                   "cd $UT; del a.txt; undo; cat a.txt"        "^one$"
+HOME="$UT" run_case "undo move restores both"    "cd $UT; move a.txt b.txt; undo; cat b.txt" "^two$"
+HOME="$UT" run_case "undo copy overwrite"        "cd $UT; copy a.txt b.txt; undo; cat b.txt" "^two$"
+HOME="$UT" run_case "undo empty"                 "undo"                                      "^undo: nothing to undo$"
+rm -rf "$UT"
 src=$(mktemp)
 printf 'total=0\nfor n in 1 2 3 4\ndo\n  if [ $((n %% 2)) -eq 0 ]; then\n    total=$((total + n))\n  fi\ndone\necho even-sum=$total\n' > "$src"
 run_case "source runs blocks"         "source $src"                               "^even-sum=6$"
