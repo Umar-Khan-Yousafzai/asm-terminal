@@ -320,6 +320,10 @@ section .data
                     db "    which NAME      Show if NAME is a builtin, alias or program", 10
                     db "    history [-c]    List command history (-c clears it)", 10
                     db "    kill [-SIG] ID  Send a signal to a PID or %job", 10
+                    db "    bench [-n N] CMD  Time CMD over N runs (mean/min/max, memory)", 10
+                    db "                    bench -n 20 ls -la", 10
+                    db "    undo            Reverse the last del, move/rename or copy", 10
+                    db "                    (del keeps files in ~/.asm_trash)", 10
                     db 10
                     db "  CUSTOMIZATION", 10
                     db "  ---------------------------------------------------", 10
@@ -487,6 +491,7 @@ section .data
         dq ash_s_test,   handler_test
         dq ash_s_lbracket, handler_bracket
         dq ash_s_colon,  handler_true
+        dq tl_s_undo,    handler_undo
         dq cmd_s_date,   handler_date
         dq cmd_s_time,   handler_time
         dq cmd_s_pwd,    handler_pwd
@@ -508,10 +513,10 @@ section .data
         dq cmd_s_type,   handler_type,   4
         dq cmd_s_mkdir,  handler_mkdir,  5
         dq cmd_s_rmdir,  handler_rmdir,  5
-        dq cmd_s_del,    handler_del,    3
-        dq cmd_s_copy,   handler_copy,   4
-        dq cmd_s_move,   handler_move,   4
-        dq cmd_s_rename, handler_rename, 6
+        dq cmd_s_del,    handler_del_safe, 3
+        dq cmd_s_copy,   handler_copy_safe, 4
+        dq cmd_s_move,   handler_move_safe, 4
+        dq cmd_s_rename, handler_move_safe, 6
         dq cmd_s_set,    handler_set,    3
         dq cmd_s_pushd,  handler_pushd,  5
         dq cmd_s_alias,  handler_alias,  5
@@ -525,6 +530,7 @@ section .data
         dq ash_s_test,   handler_test,   4
         dq ash_s_lbracket, handler_bracket, 1
         dq ash_s_colon,  handler_true,   1
+        dq tl_s_bench,   handler_bench,  5
         dq cmd_s_ls,     handler_ls,     2
         dq cmd_s_grep,   handler_grep,   4
         dq cmd_s_calc,   handler_calc,   4
@@ -9404,3 +9410,4 @@ align 1
 %include "ash/update.asm"
 %include "ash/builtins.asm"
 %include "ash/script.asm"
+%include "ash/tools.asm"
