@@ -391,14 +391,15 @@ section .data
                     db 10, 0
     help_len        equ $ - help_msg - 1
 
-    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Linux] - developed by Omar Farooq Khan", 10, 0
+    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Linux] - developed by Umer Farooq Khan", 10, 0
     ver_len         equ $ - ver_msg - 1
     about_msg       db 10
                     db "  ASM Terminal v", ASM_VERSION, " with ASH (Assembly Shell)", 10
                     db "  A terminal shell written entirely in x86-64 assembly (NASM).", 10
                     db "  No libc, no runtime: raw Linux syscalls only.", 10
                     db 10
-                    db "  Developed by: Omar Farooq Khan", 10
+                    db "  Developed by: Umer Farooq Khan", 10
+                    db "  GitHub:       https://github.com/Umar-Khan-Yousafzai", 10
                     db "  Source:       https://github.com/Umar-Khan-Yousafzai/asm-terminal", 10
                     db 10, 0
     about_len       equ $ - about_msg - 1

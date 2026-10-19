@@ -164,7 +164,7 @@ section .data
                     db 13, 10, 0
     help_len        equ $ - help_msg - 1
 
-    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Windows] - developed by Omar Farooq Khan", 13, 10, 0
+    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Windows] - developed by Umer Farooq Khan", 13, 10, 0
     ver_len         equ $ - ver_msg - 1
     err_cd_msg      db "Error: Could not change directory.", 13, 10, 0
     err_cd_len      equ $ - err_cd_msg - 1
