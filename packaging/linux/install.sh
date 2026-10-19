@@ -106,6 +106,9 @@ for png in "$HERE"/icons/hicolor/*/apps/asm-terminal.png; do
     mkdirp "$SHAREDIR/icons/hicolor/$size/apps"
     copy 0644 "$png" "$SHAREDIR/icons/hicolor/$size/apps/asm-terminal.png"
 done
+mkdirp "$SHAREDIR/icons/hicolor/symbolic/apps"
+copy 0644 "$HERE/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg" \
+          "$SHAREDIR/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg"
 
 # Refresh caches (ignore failures — purely a UX improvement)
 if have update-desktop-database; then $SUDO update-desktop-database "$APPDIR" >/dev/null 2>&1 || true; fi

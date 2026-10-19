@@ -80,7 +80,7 @@ install: $(TARGET)
 # Install with .desktop entry + icon + launcher wrapper (recognizable app)
 # ----------------------------------------------------------------------------
 
-ICON_SIZES = 16 24 32 48 64 128 256 512
+ICON_SIZES = 16 22 24 32 48 64 96 128 192 256 512
 
 install-desktop: install
 	install -d "$(APPDIR)" "$(ICONDIR)"
@@ -95,6 +95,9 @@ install-desktop: install
 		install -m 0644 "packaging/linux/icons/hicolor/$${s}x$${s}/apps/asm-terminal.png" \
 		        "$(SHAREDIR)/icons/hicolor/$${s}x$${s}/apps/asm-terminal.png"; \
 	done
+	install -d "$(SHAREDIR)/icons/hicolor/symbolic/apps"
+	install -m 0644 packaging/linux/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg \
+	        "$(SHAREDIR)/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg"
 	-update-desktop-database "$(APPDIR)" 2>/dev/null || true
 	-gtk-update-icon-cache "$(SHAREDIR)/icons/hicolor" 2>/dev/null || true
 	@echo "Installed ASM Terminal with desktop integration."
@@ -109,6 +112,7 @@ uninstall:
 	rm -f "$(APPDIR)/asm-terminal.desktop"
 	rm -f "$(ICONDIR)/asm-terminal.svg"
 	for s in $(ICON_SIZES); do rm -f "$(SHAREDIR)/icons/hicolor/$${s}x$${s}/apps/asm-terminal.png"; done
+	rm -f "$(SHAREDIR)/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg"
 	-update-desktop-database "$(APPDIR)" 2>/dev/null || true
 	-gtk-update-icon-cache "$(SHAREDIR)/icons/hicolor" 2>/dev/null || true
 	@echo "Removed ASM Terminal."
