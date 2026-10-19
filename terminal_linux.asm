@@ -314,7 +314,12 @@ section .data
                     db "    source <file>   Execute commands from a file", 10
                     db "                    source setup.sh", 10
                     db "    help            This help message", 10
-                    db "    exit            Exit the terminal", 10
+                    db "    exit [N]        Exit the terminal (with status N)", 10
+                    db "    true / false    Set status 0 / 1", 10
+                    db "    clear           Clear screen (same as cls)", 10
+                    db "    which NAME      Show if NAME is a builtin, alias or program", 10
+                    db "    history [-c]    List command history (-c clears it)", 10
+                    db "    kill [-SIG] ID  Send a signal to a PID or %job", 10
                     db 10
                     db "  CUSTOMIZATION", 10
                     db "  ---------------------------------------------------", 10
@@ -460,6 +465,10 @@ section .data
         dq cmd_s_ver,    handler_ver
         dq cmd_s_about,  handler_about
         dq cmd_s_update, handler_update
+        dq bi_s_true,    handler_true
+        dq bi_s_false,   handler_false
+        dq bi_s_clear,   handler_cls
+        dq bi_s_history, handler_history
         dq cmd_s_date,   handler_date
         dq cmd_s_time,   handler_time
         dq cmd_s_pwd,    handler_pwd
@@ -491,6 +500,10 @@ section .data
         dq cmd_s_source, handler_source, 6
         dq cmd_s_cat,    handler_type,   3
         dq cmd_s_update, handler_update, 6
+        dq cmd_s_exit,   handler_exit_code, 4
+        dq bi_s_which,   handler_which,  5
+        dq bi_s_history, handler_history, 7
+        dq bi_s_kill,    handler_kill,   4
         dq cmd_s_ls,     handler_ls,     2
         dq cmd_s_grep,   handler_grep,   4
         dq cmd_s_calc,   handler_calc,   4
@@ -3008,7 +3021,9 @@ dispatch_command:
     jmp .dc_done
 
 .dc_external:
+    call stats_begin
     call execute_external
+    call stats_end
 
 .dc_done:
     call restore_redirection
@@ -8511,6 +8526,9 @@ print_prompt:
     push r12
     sub rsp, 16
 
+    ; "took 2.31s, peak 45.2 MB" after slow commands
+    call print_cmd_stats
+
     ; Show exit status of last command in red when non-zero (fish-style hint)
     mov eax, [last_exit_status]
     test eax, eax
@@ -9553,3 +9571,4 @@ align 1
 ; ASH native executor (milestone 1)
 %include "ash/ash_exec.asm"
 %include "ash/update.asm"
+%include "ash/builtins.asm"

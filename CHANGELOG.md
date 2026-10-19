@@ -18,6 +18,11 @@ The version lives in one place: `version.inc`.
 - Releases now ship a bare `asm-terminal-linux-x86_64` binary, `asm-terminal-windows-x86_64.exe`
   and a `SHA256SUMS` file.
 
+- New builtins: `exit N`, `true`, `false`, `clear`, `which`, `history` / `history -c`,
+  `kill [-SIGNAL] PID|%JOB`.
+- Per-command stats: after an external command that ran 1 s or longer, the prompt shows
+  `took 2.31s, peak 45.2 MB` (peak RAM from `wait4`). `set ASM_STATS=1` shows it for every command.
+
 ### Fixed
 - `echo` printed quote characters (`echo -e 'a\nb'` now prints two lines).
 

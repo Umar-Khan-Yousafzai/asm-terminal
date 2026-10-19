@@ -114,6 +114,31 @@ if command -v strace >/dev/null 2>&1; then
     fi
 fi
 
+# --- Builtins (milestone 2A) ----
+run_case "which builtin"              "which cd"                                  "^cd: shell builtin$"
+run_case "which program"              "which sh"                                  "^/.*/sh$"
+run_case "which alias"                "alias ll=ls -la; which ll"                 "^ll: alias for ls -la$"
+run_case "which missing"              "which nosuch_ash_zz"                       "^nosuch_ash_zz: not found$"
+run_case "false then ||"              "false || echo after-false"                 "^after-false$"
+run_case "true then &&"               "true && echo after-true"                   "^after-true$"
+run_case "kill bad signal"            "kill -NOPE 1"                              "^kill: unknown signal: NOPE$"
+run_case "kill missing job"           "kill %7"                                   "^kill: no such job: %7$"
+run_case "exit needs a number"        "exit abc"                                  "^exit: numeric argument required$"
+printf 'exit 7\n' | "$BIN" >/dev/null 2>&1; code=$?
+if [[ $code == 7 ]]; then
+    pass=$((pass + 1)); echo "  [pass] exit 7 sets status"
+else
+    fail=$((fail + 1)); failures+=("exit 7 sets status"); echo "  [FAIL] exit 7 gave status $code"
+fi
+HTMP=$(mktemp -d)
+hist_out=$(printf 'echo one\necho two\nhistory\nhistory -c\nhistory\nexit\n' | HOME="$HTMP" "$BIN" 2>&1 | strip_ansi)
+if grep -qE '^ +1  echo one$' <<<"$hist_out" && grep -q '^History cleared.$' <<<"$hist_out" && [[ ! -s "$HTMP/.asm_history" || $(wc -l < "$HTMP/.asm_history") -le 2 ]]; then
+    pass=$((pass + 1)); echo "  [pass] history lists and clears"
+else
+    fail=$((fail + 1)); failures+=("history lists and clears"); echo "  [FAIL] history lists and clears"; echo "    got: $(tail -c 300 <<<"$hist_out")"
+fi
+rm -rf "$HTMP"
+
 # --- Version + update (fake curl, no network) ----
 VER=$(sed -n 's/.*ASM_VERSION "\(.*\)".*/\1/p' "$HERE/../version.inc")
 run_case "ver shows version.inc"      "ver"                                       "v$VER "
