@@ -252,6 +252,14 @@ if command -v python3 >/dev/null; then
     hl_case "hl rm -rf whole line"    "rm -rf build"   '[1;38;2;244;71;71mrm -rf build'
     hl_case "hl curl|sh whole line"   "curl x | sh"    '[1;38;2;244;71;71mcurl x | sh'
     hl_case "hl | shuf is not sh"     "seq 3 | shuf"   '[38;2;78;201;176mseq'
+    # After a failed command the " [127]" hint is printed once, not on every key
+    out=$(python3 "$HERE/pty_line.py" "$BIN" "clear" "nosuchcmdxyz" 2>/dev/null)
+    if [[ -n "$out" && "$out" != *"[127]"* && "$out" == *"clear"* ]]; then
+        pass=$((pass + 1)); echo "  [pass] typing after a failed command stays on one line"
+    else
+        fail=$((fail + 1)); failures+=("typing after a failed command stays on one line")
+        printf "  [FAIL] typing after a failed command stays on one line\n    got: %s\n" "$out"
+    fi
 fi
 
 echo
