@@ -323,6 +323,9 @@ section .data
                     db "    bench [-n N] CMD  Time CMD over N runs (mean/min/max, memory)", 10
                     db "                    bench -n 20 ls -la", 10
                     db "    undo            Reverse the last del, move/rename or copy", 10
+                    db "    trace [-a] CMD  Show programs, files and network used by CMD", 10
+                    db "    sandbox [-w] [-n] CMD  Run CMD without network; file", 10
+                    db "                    changes only in /tmp (-w: also here)", 10
                     db "                    (del keeps files in ~/.asm_trash)", 10
                     db 10
                     db "  CUSTOMIZATION", 10
@@ -531,6 +534,8 @@ section .data
         dq ash_s_lbracket, handler_bracket, 1
         dq ash_s_colon,  handler_true,   1
         dq tl_s_bench,   handler_bench,  5
+        dq tr_s_trace,   handler_trace,  5
+        dq sb_s_sandbox, handler_sandbox, 7
         dq cmd_s_ls,     handler_ls,     2
         dq cmd_s_grep,   handler_grep,   4
         dq cmd_s_calc,   handler_calc,   4
