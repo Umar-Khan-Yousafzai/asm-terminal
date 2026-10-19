@@ -114,6 +114,39 @@ if command -v strace >/dev/null 2>&1; then
     fi
 fi
 
+# --- Version + update (fake curl, no network) ----
+VER=$(sed -n 's/.*ASM_VERSION "\(.*\)".*/\1/p' "$HERE/../version.inc")
+run_case "ver shows version.inc"      "ver"                                       "v$VER "
+UPD=$(mktemp -d)
+mkdir -p "$UPD/bin" "$UPD/srv" "$UPD/inst"
+cp "$BIN" "$UPD/srv/asm-terminal-linux-x86_64"; printf X >> "$UPD/srv/asm-terminal-linux-x86_64"
+(cd "$UPD/srv" && sha256sum asm-terminal-linux-x86_64 > SHA256SUMS)
+echo '{"tag_name": "v99.0.0"}' > "$UPD/srv/latest"
+cat > "$UPD/bin/curl" <<CURL
+#!/usr/bin/env bash
+out=""; url=""
+while [ \$# -gt 0 ]; do case "\$1" in -o) out="\$2"; shift;; --max-time|-H) shift;; -*) ;; *) url="\$1";; esac; shift; done
+f="$UPD/srv/\$(basename "\$url")"
+[ -f "\$f" ] || exit 22
+if [ -n "\$out" ]; then cp "\$f" "\$out"; else cat "\$f"; fi
+CURL
+chmod +x "$UPD/bin/curl"
+upd_out=$(printf 'update\nexit\n' | env PATH="$UPD/bin:$PATH" HOME="$UPD" "$BIN" 2>&1 | strip_ansi)
+if grep -q "Update available: v$VER -> v99.0.0" <<<"$upd_out"; then
+    pass=$((pass + 1)); echo "  [pass] update detects newer release"
+else
+    fail=$((fail + 1)); failures+=("update detects newer release"); echo "  [FAIL] update detects newer release"; echo "    got: $(tail -c 200 <<<"$upd_out")"
+fi
+# install: run a copy so the real binary is untouched
+cp "$BIN" "$UPD/inst/asm"
+printf 'update install\nexit\n' | env PATH="$UPD/bin:$PATH" HOME="$UPD" "$UPD/inst/asm" >/dev/null 2>&1
+if cmp -s "$UPD/inst/asm" "$UPD/srv/asm-terminal-linux-x86_64" && [[ ! -e "$UPD/inst/asm.new" ]]; then
+    pass=$((pass + 1)); echo "  [pass] update install replaces binary"
+else
+    fail=$((fail + 1)); failures+=("update install replaces binary"); echo "  [FAIL] update install replaces binary"
+fi
+rm -rf "$UPD"
+
 echo
 echo "=== $pass passed, $fail failed ==="
 if (( fail > 0 )); then

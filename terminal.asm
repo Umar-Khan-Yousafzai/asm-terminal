@@ -1,9 +1,11 @@
 ; ============================================================================
-; ASM Terminal v2.0 - Full-featured terminal in x86-64 Assembly (NASM)
+; ASM Terminal - Full-featured terminal in x86-64 Assembly (NASM)
 ; Target: Windows x64, linked with MinGW ld
 ; ============================================================================
 bits 64
 default rel
+
+%include "version.inc"
 
 ; ---- External Windows API functions ----
 extern GetStdHandle
@@ -119,7 +121,7 @@ section .data
                     db "   / ___ \ ___) | |  | |", 13, 10
                     db "  /_/   \_\____/|_|  |_|", 13, 10
                     db 13, 10
-                    db "  ASM Terminal v2.0 - x86-64 Assembly Shell", 13, 10
+                    db "  ASM Terminal v", ASM_VERSION, " - x86-64 Assembly Shell", 13, 10
                     db "  Type 'help' for available commands", 13, 10
                     db 13, 10, 0
     welcome_len     equ $ - welcome_msg - 1
@@ -162,7 +164,7 @@ section .data
                     db 13, 10, 0
     help_len        equ $ - help_msg - 1
 
-    ver_msg         db "ASM Terminal v2.0 [x86-64 NASM/Windows] - developed by Omar Farooq Khan", 13, 10, 0
+    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Windows] - developed by Omar Farooq Khan", 13, 10, 0
     ver_len         equ $ - ver_msg - 1
     err_cd_msg      db "Error: Could not change directory.", 13, 10, 0
     err_cd_len      equ $ - err_cd_msg - 1
@@ -181,7 +183,7 @@ section .data
     err_no_prev_dir db "Error: No previous directory.", 13, 10, 0
     err_no_prev_len equ $ - err_no_prev_dir - 1
 
-    title_default   db "ASM Terminal v2.0", 0
+    title_default   db "ASM Terminal v", ASM_VERSION, 0
     cmd_prefix      db "cmd.exe /c ", 0
     date_slash      db "/", 0
     time_colon      db ":", 0
