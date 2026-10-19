@@ -26,9 +26,10 @@ It is part serious tool, part love letter to the x86-64 ISA and the Linux kernel
 ## Features
 
 ### Shell
+- **ASH (Assembly Shell)** executor: pipelines, quotes, escapes and `<` `>` `>>` `2>` `2>>` `2>&1` run natively, no `/bin/sh` process. Syntax ASH does not handle yet (globs, `$(...)`, `if`/`for`, here-docs, `&`) still goes to `/bin/sh`.
 - Compound commands: `cmd1 ; cmd2` and `cmd1 && cmd2`
 - I/O redirection: `>`, `>>`, `<`
-- Piping: `cmd1 | cmd2` (delegated to `/bin/sh`)
+- Piping: `cmd1 | cmd2`
 - Environment variable expansion: `$VAR` and `${VAR}`
 - Wildcard expansion (`*`, `?`) for external commands
 
