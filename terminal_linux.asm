@@ -3831,22 +3831,22 @@ handler_echo:
     inc rbx
 
 .he_emit:
-    ; If -e, expand backslash escapes into a temp buffer; else print as-is
-    test r12d, 2
-    jnz .he_expand
-    mov rdi, rbx
-    call print_cstring
-    jmp .he_terminator
-
-.he_expand:
+    ; Copy into a temp buffer: drop shell quote characters, and expand
+    ; backslash escapes only when -e was given.
     lea rdi, [env_expand_buf]       ; reuse 1 KB scratch
     mov rsi, rbx
 .he_exp_loop:
     movzx eax, byte [rsi]
     test al, al
     jz .he_exp_done
+    cmp al, 0x27                    ; ' quote
+    je .he_exp_skip
+    cmp al, '"'
+    je .he_exp_skip
     cmp al, '\'
     jne .he_exp_copy
+    test r12d, 2                    ; no -e: keep backslashes literal
+    jz .he_exp_copy
     movzx eax, byte [rsi + 1]
     cmp al, 'n'
     je .he_exp_newline
@@ -3891,6 +3891,7 @@ handler_echo:
 .he_exp_copy:
     mov byte [rdi], al
     inc rdi
+.he_exp_skip:
     inc rsi
     jmp .he_exp_loop
 
@@ -5275,6 +5276,19 @@ execute_external:
 
 .ee_bg_trimmed:
 .ee_no_bg:
+    ; ASH: run foreground commands and pipelines natively when the
+    ; parser understands the whole line; otherwise fall back to /bin/sh.
+    test r14d, r14d
+    jnz .ee_legacy
+    lea rdi, [input_buf]
+    call ash_parse
+    test eax, eax
+    jz .ee_legacy
+    mov edi, eax
+    call ash_run
+    jmp .ee_done
+
+.ee_legacy:
     ; Restore terminal to cooked mode so child process gets sane terminal
     call restore_terminal
 
@@ -9501,3 +9515,6 @@ align 1
 ; ============================================================================
 ; End of Part 2
 ; ============================================================================
+
+; ASH native executor (milestone 1)
+%include "ash/ash_exec.asm"

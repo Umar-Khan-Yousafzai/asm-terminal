@@ -92,6 +92,26 @@ run_case "unalias removes"            "alias pp=echo aa; pp; unalias pp" "^aa$"
 # --- Timezone env ----
 run_case "ASM_TZ=0 shows UTC-ish"     "set ASM_TZ=0; date"            "[0-9]+"
 
+# --- ASH native executor (no /bin/sh) ----
+run_case "ash pipeline"               "printf 'b\\na\\nc\\n' | sort | head -1"   "^a$"
+run_case "ash quotes"                 "printf '%s|%s\\n' 'x y' \"q \\\"z\\\"\""    '^x y\|q "z"$'
+run_case "ash backslash escape"       "printf '%s\\n' a\\ b"                       "^a b$"
+run_case "ash command not found"      "nosuchcmd_ash_zz"                           "ash: nosuchcmd_ash_zz: command not found"
+run_case "ash 2>&1 into pipe"         "head /nonexist_ash 2>&1 | wc -l"           "^1$"
+rm -f /tmp/asm-ash-out.txt
+run_case "ash > and >> redirect"      "printf 'a\\n' > /tmp/asm-ash-out.txt; printf 'b\\n' >> /tmp/asm-ash-out.txt; wc -l /tmp/asm-ash-out.txt" "^2 /tmp/asm-ash-out.txt$"
+run_case "ash < redirect in pipe"     "tr a-z A-Z < /tmp/asm-ash-out.txt | head -1" "^A$"
+rm -f /tmp/asm-ash-out.txt
+run_case "ash glob falls back to sh"  "ls -d /bin/s* | head -1"                   "^/bin/s"
+if command -v strace >/dev/null 2>&1; then
+    sh_execs=$(printf "printf 'x\\\\n' | sort | head -1\nexit\n" | strace -f -e trace=execve "$BIN" 2>&1 >/dev/null | grep -c '"/bin/sh"')
+    if [[ "$sh_execs" == "0" ]]; then
+        pass=$((pass + 1)); echo "  [pass] ash pipeline spawns no /bin/sh"
+    else
+        fail=$((fail + 1)); failures+=("ash pipeline spawns no /bin/sh"); echo "  [FAIL] ash pipeline spawned /bin/sh $sh_execs time(s)"
+    fi
+fi
+
 echo
 echo "=== $pass passed, $fail failed ==="
 if (( fail > 0 )); then

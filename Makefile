@@ -50,7 +50,7 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(LD) $(OBJ) -o $(TARGET) -e _start
 
-$(OBJ): $(SRC)
+$(OBJ): $(SRC) $(wildcard ash/*.asm)
 	$(NASM) -f elf64 $(SRC) -o $(OBJ)
 
 clean:
