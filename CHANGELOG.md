@@ -9,7 +9,7 @@ The version lives in one place: `version.inc`.
 ### Added
 - **ASH (Assembly Shell)** native executor: commands and pipelines run without `/bin/sh`
   (quotes, escapes, `|`, `<`, `>`, `>>`, `2>`, `2>>`, `2>&1`). Unknown syntax still falls back to `/bin/sh`.
-- `about` command with developer credit (Omar Farooq Khan).
+- `about` command with developer credit (Umer Farooq Khan).
 - `update` command: checks GitHub for a newer release; `update install` downloads it,
   verifies its SHA-256 and replaces the binary.
 - Startup notice when a newer version is available (checked in the background at most once a day;

@@ -92,7 +92,8 @@ run_case "unalias removes"            "alias pp=echo aa; pp; unalias pp" "^aa$"
 # --- Timezone env ----
 run_case "ASM_TZ=0 shows UTC-ish"     "set ASM_TZ=0; date"            "[0-9]+"
 
-run_case "about shows developer"     "about"                                     "Developed by: Omar Farooq Khan"
+run_case "about shows developer"     "about"                                     "Developed by: Umer Farooq Khan"
+run_case "about shows GitHub"        "about"                                     "GitHub: +https://github.com/Umar-Khan-Yousafzai$"
 
 # --- ASH native executor (no /bin/sh) ----
 run_case "ash pipeline"               "printf 'b\\na\\nc\\n' | sort | head -1"   "^a$"
