@@ -19,6 +19,7 @@ for f in \
     "$PREFIX/bin/asm-terminal-launch" \
     "$PREFIX/share/applications/asm-terminal.desktop" \
     "$PREFIX/share/icons/hicolor/scalable/apps/asm-terminal.svg" \
+    "$PREFIX"/share/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg \
     "$PREFIX"/share/icons/hicolor/*x*/apps/asm-terminal.png; do
     if [ -e "$f" ] || [ -L "$f" ]; then
         $SUDO rm -f "$f"

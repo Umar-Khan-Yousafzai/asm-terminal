@@ -50,6 +50,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     for f in "$BINDIR/asm-terminal" "$BINDIR/asm-terminal-launch" \
              "$APPDIR/asm-terminal.desktop" \
              "$ICONROOT/scalable/apps/asm-terminal.svg" \
+             "$ICONROOT/symbolic/apps/asm-terminal-symbolic.svg" \
              "$ICONROOT"/*x*/apps/asm-terminal.png; do
         if [ -e "$f" ] || [ -L "$f" ]; then rm -f "$f"; say "removed $f"; fi
     done
@@ -74,7 +75,8 @@ else die "need curl or wget"; fi
 
 if have sha256sum;  then sha256() { sha256sum "$1" | cut -d' ' -f1; }
 elif have shasum;   then sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
-else die "need sha256sum to verify the download"; fi
+elif have openssl;  then sha256() { openssl dgst -sha256 -r "$1" | cut -d' ' -f1; }
+else die "need sha256sum, shasum or openssl to verify the download"; fi
 
 if [ -n "${ASM_RELEASE_BASE:-}" ]; then
     BASE="$ASM_RELEASE_BASE"            # mirror or local test server
@@ -145,6 +147,11 @@ if [ "$DESKTOP" = 1 ]; then
         mkdir -p "$ICONROOT/$size/apps"
         install -m 0644 "$png" "$ICONROOT/$size/apps/asm-terminal.png"
     done
+    if [ -f "$D/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg" ]; then
+        mkdir -p "$ICONROOT/symbolic/apps"
+        install -m 0644 "$D/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg" \
+            "$ICONROOT/symbolic/apps/asm-terminal-symbolic.svg"
+    fi
     refresh_caches
     say "Added ASM Terminal to your app menu (search \"ASM\")."
 fi

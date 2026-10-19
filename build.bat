@@ -6,8 +6,10 @@ rem Requires: MinGW-w64 ld on PATH (or common choco / msys install paths)
 rem Honours env overrides: set NASM_EXE=... or set LD_EXE=... before calling.
 rem ===========================================================================
 setlocal enabledelayedexpansion
+rem Build from the script folder so the version.inc include resolves.
+rem (setlocal restores the caller's folder on exit.)
+cd /d "%~dp0"
 
-set "NASM_EXE="
 if not "%NASM_EXE%"=="" goto :have_nasm
 for %%P in (
     "nasm.exe"
@@ -25,7 +27,6 @@ if not exist "%NASM_EXE%" (
     exit /b 2
 )
 
-set "LD_EXE="
 if not "%LD_EXE%"=="" goto :have_ld
 for %%P in (
     "ld.exe"
@@ -55,7 +56,7 @@ echo [*] LD   : %LD_EXE%
 echo [*] LIB  : %LD_LIBDIR%
 echo.
 echo [*] Assembling terminal.asm ...
-"%NASM_EXE%" -I"%~dp0" -f win64 terminal.asm -o terminal.obj
+"%NASM_EXE%" -f win64 terminal.asm -o terminal.obj
 if errorlevel 1 (
     echo [!] Assembly failed!
     exit /b 1
