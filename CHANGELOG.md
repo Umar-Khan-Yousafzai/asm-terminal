@@ -35,6 +35,12 @@ The version lives in one place: `version.inc`.
 - `undo`: reverses the last `del`, `move`/`rename` or `copy`. `del` now moves files into
   `~/.asm_trash` instead of erasing them, and `move`/`copy` first save a file they would
   overwrite. The last 16 operations can be undone.
+- `trace [-a] COMMAND`: runs a command and lists the programs it starts, the files it reads,
+  writes and deletes, and the network connections it opens (ptrace, no extra tools).
+  System library reads are hidden unless `-a` is given. A one-line summary goes to stderr.
+- `sandbox [-w] [-n] COMMAND`: runs a command that cannot change files outside `/tmp` and
+  cannot open internet connections (Landlock + seccomp). `-w` also allows writes in the
+  current directory; `-n` allows network.
 - Statements ASH cannot run natively yet (`case`, a loop piped or redirected such as
   `done | sort` or `cmd | while read l`) go to `/bin/sh` as one piece, so they keep working.
 
