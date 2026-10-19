@@ -1033,7 +1033,6 @@ section .bss
     job_cmds            resb JOB_MAX * JOB_CMD_SIZE  ; command strings
 
     ; Syntax highlighting scratch
-    first_word_buf      resb 128                ; extracted first word
 
 ; ============================================================================
 ; Code Section
@@ -2195,88 +2194,8 @@ redraw_line:
     ; Reprint the prompt using theme-aware function
     call print_prompt
 
-    ; --- Syntax highlighting for line content ---
-    mov r12d, [line_len]
-    test r12d, r12d
-    jz .rd_clear                    ; empty line, nothing to highlight
-
-    ; Extract the first word from line_buf into first_word_buf
-    lea rsi, [line_buf]
-    lea rdi, [first_word_buf]
-    xor ecx, ecx                    ; index / length of first word
-
-.rd_extract_word:
-    cmp ecx, 126                    ; guard buffer size
-    jge .rd_word_done
-    movzx eax, byte [rsi + rcx]
-    test al, al
-    jz .rd_word_done
-    cmp al, ' '
-    je .rd_word_done
-    mov [rdi + rcx], al
-    inc ecx
-    jmp .rd_extract_word
-
-.rd_word_done:
-    mov byte [rdi + rcx], 0         ; null-terminate first_word_buf
-    mov r13d, ecx                   ; r13d = first word length
-
-    test r13d, r13d
-    jz .rd_print_plain              ; no first word
-
-    ; Check if this command exists
-    lea rdi, [first_word_buf]
-    mov esi, r13d
-    call check_command_exists       ; returns eax = 1 if valid, 0 if not
-
-    test eax, eax
-    jz .rd_invalid_cmd
-
-    ; --- Valid command: print first word in green ---
-    lea rdi, [ansi_green]
-    mov esi, ansi_green_len
-    call print_string_len
-
-    lea rdi, [line_buf]
-    mov esi, r13d
-    call print_string_len
-
-    lea rdi, [ansi_default]
-    mov esi, ansi_default_len
-    call print_string_len
-
-    jmp .rd_print_rest
-
-.rd_invalid_cmd:
-    ; --- Invalid command: print first word in red ---
-    lea rdi, [ansi_red]
-    mov esi, ansi_red_len
-    call print_string_len
-
-    lea rdi, [line_buf]
-    mov esi, r13d
-    call print_string_len
-
-    lea rdi, [ansi_default]
-    mov esi, ansi_default_len
-    call print_string_len
-
-.rd_print_rest:
-    ; Print the rest of line_buf (after first word) in default color
-    mov eax, r12d                   ; total line_len
-    sub eax, r13d                   ; remaining chars
-    jle .rd_clear                   ; nothing left
-
-    lea rdi, [line_buf + r13]       ; use r13 as 64-bit offset
-    mov esi, eax
-    call print_string_len
-    jmp .rd_clear
-
-.rd_print_plain:
-    ; No recognizable first word; just print entire line_buf
-    lea rdi, [line_buf]
-    mov esi, r12d
-    call print_string_len
+    ; --- Syntax highlighting for line content (ash/highlight.asm) ---
+    call hl_draw_line
 
 .rd_clear:
     ; Clear from cursor to end of line (removes any leftover chars)
@@ -9416,3 +9335,4 @@ align 1
 %include "ash/builtins.asm"
 %include "ash/script.asm"
 %include "ash/tools.asm"
+%include "ash/highlight.asm"
