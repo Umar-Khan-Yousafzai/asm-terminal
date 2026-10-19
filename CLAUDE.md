@@ -11,6 +11,7 @@ asm-terminal/
   ash/ash_exec.asm      # ASH native executor (%included by terminal_linux.asm)
   ash/script.asm        # ASH script engine: if/while/for, && ||, test, $((...))
   ash/tools.asm         # bench, undo (+ safe del/move/copy, ~/.asm_trash), trace, sandbox
+  ash/highlight.asm     # live command colors (Dark+ palette, danger list for Linux + Windows)
   build.bat             # Windows build script (NASM + MinGW ld)
   Makefile              # Linux build: make / make clean
   terminal.exe          # Windows binary (38KB)
@@ -137,7 +138,7 @@ build.bat               # Requires: NASM, MinGW ld
 - **Keyboard shortcuts**: Ctrl+L (clear), Ctrl+W (delete word), Ctrl+U (clear line)
 - **Config file**: `~/.asmrc` executed at startup
 - **Autoexec**: `autoexec.txt` in binary directory
-- **Syntax highlighting**: first word colored green (valid) or red (invalid)
+- **Syntax highlighting**: command word colored as you type (`ash/highlight.asm`): teal = known/on PATH, blue = help, gray = unknown, red = destroys data
 - **Prompt**: `user@host:path$` format with theme colors
 - **Wildcard expansion**: `*` and `?` handled via /bin/sh for external commands
 

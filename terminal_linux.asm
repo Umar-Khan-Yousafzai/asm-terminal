@@ -391,14 +391,15 @@ section .data
                     db 10, 0
     help_len        equ $ - help_msg - 1
 
-    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Linux] - developed by Omar Farooq Khan", 10, 0
+    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Linux] - developed by Umer Farooq Khan", 10, 0
     ver_len         equ $ - ver_msg - 1
     about_msg       db 10
                     db "  ASM Terminal v", ASM_VERSION, " with ASH (Assembly Shell)", 10
                     db "  A terminal shell written entirely in x86-64 assembly (NASM).", 10
                     db "  No libc, no runtime: raw Linux syscalls only.", 10
                     db 10
-                    db "  Developed by: Omar Farooq Khan", 10
+                    db "  Developed by: Umer Farooq Khan", 10
+                    db "  GitHub:       https://github.com/Umar-Khan-Yousafzai", 10
                     db "  Source:       https://github.com/Umar-Khan-Yousafzai/asm-terminal", 10
                     db 10, 0
     about_len       equ $ - about_msg - 1
@@ -993,6 +994,7 @@ section .bss
 
     ; --- Compound command execution ---
     last_exit_status    resd 1      ; 0 = success, nonzero = failure
+    prompt_redraw       resb 1      ; 1 = print_prompt redraws the line only
 
     ; --- Source command ---
     source_read_buf     resb READ_BUF_SIZE  ; dedicated buffer for source
@@ -1033,7 +1035,6 @@ section .bss
     job_cmds            resb JOB_MAX * JOB_CMD_SIZE  ; command strings
 
     ; Syntax highlighting scratch
-    first_word_buf      resb 128                ; extracted first word
 
 ; ============================================================================
 ; Code Section
@@ -2192,91 +2193,13 @@ redraw_line:
     mov esi, 1
     call print_string_len
 
-    ; Reprint the prompt using theme-aware function
+    ; Reprint only the prompt line itself: the "[127]" exit hint and the
+    ; stats line sit above it and were printed once already.
+    mov byte [prompt_redraw], 1
     call print_prompt
 
-    ; --- Syntax highlighting for line content ---
-    mov r12d, [line_len]
-    test r12d, r12d
-    jz .rd_clear                    ; empty line, nothing to highlight
-
-    ; Extract the first word from line_buf into first_word_buf
-    lea rsi, [line_buf]
-    lea rdi, [first_word_buf]
-    xor ecx, ecx                    ; index / length of first word
-
-.rd_extract_word:
-    cmp ecx, 126                    ; guard buffer size
-    jge .rd_word_done
-    movzx eax, byte [rsi + rcx]
-    test al, al
-    jz .rd_word_done
-    cmp al, ' '
-    je .rd_word_done
-    mov [rdi + rcx], al
-    inc ecx
-    jmp .rd_extract_word
-
-.rd_word_done:
-    mov byte [rdi + rcx], 0         ; null-terminate first_word_buf
-    mov r13d, ecx                   ; r13d = first word length
-
-    test r13d, r13d
-    jz .rd_print_plain              ; no first word
-
-    ; Check if this command exists
-    lea rdi, [first_word_buf]
-    mov esi, r13d
-    call check_command_exists       ; returns eax = 1 if valid, 0 if not
-
-    test eax, eax
-    jz .rd_invalid_cmd
-
-    ; --- Valid command: print first word in green ---
-    lea rdi, [ansi_green]
-    mov esi, ansi_green_len
-    call print_string_len
-
-    lea rdi, [line_buf]
-    mov esi, r13d
-    call print_string_len
-
-    lea rdi, [ansi_default]
-    mov esi, ansi_default_len
-    call print_string_len
-
-    jmp .rd_print_rest
-
-.rd_invalid_cmd:
-    ; --- Invalid command: print first word in red ---
-    lea rdi, [ansi_red]
-    mov esi, ansi_red_len
-    call print_string_len
-
-    lea rdi, [line_buf]
-    mov esi, r13d
-    call print_string_len
-
-    lea rdi, [ansi_default]
-    mov esi, ansi_default_len
-    call print_string_len
-
-.rd_print_rest:
-    ; Print the rest of line_buf (after first word) in default color
-    mov eax, r12d                   ; total line_len
-    sub eax, r13d                   ; remaining chars
-    jle .rd_clear                   ; nothing left
-
-    lea rdi, [line_buf + r13]       ; use r13 as 64-bit offset
-    mov esi, eax
-    call print_string_len
-    jmp .rd_clear
-
-.rd_print_plain:
-    ; No recognizable first word; just print entire line_buf
-    lea rdi, [line_buf]
-    mov esi, r12d
-    call print_string_len
+    ; --- Syntax highlighting for line content (ash/highlight.asm) ---
+    call hl_draw_line
 
 .rd_clear:
     ; Clear from cursor to end of line (removes any leftover chars)
@@ -8354,6 +8277,9 @@ print_prompt:
     push r12
     sub rsp, 16
 
+    movzx r12d, byte [prompt_redraw] ; 1 = redraw while typing
+    mov byte [prompt_redraw], 0
+
     ; Inside an unfinished if/while/for block: short "> " prompt
     cmp byte [ash_cont], 0
     je .pp_primary
@@ -8362,6 +8288,9 @@ print_prompt:
     mov dword [prompt_total_len], 2
     jmp .pp_ret
 .pp_primary:
+    ; Redraw while typing: skip the lines printed above the prompt
+    test r12d, r12d
+    jnz .pp_no_exit
 
     ; "took 2.31s, peak 45.2 MB" after slow commands
     call print_cmd_stats
@@ -8674,6 +8603,12 @@ print_git_branch_if_any:
     call print_cstring
     lea rdi, [git_prompt_post]
     call print_cstring
+
+    ; " (" + branch + ")" is on screen too: keep the cursor math right
+    lea rdi, [git_branch]
+    call str_len
+    add eax, 3
+    add [prompt_total_len], eax
 
 .pgb_done:
     leave
@@ -9416,3 +9351,4 @@ align 1
 %include "ash/builtins.asm"
 %include "ash/script.asm"
 %include "ash/tools.asm"
+%include "ash/highlight.asm"
