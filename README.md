@@ -250,4 +250,4 @@ MIT — do whatever you want, just don't blame me if you learn too much about th
 
 ## Author
 
-Developed by **Omar Farooq Khan** ([@Umar-Khan-Yousafzai](https://github.com/Umar-Khan-Yousafzai)). Run `about` inside the terminal for details.
+Developed by **Umer Farooq Khan** ([@Umar-Khan-Yousafzai](https://github.com/Umar-Khan-Yousafzai)). Run `about` inside the terminal for details.
