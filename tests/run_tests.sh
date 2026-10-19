@@ -172,6 +172,47 @@ else
 fi
 rm -rf "$UPD"
 
+# --- ASH script engine (M2B) ----
+run_case "if/else"                    "if false; then echo y; else echo n; fi"    "^n$"
+run_case "elif"                       "if false; then echo a; elif true; then echo b; else echo c; fi" "^b$"
+run_case "if over lines"              $'if [ 1 -gt 2 ]\nthen\n  echo wrong\nelse\n  echo multi\nfi'  "^multi$"
+run_case "for loop"                   "s=; for i in 1 2 3; do s=\$s-\$i; done; echo s=\$s" "^s=-1-2-3$"
+run_case "for with quotes"            "for f in a \"b c\"; do echo \"[\$f]\"; done" "^\[b c\]$"
+run_case "for with glob"              "cd $HERE/..; for f in ash/script*.asm; do echo F:\$f; done" "^F:ash/script.asm$"
+run_case "while + arithmetic"         "i=0; while [ \$i -lt 5 ]; do i=\$((i+1)); done; echo i=\$i" "^i=5$"
+run_case "until loop"                 "n=0; until [ \$n -ge 2 ]; do n=\$((n+1)); done; echo n=\$n" "^n=2$"
+run_case "break and continue"         "s=; for i in 1 2 3 4 5; do if [ \$i -eq 2 ]; then continue; fi; if [ \$i -eq 4 ]; then break; fi; s=\$s\$i; done; echo s=\$s" "^s=13$"
+run_case "and/or chain"               "false && echo a || echo b"                 "^b$"
+run_case "or then and"                "false || echo c && echo d"                 "^d$"
+run_case "status \$?"                 "false; echo s=\$?"                         "^s=1$"
+run_case "arithmetic"                 "echo \$((2+3*4)) \$((-7%3)) \$(( (1+2)*3 ))" "^14 -1 9$"
+run_case "single quotes stay literal" "echo '\$HOME'"                             "^\\\$HOME$"
+run_case "assignment keeps spaces"    "x='a b'; echo \"[\$x]\""                   "^\[a b\]$"
+run_case "command substitution"       "x=\$(echo hi there); echo \"[\$x]\""       "^\[hi there\]$"
+run_case "negation"                   "! false && echo neg"                       "^neg$"
+run_case "brace group"                "false || { echo g1; echo g2; }"            "^g2$"
+run_case "test file ops"              "[ -d /tmp ] && [ ! -f /nonexist ] && echo ok" "^ok$"
+run_case "test strings"               "[ abc = abc ] && [ -z '' ] && [ -n x ] && echo ok" "^ok$"
+run_case "test bad integer"           "[ 3 -lt x ]; echo s=\$?"                   "^s=2$"
+run_case "syntax error"               "fi"                                        "syntax error near 'fi'"
+run_case "comment"                    "echo kept # dropped"                       "^kept$"
+run_case "function with args"         "greet() { echo \"hi \$1 (\$#)\"; return 3; }; greet Umer x; echo st=\$?" "^hi Umer \(2\)$"
+run_case "function return status"     "f() { return 3; }; f; echo st=\$?"         "^st=3$"
+run_case "function over lines"        $'add() {\n  echo $(( $1 + $2 ))\n}\nadd 2 40' "^42$"
+run_case "case via sh"                "x=b; case \$x in a) echo isA;; b) echo isB;; esac" "^isB$"
+run_case "loop piped via sh"          "for i in 3 1 2; do echo \$i; done | sort | head -1" "^1$"
+run_case "pipe into while read"       "printf 'l1\\nl2\\n' | while read l; do echo got-\$l; done" "^got-l2$"
+src=$(mktemp)
+printf 'total=0\nfor n in 1 2 3 4\ndo\n  if [ $((n %% 2)) -eq 0 ]; then\n    total=$((total + n))\n  fi\ndone\necho even-sum=$total\n' > "$src"
+run_case "source runs blocks"         "source $src"                               "^even-sum=6$"
+rm -f "$src"
+printf 'false\n' | "$BIN" >/dev/null 2>&1; code=$?
+if [[ $code == 1 ]]; then
+    pass=$((pass + 1)); echo "  [pass] EOF exits with last status"
+else
+    fail=$((fail + 1)); failures+=("EOF exits with last status"); echo "  [FAIL] EOF exits with last status (got $code)"
+fi
+
 echo
 echo "=== $pass passed, $fail failed ==="
 if (( fail > 0 )); then
