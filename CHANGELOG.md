@@ -50,6 +50,10 @@ The version lives in one place: `version.inc`.
   `done | sort` or `cmd | while read l`) go to `/bin/sh` as one piece, so they keep working.
 
 ### Fixed
+- After a failed command, each key typed reprinted the " [127]" line, so the prompt
+  scrolled one line per key. The hint now prints once.
+- Inside a git repo the cursor sat inside the " (branch)" text instead of after the typed
+  command.
 - `echo` printed quote characters (`echo -e 'a\nb'` now prints two lines).
 - `a && b || c` now follows sh rules (`false && x || y` runs `y`), and `;`, `&&`, `||` inside
   quotes no longer split the line.

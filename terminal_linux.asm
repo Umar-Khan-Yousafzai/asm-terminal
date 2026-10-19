@@ -994,6 +994,7 @@ section .bss
 
     ; --- Compound command execution ---
     last_exit_status    resd 1      ; 0 = success, nonzero = failure
+    prompt_redraw       resb 1      ; 1 = print_prompt redraws the line only
 
     ; --- Source command ---
     source_read_buf     resb READ_BUF_SIZE  ; dedicated buffer for source
@@ -2192,7 +2193,9 @@ redraw_line:
     mov esi, 1
     call print_string_len
 
-    ; Reprint the prompt using theme-aware function
+    ; Reprint only the prompt line itself: the "[127]" exit hint and the
+    ; stats line sit above it and were printed once already.
+    mov byte [prompt_redraw], 1
     call print_prompt
 
     ; --- Syntax highlighting for line content (ash/highlight.asm) ---
@@ -8274,6 +8277,9 @@ print_prompt:
     push r12
     sub rsp, 16
 
+    movzx r12d, byte [prompt_redraw] ; 1 = redraw while typing
+    mov byte [prompt_redraw], 0
+
     ; Inside an unfinished if/while/for block: short "> " prompt
     cmp byte [ash_cont], 0
     je .pp_primary
@@ -8282,6 +8288,9 @@ print_prompt:
     mov dword [prompt_total_len], 2
     jmp .pp_ret
 .pp_primary:
+    ; Redraw while typing: skip the lines printed above the prompt
+    test r12d, r12d
+    jnz .pp_no_exit
 
     ; "took 2.31s, peak 45.2 MB" after slow commands
     call print_cmd_stats
@@ -8594,6 +8603,12 @@ print_git_branch_if_any:
     call print_cstring
     lea rdi, [git_prompt_post]
     call print_cstring
+
+    ; " (" + branch + ")" is on screen too: keep the cursor math right
+    lea rdi, [git_branch]
+    call str_len
+    add eax, 3
+    add [prompt_total_len], eax
 
 .pgb_done:
     leave
