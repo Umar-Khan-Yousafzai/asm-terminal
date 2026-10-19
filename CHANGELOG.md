@@ -30,6 +30,11 @@ The version lives in one place: `version.inc`.
 - `$?`, `$$` and `$((...))` arithmetic (`+ - * / %`, comparisons, `&& || !`, parentheses).
 - Functions: `name() { ...; }` with `$1`..`$9`, `$#`, `$@` and `return [N]`.
 - `:` builtin; `#` comments; `\` line continuation.
+- `bench [-n N] COMMAND`: runs a command N times (output hidden) and prints mean, min and max
+  time, peak memory and the number of failed runs.
+- `undo`: reverses the last `del`, `move`/`rename` or `copy`. `del` now moves files into
+  `~/.asm_trash` instead of erasing them, and `move`/`copy` first save a file they would
+  overwrite. The last 16 operations can be undone.
 - Statements ASH cannot run natively yet (`case`, a loop piped or redirected such as
   `done | sort` or `cmd | while read l`) go to `/bin/sh` as one piece, so they keep working.
 
