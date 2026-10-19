@@ -7,7 +7,7 @@
 #   make clean           - remove build artifacts
 #
 # Install:
-#   make install         - install as <PREFIX>/bin/asm  (default ~/.local)
+#   make install         - install <PREFIX>/bin/asm-terminal + asm symlink (default ~/.local)
 #   make install-desktop - install binary + launcher + .desktop + icon (Linux app menu)
 #   make install-gui     - run the zenity installer for interactive install
 #   make uninstall       - reverse install-desktop
@@ -44,7 +44,7 @@ export APP_VERSION ?= $(VERSION)
 DIST_NAME  = asm-terminal-$(VERSION)-linux-x86_64
 WIN_DIST   = asm-terminal-$(VERSION)-windows-x86_64
 
-.PHONY: version all clean install install-desktop install-gui uninstall \
+.PHONY: version all clean install install-desktop install-gui uninstall check-path \
         test size dist deb appimage zip-windows release
 
 all: $(TARGET)
@@ -69,35 +69,59 @@ clean:
 
 install: $(TARGET)
 	install -d "$(BINDIR)"
-	install -m 0755 "$(TARGET)" "$(BINDIR)/$(INSTALL_NAME)"
-	@echo "Installed $(BINDIR)/$(INSTALL_NAME)"
+	install -m 0755 "$(TARGET)" "$(BINDIR)/asm-terminal"
+	ln -sf asm-terminal "$(BINDIR)/$(INSTALL_NAME)"
+	@echo "Installed $(BINDIR)/asm-terminal (and $(BINDIR)/$(INSTALL_NAME) -> asm-terminal)"
+	@$(MAKE) --no-print-directory check-path
 
 # ----------------------------------------------------------------------------
 # Install with .desktop entry + icon + launcher wrapper (recognizable app)
 # ----------------------------------------------------------------------------
 
-install-desktop: $(TARGET)
-	install -d "$(BINDIR)" "$(APPDIR)" "$(ICONDIR)"
-	install -m 0755 "$(TARGET)"                                  "$(BINDIR)/$(INSTALL_NAME)"
+ICON_SIZES = 16 24 32 48 64 128 256 512
+
+install-desktop: install
+	install -d "$(APPDIR)" "$(ICONDIR)"
 	install -m 0755 packaging/linux/asm-terminal-launch           "$(BINDIR)/asm-terminal-launch"
-	install -m 0644 packaging/linux/asm-terminal.desktop          "$(APPDIR)/asm-terminal.desktop"
+	sed -e 's|^TryExec=.*|TryExec=$(BINDIR)/asm-terminal-launch|' \
+	    -e 's|^Exec=.*|Exec=$(BINDIR)/asm-terminal-launch|' \
+	    packaging/linux/asm-terminal.desktop > "$(APPDIR)/asm-terminal.desktop"
+	chmod 0644 "$(APPDIR)/asm-terminal.desktop"
 	install -m 0644 packaging/linux/asm-terminal.svg              "$(ICONDIR)/asm-terminal.svg"
+	for s in $(ICON_SIZES); do \
+		install -d "$(SHAREDIR)/icons/hicolor/$${s}x$${s}/apps"; \
+		install -m 0644 "packaging/linux/icons/hicolor/$${s}x$${s}/apps/asm-terminal.png" \
+		        "$(SHAREDIR)/icons/hicolor/$${s}x$${s}/apps/asm-terminal.png"; \
+	done
 	-update-desktop-database "$(APPDIR)" 2>/dev/null || true
 	-gtk-update-icon-cache "$(SHAREDIR)/icons/hicolor" 2>/dev/null || true
 	@echo "Installed ASM Terminal with desktop integration."
-	@echo "Open from your app menu or run: $(INSTALL_NAME)"
+	@echo "Search 'ASM' in your app launcher, or run: asm-terminal"
 
 install-gui: $(TARGET)
 	bash packaging/linux/install.sh
 
 uninstall:
-	rm -f "$(BINDIR)/$(INSTALL_NAME)"
+	rm -f "$(BINDIR)/$(INSTALL_NAME)" "$(BINDIR)/asm-terminal"
 	rm -f "$(BINDIR)/asm-terminal-launch"
 	rm -f "$(APPDIR)/asm-terminal.desktop"
 	rm -f "$(ICONDIR)/asm-terminal.svg"
+	for s in $(ICON_SIZES); do rm -f "$(SHAREDIR)/icons/hicolor/$${s}x$${s}/apps/asm-terminal.png"; done
 	-update-desktop-database "$(APPDIR)" 2>/dev/null || true
 	-gtk-update-icon-cache "$(SHAREDIR)/icons/hicolor" 2>/dev/null || true
 	@echo "Removed ASM Terminal."
+
+# Warn when another program named `asm` (e.g. pwntools' /usr/bin/asm on
+# Fedora) shadows ours on PATH.
+check-path:
+	@found="$$(command -v $(INSTALL_NAME) 2>/dev/null || true)"; \
+	if [ -n "$$found" ] && [ "$$(readlink -f "$$found")" != "$$(readlink -f "$(BINDIR)/asm-terminal")" ]; then \
+		echo; \
+		echo "warning: '$(INSTALL_NAME)' on your PATH is $$found, not ASM Terminal."; \
+		echo "  Run 'asm-terminal' instead, or put $(BINDIR) first in PATH:"; \
+		echo "    echo 'export PATH=\"$(BINDIR):\$$PATH\"' >> ~/.bashrc"; \
+		echo "  then open a new terminal."; \
+	fi
 
 # ----------------------------------------------------------------------------
 # Tests + introspection
