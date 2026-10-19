@@ -14,6 +14,8 @@
 #
 # Packaging:
 #   make deb             - build a .deb package in dist/
+#   make rpm             - build an .rpm package in dist/ (Fedora/RHEL/openSUSE)
+#   make desktop-tarball - dist/asm-terminal-linux-desktop.tar.gz (launcher, .desktop, icons)
 #   make appimage        - build an AppImage in repo root
 #   make zip-windows     - bundle terminal.exe + install.bat for Windows release
 #   make dist            - tarball + README + LICENSE
@@ -45,7 +47,7 @@ DIST_NAME  = asm-terminal-$(VERSION)-linux-x86_64
 WIN_DIST   = asm-terminal-$(VERSION)-windows-x86_64
 
 .PHONY: version all clean install install-desktop install-gui uninstall check-path \
-        test size dist deb appimage zip-windows release
+        test size dist deb rpm desktop-tarball appimage zip-windows release
 
 all: $(TARGET)
 
@@ -61,7 +63,7 @@ version:
 clean:
 	rm -f $(OBJ) $(TARGET)
 	rm -rf dist packaging/appimage/AppDir packaging/appimage/_tools \
-	       packaging/debian/_stage asm-terminal-*.AppImage
+	       packaging/debian/_stage packaging/rpm/_rpmbuild asm-terminal-*.AppImage
 
 # ----------------------------------------------------------------------------
 # Install (binary only)
@@ -150,6 +152,15 @@ dist: $(TARGET)
 deb: $(TARGET)
 	bash packaging/debian/build-deb.sh
 
+rpm: $(TARGET)
+	bash packaging/rpm/build-rpm.sh
+
+# Desktop files for packaging/linux/install-release.sh (one release asset)
+desktop-tarball:
+	mkdir -p dist
+	tar -C packaging/linux -czf dist/asm-terminal-linux-desktop.tar.gz \
+	    asm-terminal-launch asm-terminal.desktop asm-terminal.svg icons
+
 appimage: $(TARGET)
 	bash packaging/appimage/build-appimage.sh
 
@@ -168,7 +179,7 @@ zip-windows:
 	cd dist && zip -r $(WIN_DIST).zip $(WIN_DIST)
 	@sha256sum dist/$(WIN_DIST).zip
 
-release: dist deb appimage
+release: dist deb rpm desktop-tarball appimage
 	@echo
 	@echo "Release artifacts in dist/:"
 	@ls -la dist/ 2>/dev/null || true

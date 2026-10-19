@@ -19,6 +19,9 @@ Two more Linux artifacts live under separate subdirs because they need
 extra tooling:
 
 - `packaging/debian/build-deb.sh`    — builds `.deb` via `dpkg-deb`
+- `packaging/rpm/build-rpm.sh`       — builds `.rpm` via `rpmbuild` (spec: `asm-terminal.spec`)
+- `packaging/linux/install-release.sh` — the `curl ... | sh` installer; published
+  as the release asset `install.sh`, with `asm-terminal-linux-desktop.tar.gz`
 - `packaging/appimage/build-appimage.sh` — builds an AppImage
 
 From the repo root:
@@ -27,6 +30,7 @@ From the repo root:
 make install-gui    # run the GUI installer
 make install-desktop # non-interactive, honours PREFIX / BINDIR / ...
 make deb            # dist/asm-terminal_2.0.0_amd64.deb
+make rpm            # dist/asm-terminal-2.0.0-1.x86_64.rpm
 make appimage       # asm-terminal-2.0.0-x86_64.AppImage
 ```
 
@@ -47,7 +51,8 @@ See `packaging/windows/README.md` for details.
 `.github/workflows/release.yml` runs on tag push and builds:
 
 - Linux tarball
-- Linux `.deb`
+- Linux `.deb` and `.rpm`
+- `install.sh` + `asm-terminal-linux-desktop.tar.gz` for the one-line installer
 - Linux AppImage
 - Windows `.zip` with `install.bat`
 - NSIS `setup.exe` (if the NSIS toolchain is available)
