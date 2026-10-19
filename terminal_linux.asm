@@ -1,10 +1,12 @@
 ; ============================================================================
-; ASM Terminal v2.0 - Full-featured terminal in x86-64 Assembly (NASM)
+; ASM Terminal - Full-featured terminal in x86-64 Assembly (NASM)
 ; Target: Linux x86-64, using raw syscalls (no libc)
 ; Port of the Windows version to Linux
 ; ============================================================================
 bits 64
 default rel
+
+%include "version.inc"
 
 ; ============================================================================
 ; Linux syscall numbers
@@ -218,13 +220,13 @@ section .data
                     db "   / ___ \ ___) | |  | |", 10
                     db "  /_/   \_\____/|_|  |_|", 10
                     db 10
-                    db "  ASM Terminal v2.0 - x86-64 Assembly Shell", 10
+                    db "  ASM Terminal v", ASM_VERSION, " - x86-64 Assembly Shell", 10
                     db "  Type 'help' for available commands", 10
                     db 10, 0
     welcome_len     equ $ - welcome_msg - 1
 
     help_msg        db 10
-                    db "  ASM Terminal v2.0 - Command Reference", 10
+                    db "  ASM Terminal v", ASM_VERSION, " - Command Reference", 10
                     db "  =====================================================", 10
                     db 10
                     db "  NAVIGATION", 10
@@ -297,6 +299,7 @@ section .data
                     db "  ---------------------------------------------------", 10
                     db "    ver             Show version info", 10
                     db "    about           About ASM Terminal and its developer", 10
+                    db "    update          Check for a new version ('update install' installs it)", 10
                     db "    date            Show current date and time", 10
                     db "                    date   -> Fri Apr  3 08:14:01 PM PKT 2026", 10
                     db "    time            Same as date", 10
@@ -361,10 +364,10 @@ section .data
                     db 10, 0
     help_len        equ $ - help_msg - 1
 
-    ver_msg         db "ASM Terminal v2.0 [x86-64 NASM/Linux] - developed by Omar Farooq Khan", 10, 0
+    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Linux] - developed by Omar Farooq Khan", 10, 0
     ver_len         equ $ - ver_msg - 1
     about_msg       db 10
-                    db "  ASM Terminal v2.0 with ASH (Assembly Shell)", 10
+                    db "  ASM Terminal v", ASM_VERSION, " with ASH (Assembly Shell)", 10
                     db "  A terminal shell written entirely in x86-64 assembly (NASM).", 10
                     db "  No libc, no runtime: raw Linux syscalls only.", 10
                     db 10
@@ -413,6 +416,7 @@ section .data
     cmd_s_exit      db "exit", 0
     cmd_s_ver       db "ver", 0
     cmd_s_about     db "about", 0
+    cmd_s_update    db "update", 0
     cmd_s_date      db "date", 0
     cmd_s_time      db "time", 0
     cmd_s_pwd       db "pwd", 0
@@ -455,6 +459,7 @@ section .data
         dq cmd_s_exit,   handler_exit
         dq cmd_s_ver,    handler_ver
         dq cmd_s_about,  handler_about
+        dq cmd_s_update, handler_update
         dq cmd_s_date,   handler_date
         dq cmd_s_time,   handler_time
         dq cmd_s_pwd,    handler_pwd
@@ -485,6 +490,7 @@ section .data
         dq cmd_s_alias,  handler_alias,  5
         dq cmd_s_source, handler_source, 6
         dq cmd_s_cat,    handler_type,   3
+        dq cmd_s_update, handler_update, 6
         dq cmd_s_ls,     handler_ls,     2
         dq cmd_s_grep,   handler_grep,   4
         dq cmd_s_calc,   handler_calc,   4
@@ -1067,6 +1073,9 @@ main:
     lea rdi, [welcome_msg]
     mov esi, welcome_len
     call print_string_len
+
+    ; Flag a newer release (cached), refresh the cache in the background
+    call update_startup
 
     ; Run autoexec.txt if present
     call run_autoexec
@@ -9543,3 +9552,4 @@ align 1
 
 ; ASH native executor (milestone 1)
 %include "ash/ash_exec.asm"
+%include "ash/update.asm"
