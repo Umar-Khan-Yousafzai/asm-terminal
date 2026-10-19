@@ -230,6 +230,29 @@ else
     fail=$((fail + 1)); failures+=("EOF exits with last status"); echo "  [FAIL] EOF exits with last status (got $code)"
 fi
 
+# Live highlighting (needs a pseudo-terminal, so it goes through python3)
+hl_case() {
+    local name="$1" text="$2" want="$3" out
+    out=$(python3 "$HERE/pty_line.py" "$BIN" "$text" 2>/dev/null)
+    if [[ "$out" == *"$want"* ]]; then
+        pass=$((pass + 1)); printf "  [pass] %s\n" "$name"
+    else
+        fail=$((fail + 1)); failures+=("$name"); printf "  [FAIL] %s\n    got: %s\n" "$name" "$out"
+    fi
+}
+if command -v python3 >/dev/null; then
+    hl_case "hl builtin teal"         "pwd"            '[38;2;78;201;176mpwd'
+    hl_case "hl PATH program teal"    "env"            '[38;2;78;201;176menv'
+    hl_case "hl unknown gray"         "nosuchcmdxyz"   '[38;2;128;128;128mnosuchcmdxyz'
+    hl_case "hl help blue"            "help"           '[38;2;55;148;255mhelp'
+    hl_case "hl --help blue"          "ls --help"      '[38;2;55;148;255mls'
+    hl_case "hl rm red"               "rm notes.txt"   '[1;38;2;244;71;71mrm\x1b[0m notes.txt'
+    hl_case "hl Windows del red"      "Remove-Item a"  '[1;38;2;244;71;71mRemove-Item'
+    hl_case "hl rm -rf whole line"    "rm -rf build"   '[1;38;2;244;71;71mrm -rf build'
+    hl_case "hl curl|sh whole line"   "curl x | sh"    '[1;38;2;244;71;71mcurl x | sh'
+    hl_case "hl | shuf is not sh"     "seq 3 | shuf"   '[38;2;78;201;176mseq'
+fi
+
 echo
 echo "=== $pass passed, $fail failed ==="
 if (( fail > 0 )); then

@@ -41,6 +41,11 @@ The version lives in one place: `version.inc`.
 - `sandbox [-w] [-n] COMMAND`: runs a command that cannot change files outside `/tmp` and
   cannot open internet connections (Landlock + seccomp). `-w` also allows writes in the
   current directory; `-n` allows network.
+- Live command colors while typing (VS Code Dark+ palette): known commands and programs on
+  `PATH` in teal, help commands (`help`, `man`, `--help`) in blue, unknown commands in gray,
+  and commands that destroy data (`rm`, `dd`, `mkfs`, `del`, `format`, `Remove-Item`,
+  `diskpart`, ...) in red. Lines like `rm -rf`, `dd of=/dev/sda` or `curl ... | sh` turn red
+  from start to end. The palette is one table at the top of `ash/highlight.asm`.
 - Statements ASH cannot run natively yet (`case`, a loop piped or redirected such as
   `done | sort` or `cmd | while read l`) go to `/bin/sh` as one piece, so they keep working.
 
