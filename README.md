@@ -78,6 +78,21 @@ To release: bump `version.inc`, add a CHANGELOG entry, then push a tag `vX.Y.Z`.
 
 ---
 
+## Install
+
+### Linux (any distro, no build tools)
+```bash
+curl -fsSL https://github.com/Umar-Khan-Yousafzai/asm-terminal/releases/latest/download/install.sh | sh
+```
+Downloads the latest release, checks it against the release's `SHA256SUMS`, and installs `asm-terminal` (plus an `asm` symlink), an app-menu entry and the icon into `~/.local`. Uninstall with `... | sh -s -- --uninstall`.
+
+### Packages
+Every [release](https://github.com/Umar-Khan-Yousafzai/asm-terminal/releases/latest) also has:
+- Fedora / RHEL / openSUSE: `sudo dnf install ./asm-terminal-<version>-1.x86_64.rpm` (command: `asm-terminal`)
+- Debian / Ubuntu: `sudo apt install ./asm-terminal_<version>_amd64.deb`
+- Any distro: the `.AppImage`
+- Windows: `asm-terminal-<version>-windows-x86_64-setup.exe`
+
 ## Build
 
 ### Linux
