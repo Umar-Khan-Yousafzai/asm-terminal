@@ -23,10 +23,12 @@ mkdir -p "$STAGE/usr/share/applications"
 mkdir -p "$STAGE/usr/share/icons/hicolor/scalable/apps"
 mkdir -p "$STAGE/usr/share/doc/$PKG"
 
-install -m 0755 "$BIN"                                   "$STAGE/usr/bin/asm"
+install -m 0755 "$BIN"                                   "$STAGE/usr/bin/asm-terminal"
+ln -sf asm-terminal                                      "$STAGE/usr/bin/asm"
 install -m 0755 "$HERE/../linux/asm-terminal-launch"     "$STAGE/usr/bin/asm-terminal-launch"
 install -m 0644 "$HERE/../linux/asm-terminal.desktop"    "$STAGE/usr/share/applications/asm-terminal.desktop"
 install -m 0644 "$HERE/../linux/asm-terminal.svg"        "$STAGE/usr/share/icons/hicolor/scalable/apps/asm-terminal.svg"
+cp -r "$HERE/../linux/icons/hicolor/."                   "$STAGE/usr/share/icons/hicolor/"
 
 if [ -f "$REPO/README.md" ]; then cp "$REPO/README.md" "$STAGE/usr/share/doc/$PKG/README.md"; fi
 

@@ -9,6 +9,5 @@ Exec=asm-terminal-launch
 Icon=asm-terminal
 Terminal=false
 Categories=System;TerminalEmulator;Utility;
-Keywords=shell;terminal;asm;assembly;
+Keywords=asm;ASM;assembly;nasm;shell;terminal;console;command;prompt;
 StartupNotify=true
-StartupWMClass=asm-terminal
