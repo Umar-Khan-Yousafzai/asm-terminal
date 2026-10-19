@@ -7,7 +7,8 @@ A fully-featured terminal/shell written entirely in x86-64 assembly (NASM). Cros
 ```
 asm-terminal/
   terminal.asm          # Windows version (2,691 lines, original)
-  terminal_linux.asm    # Linux version (7,700+ lines, full-featured port)
+  terminal_linux.asm    # Linux version (9,500+ lines, full-featured port)
+  ash/ash_exec.asm      # ASH native executor (%included by terminal_linux.asm)
   build.bat             # Windows build script (NASM + MinGW ld)
   Makefile              # Linux build: make / make clean
   terminal.exe          # Windows binary (38KB)
@@ -36,7 +37,7 @@ build.bat               # Requires: NASM, MinGW ld
 - **Callee-saved registers**: rbx, rbp, r12-r15
 - **Terminal control**: termios via ioctl (TCGETS/TCSETS) for raw mode
 - **Colors/cursor**: ANSI escape sequences
-- **External commands**: fork + execve(/bin/sh -c) + wait4
+- **External commands**: ASH (`ash/ash_exec.asm`) parses the line and runs commands/pipelines natively (PATH lookup, pipe2, dup2, fork, execve). Lines it does not understand yet (globs, `$(...)`, `if/for`, here-docs, `&`) fall back to fork + execve(/bin/sh -c)
 - **Signals**: sigaction for SIGINT (Ctrl+C)
 - **Entry point**: `_start` → parses kernel stack for envp → `call main`
 
