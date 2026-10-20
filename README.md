@@ -110,6 +110,14 @@ Or just the binary: `make install`. Run it from anywhere with `asm-terminal` (or
 
 If `asm` runs a different program (pwntools ships `/usr/bin/asm` on Fedora), use `asm-terminal`, or put `~/.local/bin` first in your `PATH`. `make install` warns when this happens.
 
+### Releasing
+Releases are automatic. To ship one:
+1. Bump the version in `version.inc` (e.g. `2.2.0`).
+2. Add a `## [2.2.0] - YYYY-MM-DD` section to `CHANGELOG.md` describing what changed.
+3. Merge to `main`.
+
+The Release workflow sees that tag `v2.2.0` does not exist yet, builds every package, and publishes the release with notes built from that CHANGELOG section (plus install commands, platforms and checksums). It fails without a CHANGELOG entry. Preview the notes with `bash packaging/release-notes.sh 2.2.0`.
+
 ### Windows
 Requires NASM and MinGW `ld`.
 ```bat
