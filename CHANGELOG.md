@@ -4,6 +4,13 @@ All notable changes to ASM Terminal. Versions follow [Semantic Versioning](https
 MAJOR for breaking changes, MINOR for new features, PATCH for fixes.
 The version lives in one place: `version.inc`.
 
+## [Unreleased]
+
+### Changed
+- `help` is now a table with Command, Usage and Example columns, grouped by section. Each run
+  picks a random example per command. Commands that destroy data show in red. On terminals
+  narrower than 95 columns the example moves to its own line.
+
 ## [2.2.0] - 2026-10-20
 
 ### Highlights

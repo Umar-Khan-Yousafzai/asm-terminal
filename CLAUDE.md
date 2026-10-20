@@ -12,6 +12,7 @@ asm-terminal/
   ash/script.asm        # ASH script engine: if/while/for, && ||, test, $((...))
   ash/tools.asm         # bench, undo (+ safe del/move/copy, ~/.asm_trash), trace, sandbox
   ash/highlight.asm     # live command colors (Dark+ palette, danger list for Linux + Windows)
+  ash/help.asm          # `help` table: HSEC/HROW rows (Command | Usage | random Example)
   build.bat             # Windows build script (NASM + MinGW ld)
   Makefile              # Linux build: make / make clean
   terminal.exe          # Windows binary (38KB)
@@ -113,7 +114,7 @@ build.bat               # Requires: NASM, MinGW ld
 - `free` — memory info from /proc/meminfo
 - `calc <expr>` — integer math (`calc 10 + 5 * 2`)
 - `source <file>` — execute commands from file
-- `help` — full command reference with examples
+- `help` — table of commands with usage and a random example (`ash/help.asm`)
 - `exit` — exit terminal
 
 ### Customization
