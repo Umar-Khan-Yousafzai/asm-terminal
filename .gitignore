@@ -7,3 +7,5 @@ terminal
 terminal.exe
 terminal.obj
 terminal_linux.o
+__pycache__/
+*.pyc
