@@ -1119,9 +1119,6 @@ main:
     mov esi, welcome_len
     call print_string_len
 
-    ; Flag a newer release (cached), refresh the cache in the background
-    call update_startup
-
     ; Run autoexec.txt if present
     call run_autoexec
 
@@ -1130,6 +1127,10 @@ main:
 
     ; Run ~/.asmrc config if present
     call run_asmrc
+
+    ; Flag a newer release (cached), refresh the cache in the background.
+    ; After ~/.asmrc so that "set ASM_NO_UPDATE_CHECK=1" there is honoured.
+    call update_startup
 
     ; Cache username and hostname for prompt
     call init_prompt_cache
