@@ -4,12 +4,41 @@ All notable changes to ASM Terminal. Versions follow [Semantic Versioning](https
 MAJOR for breaking changes, MINOR for new features, PATCH for fixes.
 The version lives in one place: `version.inc`.
 
-## [2.1.0] - unreleased
+## [2.2.0] - 2026-10-20
+
+### Highlights
+- **Live command colors** while you type: you see whether a command exists, and commands that
+  destroy data show in red before you press Enter.
+- **Smoother prompt**: no more scrolling after a failed command, and the cursor stays where you
+  type inside git repos.
+- **Automatic releases** with full release notes on every version bump.
+
+### Added
+- Live command colors while typing (VS Code Dark+ palette): known commands and programs on
+  `PATH` in teal, help commands (`help`, `man`, `--help`) in blue, unknown commands in gray,
+  and commands that destroy data (`rm`, `dd`, `mkfs`, `del`, `format`, `Remove-Item`,
+  `diskpart`, ...) in red. Lines like `rm -rf`, `dd of=/dev/sda` or `curl ... | sh` turn red
+  from start to end. The palette is one table at the top of `ash/highlight.asm`.
+- `about` now shows the developer, Umer Farooq Khan, and the GitHub link.
+
+### Changed
+- Releases are built and published automatically when `version.inc` changes on `main`. The
+  release notes come from this file, and a release without a CHANGELOG entry fails.
+- Release smoke tests now block a release instead of only being reported.
+
+### Fixed
+- After a failed command, each key typed reprinted the " [127]" line, so the prompt
+  scrolled one line per key. The hint now prints once.
+- Inside a git repo the cursor sat inside the " (branch)" text instead of after the typed
+  command.
+- The developer credit spelled the name wrong.
+
+## [2.1.0] - 2026-10-19
 
 ### Added
 - **ASH (Assembly Shell)** native executor: commands and pipelines run without `/bin/sh`
   (quotes, escapes, `|`, `<`, `>`, `>>`, `2>`, `2>>`, `2>&1`). Unknown syntax still falls back to `/bin/sh`.
-- `about` command with developer credit (Umer Farooq Khan).
+- `about` command with developer credit.
 - `update` command: checks GitHub for a newer release; `update install` downloads it,
   verifies its SHA-256 and replaces the binary.
 - Startup notice when a newer version is available (checked in the background at most once a day;
@@ -41,25 +70,36 @@ The version lives in one place: `version.inc`.
 - `sandbox [-w] [-n] COMMAND`: runs a command that cannot change files outside `/tmp` and
   cannot open internet connections (Landlock + seccomp). `-w` also allows writes in the
   current directory; `-n` allows network.
-- Live command colors while typing (VS Code Dark+ palette): known commands and programs on
-  `PATH` in teal, help commands (`help`, `man`, `--help`) in blue, unknown commands in gray,
-  and commands that destroy data (`rm`, `dd`, `mkfs`, `del`, `format`, `Remove-Item`,
-  `diskpart`, ...) in red. Lines like `rm -rf`, `dd of=/dev/sda` or `curl ... | sh` turn red
-  from start to end. The palette is one table at the top of `ash/highlight.asm`.
 - Statements ASH cannot run natively yet (`case`, a loop piped or redirected such as
   `done | sort` or `cmd | while read l`) go to `/bin/sh` as one piece, so they keep working.
 
+- New app icon (chip with a `>_` prompt) in 11 sizes from 16 to 512 px, a scalable SVG and a
+  one-color symbolic icon for GNOME and COSMIC panels.
+- App-menu entry: search "ASM" in GNOME, KDE, COSMIC, XFCE and others. The launcher opens the
+  desktop's own terminal (cosmic-term on COSMIC, Ptyxis or GNOME Terminal on GNOME, Konsole on
+  KDE); `ASM_TERMINAL_EMULATOR` picks a different one.
+- One-line installer for any Linux distro, published with each release:
+  `curl -fsSL https://github.com/Umar-Khan-Yousafzai/asm-terminal/releases/latest/download/install.sh | sh`.
+  It verifies the download against `SHA256SUMS` (`sha256sum`, `shasum` or `openssl`), works with
+  `curl` or `wget`, installs into `~/.local` (or `/usr/local` as root), and removes everything
+  with `--uninstall`. `ASM_VERSION=vX.Y.Z` installs a specific release.
+- Fedora / RHEL / openSUSE `.rpm` package (`make rpm`).
+- The shell installs as `asm-terminal`, with `asm` as a symlink to it. When another `asm` comes
+  first on `PATH` (pwntools ships `/usr/bin/asm`), `asm-terminal` still works, and `make install`
+  prints how to fix the order. The `.rpm` installs only `asm-terminal`.
+
 ### Fixed
-- After a failed command, each key typed reprinted the " [127]" line, so the prompt
-  scrolled one line per key. The hint now prints once.
-- Inside a git repo the cursor sat inside the " (branch)" text instead of after the typed
-  command.
 - `echo` printed quote characters (`echo -e 'a\nb'` now prints two lines).
 - `a && b || c` now follows sh rules (`false && x || y` runs `y`), and `;`, `&&`, `||` inside
   quotes no longer split the line.
 - `$VAR` is no longer expanded inside single quotes.
 - `exit` with no number, and end of input, now exit with the last command's status.
 - Variable expansion wrote a flag over a saved register, and long expansions could overflow the input buffer.
+- The app-menu launcher stopped after the first terminal it could not find, so on Fedora it
+  never reached cosmic-term or Ptyxis.
+- The app-menu entry pointed at a path the desktop session cannot see, so it did not appear.
+- Windows build: `build.bat` passed a broken include path to NASM and ignored the `LD_EXE` and
+  `NASM_EXE` overrides.
 
 ## [2.0.0] - 2026-04-20
 
