@@ -29,7 +29,6 @@ default rel
 %define SYS_WAIT4           61
 %define SYS_KILL            62
 %define SYS_UNAME           63
-%define SYS_KILL            62
 %define SYS_GETCWD          79
 %define SYS_CHDIR           80
 %define SYS_RENAME          82
@@ -38,6 +37,7 @@ default rel
 %define SYS_UNLINK          87
 %define SYS_READLINK        89
 %define SYS_GETUID          102
+%define SYS_GETEUID         107
 %define SYS_GETDENTS64      217
 %define SYS_CLOCK_GETTIME   228
 %define SYS_NEWFSTATAT      262
@@ -69,7 +69,6 @@ default rel
 %define SIGTERM             15
 %define SA_RESTORER         0x04000000
 %define SA_RESTART          0x10000000
-%define SIGCONT             18
 
 ; File open flags
 %define O_RDONLY            0
@@ -101,6 +100,7 @@ default rel
 ; stat structure offsets (x86-64 Linux)
 %define STAT_ST_MODE        24      ; offset of st_mode
 %define STAT_ST_SIZE        48      ; offset of st_size
+%define STAT_ST_UID         28      ; offset of st_uid
 
 ; Clock IDs
 %define CLOCK_REALTIME      0
@@ -169,12 +169,14 @@ default rel
 %define PERM_0644           FILE_MODE_DEFAULT
 %define PERM_0755           DIR_MODE_DEFAULT
 %define ENV_OVERLAY_SIZE    512
-%define ENV_OVERLAY_COUNT   64
+%define ENV_OVERLAY_COUNT   256
+%define MERGED_ENVP_MAX     8192    ; env slots handed to a child, NULL included
 %define AT_FDCWD            -100
 %define S_IFDIR             0o040000
 
-; Timezone offset: PKT = UTC+5 = 18000 seconds
+; Timezone used when neither $ASM_TZ nor $TZ is usable: PKT = UTC+5 = 18000 seconds
 %define TZ_OFFSET_SECONDS   18000
+%define TZ_NAME_DEFAULT     "PKT"
 
 ; ============================================================================
 ; ANSI escape sequence strings
@@ -235,7 +237,7 @@ section .data
                     db "                    cd /home        go to /home", 10
                     db "                    cd ..           go up one level", 10
                     db "                    cd -            go to previous dir", 10
-                    db "                    cd              show current dir", 10
+                    db "                    cd              go to $HOME", 10
                     db "    pwd             Print working directory", 10
                     db "                    pwd", 10
                     db "    pushd <path>    Push dir onto stack and cd", 10
@@ -280,6 +282,8 @@ section .data
                     db "                    set HOME", 10
                     db "    set <var>=<val> Set environment variable", 10
                     db "                    set EDITOR=vim", 10
+                    db "    export V=val    Same as set V=val", 10
+                    db "    unset <var>     Remove a variable (also an inherited one)", 10
                     db "    whoami          Display current username", 10
                     db "                    whoami", 10
                     db 10
@@ -302,12 +306,13 @@ section .data
                     db "    update          Check for a new version ('update install' installs it)", 10
                     db "    date            Show current date and time", 10
                     db "                    date   -> Fri Apr  3 08:14:01 PM PKT 2026", 10
+                    db "                    zone: ASM_TZ=<seconds east of UTC>, or TZ=EST5", 10
                     db "    time            Same as date", 10
                     db "    uptime          Show system uptime", 10
                     db "                    uptime -> up 2 days, 05:30:12", 10
                     db "    free            Show memory usage", 10
                     db "                    free   -> MemTotal, MemFree, ...", 10
-                    db "    calc <expr>     Integer calculator (+, -, *, /)", 10
+                    db "    calc <expr>     Integer calculator (+, -, *, /), left to right", 10
                     db "                    calc 2 + 3          -> 5", 10
                     db "                    calc 100 / 3        -> 33", 10
                     db "                    calc 10 + 5 * 2     -> 30", 10
@@ -323,10 +328,12 @@ section .data
                     db "    bench [-n N] CMD  Time CMD over N runs (mean/min/max, memory)", 10
                     db "                    bench -n 20 ls -la", 10
                     db "    undo            Reverse the last del, move/rename or copy", 10
+                    db "    trash [empty]   List what del/move/copy keep, or empty it", 10
+                    db "                    (kept in ~/.asm_trash; del/move/copy -f skip it)", 10
                     db "    trace [-a] CMD  Show programs, files and network used by CMD", 10
-                    db "    sandbox [-w] [-n] CMD  Run CMD without network; file", 10
-                    db "                    changes only in /tmp (-w: also here)", 10
-                    db "                    (del keeps files in ~/.asm_trash)", 10
+                    db "    sandbox [-w] [-n] [-b] CMD  Run CMD with no sockets (-n: IPv4/6", 10
+                    db "                    only); file changes only in /tmp (-w: also here).", 10
+                    db "                    Run 'sandbox' alone for what it does not block", 10
                     db 10
                     db "  CUSTOMIZATION", 10
                     db "  ---------------------------------------------------", 10
@@ -334,6 +341,7 @@ section .data
                     db "                    alias ll=ls -la", 10
                     db "                    alias gs=git status", 10
                     db "                    alias          list all aliases", 10
+                    db "    unalias <name>  Remove an alias", 10
                     db "    theme [name]    Switch color theme", 10
                     db "                    theme           list themes", 10
                     db "                    theme default   bold colors", 10
@@ -347,6 +355,8 @@ section .data
                     db "    jobs            List background jobs", 10
                     db "    fg <n>          Bring job to foreground", 10
                     db "                    fg 1", 10
+                    db "    bg <n>          Resume a stopped job in the background", 10
+                    db "    Ctrl+Z          Stop the running command (then fg or bg)", 10
                     db 10
                     db "  SHELL FEATURES", 10
                     db "  ---------------------------------------------------", 10
@@ -408,11 +418,11 @@ section .data
     err_exec_msg    db "Error: Could not execute command.", 10, 0
     err_exec_len    equ $ - err_exec_msg - 1
     err_file_msg    db "Error: Could not open file.", 10, 0
+    err_file_len    equ $ - err_file_msg - 1
     err_copy_read_msg db "copy: read error from source.", 10, 0
     err_copy_read_len equ $ - err_copy_read_msg - 1
     err_copy_write_msg db "copy: write error to destination.", 10, 0
     err_copy_write_len equ $ - err_copy_write_msg - 1
-    err_file_len    equ $ - err_file_msg - 1
     err_args_msg    db "Error: Missing arguments.", 10, 0
     err_args_len    equ $ - err_args_msg - 1
     err_stack_empty db "Error: Directory stack empty.", 10, 0
@@ -469,6 +479,8 @@ section .data
     cmd_s_export    db "export", 0
     cmd_s_unalias   db "unalias", 0
 
+    err_set_pre     db "set: ", 0
+    err_set_post    db ": not defined.", 10, 0
     err_unset_usage db "Usage: unset VAR", 10, 0
     err_unset_usage_len equ $ - err_unset_usage - 1
     err_unalias_usage db "Usage: unalias NAME", 10, 0
@@ -535,6 +547,7 @@ section .data
         dq ash_s_lbracket, handler_bracket, 1
         dq ash_s_colon,  handler_true,   1
         dq tl_s_bench,   handler_bench,  5
+        dq tl_s_trashcmd, handler_trash, 5
         dq tr_s_trace,   handler_trace,  5
         dq sb_s_sandbox, handler_sandbox, 7
         dq cmd_s_ls,     handler_ls,     2
@@ -622,6 +635,7 @@ section .data
     str_no_color    db "NO_COLOR", 0
     str_term        db "TERM", 0
     str_term_dumb   db "dumb", 0
+    str_term_linux  db "linux", 0
 
     ; --- OSC 7 (cwd notification) prefix + terminator ---
     osc7_prefix     db 27, "]7;file://", 0
@@ -650,8 +664,6 @@ section .data
     ; --- Git branch detection (direct .git/HEAD read, no fork) ---
     str_git_head    db "/.git/HEAD", 0
     str_ref_prefix  db "ref: refs/heads/", 0
-    git_prompt_pre  db 27, "[33m (", 0     ; " ("  in yellow
-    git_prompt_post db ")", 27, "[0m", 0   ; ")"
 
     ; --- Prompt exit-status indicator: ' [N]' in red ---
     exit_prompt_pre  db 27, "[31m [", 0
@@ -703,10 +715,12 @@ section .data
     ls_perm_exec    db "-rwxr-xr-x", 0       ; simplified executable permissions
     err_grep_usage  db "Usage: grep <pattern> <filename>", 10, 0
     err_grep_usage_len equ $ - err_grep_usage - 1
-    err_calc_usage  db "Usage: calc <expr>  (e.g. calc 2 + 3 * 4)", 10, 0
+    err_calc_usage  db "Usage: calc <expr>  (+ - * /, evaluated left to right)", 10, 0
     err_calc_usage_len equ $ - err_calc_usage - 1
     err_div_zero    db "Error: Division by zero.", 10, 0
     err_div_zero_len equ $ - err_div_zero - 1
+    err_overflow    db "Error: Integer overflow.", 10, 0
+    err_overflow_len equ $ - err_overflow - 1
 
     ; Permission mode bits for executable check
     %define S_IXUSR  0o100
@@ -826,7 +840,6 @@ section .data
                     db "Sep", 0, "Oct", 0, "Nov", 0, "Dec", 0
 
     ; Timezone and AM/PM strings
-    str_pkt         db " PKT ", 0
     str_am          db "AM", 0
     str_pm          db "PM", 0
 
@@ -885,7 +898,7 @@ section .bss
     ansi_num_buf        resb 16
 
     ; Environment overlay (for set command, since we can't modify real env easily)
-    env_overlay         resb 64*512 ; 64 entries, each up to 512 bytes (NAME=VALUE)
+    env_overlay         resb ENV_OVERLAY_COUNT * ENV_OVERLAY_SIZE ; NAME=VALUE slots
     env_overlay_count   resd 1
 
     ; Terminal window size
@@ -912,15 +925,8 @@ section .bss
     history_browsing    resb 1
 
     ; Tab completion
-    tab_prefix          resb MAX_PATH_BUF
-    tab_prefix_len      resd 1
     tab_active          resb 1
-    tab_dir_fd          resd 1      ; fd for opendir equivalent
-    tab_find_handle     resq 1      ; alias for compatibility
-    tab_dirent_buf      resb 8192
     ls_perms_buf        resb 16            ; rendered "drwxr-xr-x" + NUL
-    tz_offset_cache     resq 1             ; cached TZ offset (seconds)
-    tz_offset_resolved  resb 1             ; 0 = unresolved, 1 = resolved
     interactive_mode    resb 1             ; 1 = stdin & stdout are tty
     color_enabled       resb 1             ; 1 = ANSI/color permitted
     termios_probe_buf   resb 60             ; scratch for ioctl probe
@@ -928,16 +934,12 @@ section .bss
     term_rows           resw 1             ; cached from TIOCGWINSZ
     term_cols           resw 1             ; cached from TIOCGWINSZ
     winch_sigaction_buf resb 32            ; sigaction struct for SIGWINCH
-    merged_envp         resq 256            ; argv-style envp for child: 256 slots
+    merged_envp         resq MERGED_ENVP_MAX ; argv-style envp for child
     merged_envp_count   resd 1
     git_scratch_path    resb 4096          ; for walking up looking for .git
     git_head_buf        resb 512           ; contents of .git/HEAD
     git_branch          resb 128           ; extracted branch name (or NUL)
     kill_buf            resb 512           ; Ctrl+K kill target / Ctrl+Y source
-    tab_dirent_pos      resd 1      ; current position in dirent buffer
-    tab_dirent_end      resd 1      ; end of valid data in dirent buffer
-    tab_dirent_offset   resd 1      ; alias for offset tracking
-    tab_dirent_bytes    resd 1      ; total bytes from getdents64
     tab_base_pos        resd 1      ; position in line_buf where completion starts
     tab_name_prefix     resb MAX_PATH_BUF  ; name part to match
     tab_name_prefix_len resd 1      ; length of name prefix
@@ -994,7 +996,6 @@ section .bss
 
     ; --- Compound command execution ---
     last_exit_status    resd 1      ; 0 = success, nonzero = failure
-    prompt_redraw       resb 1      ; 1 = print_prompt redraws the line only
 
     ; --- Source command ---
     source_read_buf     resb READ_BUF_SIZE  ; dedicated buffer for source
@@ -1009,9 +1010,7 @@ section .bss
     ; ======== Batch 3 BSS ========
 
     ; grep line buffer (holds one line extracted from file)
-    grep_line_buf    resb 4096
-    ; grep pattern buffer
-    grep_pattern_buf resb 256
+    grep_line_buf    resb 65536
     ; ls flag state
     ls_flags         resb 1          ; bit 0 = -l, bit 1 = -a
     ; calc accumulator (signed 64-bit)
@@ -1033,8 +1032,6 @@ section .bss
     job_pids            resq JOB_MAX            ; PIDs of background jobs
     job_count           resd 1                  ; number of active slots used
     job_cmds            resb JOB_MAX * JOB_CMD_SIZE  ; command strings
-
-    ; Syntax highlighting scratch
 
 ; ============================================================================
 ; Code Section
@@ -1101,6 +1098,7 @@ main:
     ; Install SIGINT handler
     call setup_sigint
     call setup_sigwinch
+    call setup_term_signals
 
     ; Initialize state variables
     mov byte [has_prev_dir], 0
@@ -1113,14 +1111,13 @@ main:
     mov byte [redir_stdin_active], 0
     mov byte [tab_active], 0
     mov dword [env_overlay_count], 0
+    mov dword [job_count], 0        ; autoexec/.asmrc may start jobs or set a
+    mov dword [current_theme], 0    ; theme; init_prompt_cache must not undo that
 
     ; Print welcome banner
     lea rdi, [welcome_msg]
     mov esi, welcome_len
     call print_string_len
-
-    ; Flag a newer release (cached), refresh the cache in the background
-    call update_startup
 
     ; Run autoexec.txt if present
     call run_autoexec
@@ -1130,6 +1127,10 @@ main:
 
     ; Run ~/.asmrc config if present
     call run_asmrc
+
+    ; Flag a newer release (cached), refresh the cache in the background.
+    ; After ~/.asmrc so that "set ASM_NO_UPDATE_CHECK=1" there is honoured.
+    call update_startup
 
     ; Cache username and hostname for prompt
     call init_prompt_cache
@@ -1166,21 +1167,33 @@ main:
     cmp byte [input_buf], 0
     je .main_loop
 
-    ; Add to history and save to persistent file
+    ; Add to history; only a person typing at the terminal feeds the file
     lea rdi, [input_buf]
     call history_add
+    cmp byte [interactive_mode], 0
+    je .main_no_save
     lea rdi, [input_buf]
     call history_save_entry
+.main_no_save:
 
-    ; OSC 133 C — output region begins
+    ; OSC 133 C — output region begins (only for a terminal that asked for
+    ; shell integration; a pipe must see the command output and nothing else)
+    cmp byte [osc_enabled], 0
+    je .main_no_osc_c
     lea rdi, [osc133_c]
     call print_cstring
+.main_no_osc_c:
 
     ; Run it through the ASH script engine (; && || if while for ...).
-    ; An open block waits for more lines behind a "> " prompt.
+    ; An open block waits for more lines behind a "> " prompt. Ctrl+C raises
+    ; SIGINT while it runs, so even a loop of builtins can be stopped.
+    call script_isig_on
     call ash_feed_line
+    call script_isig_off
 
     ; OSC 133 D;<exit_status> — end of command + exit code
+    cmp byte [osc_enabled], 0
+    je .main_loop
     lea rdi, [osc133_d_pre]
     call print_cstring
     mov eax, [last_exit_status]
@@ -1196,6 +1209,9 @@ main:
     mov eax, SYS_EXIT
     syscall
 
+section .bss
+    osc_enabled         resb 1      ; 1 = OSC 7 / OSC 133 marks may be sent
+section .text
 ; ============================================================================
 ; init_io_modes - Resolve interactive_mode and color_enabled flags
 ; interactive = ioctl(0, TCGETS) succeeds  AND  ioctl(1, TCGETS) succeeds
@@ -1230,31 +1246,43 @@ init_io_modes:
     js .iom_done                    ; stdout not a tty
 
     mov byte [interactive_mode], 1
+    mov byte [osc_enabled], 1
 
-    ; Start assuming color is ok; disable if NO_COLOR set or TERM=dumb
+    ; Start assuming color is ok; TERM=dumb takes colors and the OSC
+    ; shell-integration marks away, NO_COLOR only the colors
     mov byte [color_enabled], 1
 
-    lea rdi, [str_no_color]
-    call getenv_internal
-    test rax, rax
-    jz .iom_check_term
-    ; NO_COLOR must be non-empty per no-color.org spec
-    cmp byte [rax], 0
-    je .iom_check_term
-    mov byte [color_enabled], 0
-    jmp .iom_done
-
-.iom_check_term:
     lea rdi, [str_term]
     call getenv_internal
     test rax, rax
-    jz .iom_done
+    jz .iom_check_nocolor
     mov rbx, rax
     lea rsi, [str_term_dumb]
     mov rdi, rbx
     call str_icompare
     test eax, eax
-    jnz .iom_done
+    jnz .iom_not_dumb
+    mov byte [color_enabled], 0
+    mov byte [osc_enabled], 0
+    jmp .iom_done
+
+.iom_not_dumb:
+    ; The Linux console has no 24-bit color: highlighting uses 16-color codes
+    lea rsi, [str_term_linux]
+    mov rdi, rbx
+    call str_icompare
+    test eax, eax
+    jnz .iom_check_nocolor
+    mov byte [hl_basic], 1
+
+.iom_check_nocolor:
+    lea rdi, [str_no_color]
+    call getenv_internal
+    test rax, rax
+    jz .iom_done
+    ; NO_COLOR must be non-empty per no-color.org spec
+    cmp byte [rax], 0
+    je .iom_done
     mov byte [color_enabled], 0
 
 .iom_done:
@@ -1267,50 +1295,83 @@ init_io_modes:
 ; read_line_plain - Read one line (terminated by LF or EOF) into input_buf
 ; Used when interactive_mode = 0. Returns rax = 1 if a line was read,
 ; rax = 0 on EOF with no bytes.
+; Input is read one byte at a time on purpose: a command that runs from the
+; script (cat, head, read) must find the lines after its own still unread on
+; stdin. A line longer than the buffer is not run in pieces: the rest of it is
+; read and dropped, an error goes to stderr and an empty line is returned
+; (main skips it).
 ; ============================================================================
+section .data
+    rlp_msg_long        db "ash: line too long (limit 511 bytes), ignored", 10
+    rlp_msg_long_len    equ $ - rlp_msg_long
+section .text
 read_line_plain:
     push rbp
     mov rbp, rsp
     push rbx
     push r12
-    sub rsp, 16
+    push r13
+    sub rsp, 8
 
     lea rbx, [input_buf]
-    xor r12d, r12d                   ; r12 = offset (syscall preserves r12)
+    xor r12d, r12d                   ; r12 = length so far
+    xor r13d, r13d                   ; r13 = 1 once the line is over the limit
 
-.rlp_loop:
-    cmp r12d, MAX_INPUT - 1
-    jge .rlp_terminate              ; full; discard rest of line silently
-    mov edi, STDIN_FD
-    mov rsi, rbx
-    add rsi, r12
-    mov edx, 1
+.rlp_next:
     mov eax, SYS_READ
+    xor edi, edi
+    lea rsi, [key_buf]
+    mov edx, 1
     syscall
+    cmp rax, -4                      ; EINTR: read again
+    je .rlp_next
     test rax, rax
-    jz .rlp_eof
-    js .rlp_eof
-    movzx edx, byte [rbx + r12]
+    jle .rlp_eof
+    movzx edx, byte [key_buf]
     cmp dl, 10                       ; LF ends the line
     je .rlp_terminate
     cmp dl, 13                       ; drop CR (CRLF line endings)
-    je .rlp_loop
+    je .rlp_next
+    test r13d, r13d
+    jnz .rlp_next                    ; over the limit: keep dropping
+    cmp r12d, MAX_INPUT - 1
+    jae .rlp_over
+    mov [rbx + r12], dl
     inc r12d
-    jmp .rlp_loop
+    jmp .rlp_next
+.rlp_over:
+    mov r13d, 1
+    jmp .rlp_next
 
 .rlp_terminate:
+    test r13d, r13d
+    jnz .rlp_toolong
     mov byte [rbx + r12], 0
     mov eax, 1
     jmp .rlp_done
 
+.rlp_toolong:
+    mov eax, SYS_WRITE
+    mov edi, STDERR_FD
+    lea rsi, [rlp_msg_long]
+    mov edx, rlp_msg_long_len
+    syscall
+    mov dword [last_exit_status], 1
+    mov byte [rbx], 0
+    mov eax, 1
+    jmp .rlp_done
+
 .rlp_eof:
+    test r13d, r13d
+    jnz .rlp_toolong                ; the overlong line was the last one
     test r12d, r12d
     jnz .rlp_terminate              ; flush pending bytes
     mov byte [rbx], 0
     xor eax, eax
 
 .rlp_done:
-    add rsp, 16
+    add rsp, 8
+    pop r13
     pop r12
     pop rbx
     pop rbp
@@ -1318,20 +1379,37 @@ read_line_plain:
 
 ; ============================================================================
 ; setup_raw_mode - Switch terminal to raw mode
-; Uses ioctl TCGETS to save original settings, then modifies c_lflag to
-; clear ICANON and ECHO, sets VMIN=1, VTIME=0, and applies with TCSETS.
+; Uses ioctl TCGETS to save the startup settings (once), then clears ICANON,
+; ECHO and ISIG in a copy, sets VMIN=1, VTIME=0 and applies it with TCSETS.
+; Does nothing unless we own the tty (interactive_mode).
 ; ============================================================================
+section .bss
+    termios_saved       resb 1      ; orig_termios holds the startup tty state
+    raw_active          resb 1      ; the tty is in our raw mode right now
+section .text
 setup_raw_mode:
     push rbp
     mov rbp, rsp
     sub rsp, 16
 
-    ; ioctl(STDIN_FD, TCGETS, &orig_termios)  - save original settings
+    ; A script on a pipe, or stdout redirected: the tty is not ours to touch
+    cmp byte [interactive_mode], 0
+    je .srm_ret
+
+    ; Remember the startup settings once. Later calls come after a child ran
+    ; and must not mistake whatever it left behind (stty -echo, a crashed
+    ; full-screen program) for the state to restore at exit.
+    cmp byte [termios_saved], 0
+    jne .srm_have_orig
     mov eax, SYS_IOCTL
     mov edi, STDIN_FD
     mov esi, TCGETS
     lea rdx, [orig_termios]
     syscall
+    test rax, rax
+    js .srm_ret                     ; cannot read the tty: leave it alone
+    mov byte [termios_saved], 1
+.srm_have_orig:
 
     ; Copy orig_termios to raw_termios
     lea rsi, [orig_termios]
@@ -1367,37 +1445,62 @@ setup_raw_mode:
     mov esi, TCSETS
     lea rdx, [raw_termios]
     syscall
+    mov byte [raw_active], 1
 
     ; Enable bracketed paste mode so pasted content is wrapped in
     ; ESC[200~ ... ESC[201~ markers we can consume in read_key.
     lea rdi, [bracketed_paste_on]
     mov esi, bracketed_paste_on_len
-    call print_string_len
+    call term_write
 
+    cmp byte [script_running], 0    ; a command line is running: Ctrl+C stays live
+    je .srm_ret
+    call script_isig_apply
+.srm_ret:
     leave
     ret
 
 ; ============================================================================
-; restore_terminal - Restore original terminal settings
-; Called before exit to return terminal to its original state.
+; term_write - write straight to the terminal (fd 1), never to a redirect
+; target: mode switches and cursor resets belong to the screen, not to the
+; file of an "extcmd > file".
+; rdi = buffer, esi = length. Clobbers rax, rcx, rdx, rsi, rdi, r11.
+; ============================================================================
+term_write:
+    mov edx, esi
+    mov rsi, rdi
+    mov edi, 1
+    mov eax, SYS_WRITE
+    syscall
+    ret
+
+; ============================================================================
+; restore_terminal - Put the tty back the way we found it
+; Called before a child runs and before exit. Does nothing unless
+; setup_raw_mode switched the tty (so it is safe to call twice, from a
+; signal handler, or when stdin is a tty but stdout is not).
 ; ============================================================================
 restore_terminal:
     push rbp
     mov rbp, rsp
     sub rsp, 16
 
+    cmp byte [raw_active], 0
+    je .rt_ret
+    mov byte [raw_active], 0
+
     ; Disable bracketed paste mode before restoring termios
     lea rdi, [bracketed_paste_off]
     mov esi, bracketed_paste_off_len
-    call print_string_len
+    call term_write
 
     ; Restore cursor shape + make sure cursor visible (TUI children may have changed)
     lea rdi, [cursor_shape_reset]
     mov esi, cursor_shape_reset_len
-    call print_string_len
+    call term_write
     lea rdi, [cursor_show]
     mov esi, cursor_show_len
-    call print_string_len
+    call term_write
 
     ; ioctl(STDIN_FD, TCSETS, &orig_termios)
     mov eax, SYS_IOCTL
@@ -1406,6 +1509,7 @@ restore_terminal:
     lea rdx, [orig_termios]
     syscall
 
+.rt_ret:
     leave
     ret
 
@@ -1449,6 +1553,77 @@ setup_sigint:
 ; ============================================================================
 sigint_handler:
     mov byte [ctrl_c_flag], 1
+    ret
+
+; ============================================================================
+; setup_term_signals - leave the tty usable when the shell is killed
+; SIGHUP, SIGQUIT, SIGTERM and the crash signals get a handler that puts the
+; terminal back (restore_terminal), then dies of the same signal. The crash
+; signals run on their own stack so a stack overflow can still be reported.
+; ============================================================================
+section .data
+term_sig_list   db SIGHUP, 3, 4, 7, 8, 11, SIGTERM, 0   ; HUP QUIT ILL BUS FPE SEGV TERM
+section .bss
+    term_sigaction_buf  resb 32
+    term_altstack_desc  resb 24         ; stack_t: sp, flags, size
+    term_altstack       resb 16384
+section .text
+setup_term_signals:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    ; sigaltstack(&desc, NULL)
+    lea rax, [term_altstack_desc]
+    lea rcx, [term_altstack]
+    mov [rax], rcx                  ; ss_sp
+    mov qword [rax + 8], 0          ; ss_flags
+    mov qword [rax + 16], 16384     ; ss_size
+    mov eax, 131                    ; SYS_sigaltstack
+    lea rdi, [term_altstack_desc]
+    xor esi, esi
+    syscall
+
+    ; One-shot handler (SA_RESETHAND) on the alternate stack (SA_ONSTACK)
+    lea rax, [term_sigaction_buf]
+    lea rcx, [term_signal_handler]
+    mov [rax], rcx                  ; sa_handler
+    mov ecx, SA_RESTORER | 0x80000000 | 0x08000000
+    mov [rax + 8], rcx              ; sa_flags
+    lea rcx, [sig_restorer]
+    mov [rax + 16], rcx             ; sa_restorer
+    mov qword [rax + 24], 0         ; sa_mask
+
+    lea rbx, [term_sig_list]
+.sts_loop:
+    movzx edi, byte [rbx]
+    test edi, edi
+    jz .sts_done
+    mov eax, SYS_RT_SIGACTION
+    lea rsi, [term_sigaction_buf]
+    xor edx, edx
+    mov r10d, 8
+    syscall
+    inc rbx
+    jmp .sts_loop
+.sts_done:
+    add rsp, 8
+    pop rbx
+    pop rbp
+    ret
+
+; term_signal_handler - rdi = signal number
+term_signal_handler:
+    push rdi                        ; keeps the stack aligned for the call
+    call restore_terminal
+    mov eax, 39                     ; SYS_getpid
+    syscall
+    mov edi, eax
+    mov rsi, [rsp]                  ; signal number
+    mov eax, SYS_KILL
+    syscall                         ; delivered when this handler returns
+    pop rdi
     ret
 
 ; ============================================================================
@@ -1526,57 +1701,112 @@ sig_restorer:
 ; ============================================================================
 ; read_key - Read a single key from stdin, decoding escape sequences
 ;
-; Reads 1 byte. If ESC (27), reads more bytes to decode CSI sequences:
-;   ESC[A = Up, ESC[B = Down, ESC[C = Right, ESC[D = Left
-;   ESC[H = Home, ESC[F = End, ESC[3~ = Delete
-; Maps LF(10) -> VK_RETURN, DEL(127) -> VK_BACK, TAB(9) -> VK_TAB
+; ESC starts a sequence. After "ESC [" the parser reads parameter and
+; intermediate bytes up to the final byte, so every CSI sequence is consumed
+; whole even when it is not one we act on:
+;   A/B/C/D = Up/Down/Right/Left, H/F = Home/End, 1~ 7~ = Home, 4~ 8~ = End,
+;   3~ = Delete, 200~ / 201~ = bracketed paste start / end.
+; "ESC O x" (SS3) is read the same way. Sequences carrying a modifier
+; (ESC[1;5C) and every other key (F1-F12, PgUp, Insert, Alt+key) produce no
+; key at all. A lone ESC (nothing follows within 100 ms) yields key_char 27.
+; Maps LF(10)/CR(13) -> VK_RETURN, DEL(127) -> VK_BACK, TAB(9) -> VK_TAB.
+; Bytes >= 0x80 are gathered into one complete UTF-8 character.
+; When stdin reports EOF or an error the terminal is gone: restore and exit.
 ;
-; Output: [key_vkey] = virtual key code, [key_char] = ASCII char
+; Output: [key_vkey] = virtual key code, [key_char] = ASCII char,
+;         [key_ulen] = byte count of a printable key held in [key_ubuf]
+;         (1 for ASCII 32..126, 2..4 for a UTF-8 character), else 0
 ; ============================================================================
-read_key:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    sub rsp, 24
+section .bss
+    key_ubuf            resb 4      ; bytes of the printable key just read
+    key_ulen            resb 1      ; 0 = not a printable key
+    key_pushback        resd 1      ; byte+1 given back by the parser, 0 = none
+    paste_active        resb 1      ; inside ESC[200~ ... ESC[201~
+section .text
 
-    ; Clear output
-    mov word [key_vkey], 0
-    mov byte [key_char], 0
-
-    ; Read 1 byte from stdin
+; rk_getc - next input byte. eax = 0..255, or -1 on EOF / read error.
+rk_getc:
+    mov eax, [key_pushback]
+    test eax, eax
+    jz .rkg_read
+    mov dword [key_pushback], 0
+    dec eax
+    ret
+.rkg_read:
     mov eax, SYS_READ
     mov edi, STDIN_FD
     lea rsi, [key_buf]
     mov edx, 1
     syscall
-    cmp eax, 1
-    jne .rk_done
+    cmp rax, -4                     ; EINTR: read again
+    je .rkg_read
+    cmp rax, 1
+    jne .rkg_eof
+    movzx eax, byte [key_buf]
+    ret
+.rkg_eof:
+    mov eax, -1
+    ret
 
-    movzx ebx, byte [key_buf]
+; rk_getc_wait - like rk_getc, but gives up after 100 ms (eax = -2).
+; The rest of an escape sequence is already queued when it was sent by a
+; terminal, so the wait only ever costs time for a lone ESC.
+rk_getc_wait:
+    cmp dword [key_pushback], 0
+    jne rk_getc
+    sub rsp, 16
+    mov dword [rsp], STDIN_FD       ; struct pollfd { fd, events, revents }
+    mov dword [rsp + 4], 1          ; POLLIN
+    mov eax, 7                      ; SYS_poll
+    mov rdi, rsp
+    mov esi, 1
+    mov edx, 100
+    syscall
+    add rsp, 16
+    cmp rax, 1
+    jge rk_getc                     ; ready, or hung up (rk_getc sees the EOF)
+    mov eax, -2
+    ret
 
-    ; Check for ESC (27) - potential escape sequence
+read_key:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 24                     ; [rsp] = ';' count, [rsp+4] = bytes seen
+
+    ; Clear output
+    mov word [key_vkey], 0
+    mov byte [key_char], 0
+    mov byte [key_ulen], 0
+
+    call rk_getc
+    test eax, eax
+    js .rk_gone
+    mov ebx, eax
+
     cmp bl, 27
     je .rk_escape
-
-    ; Check for LF (10) -> map to VK_RETURN
     cmp bl, 10
     je .rk_return
-
-    ; Check for DEL/Backspace (127) -> map to VK_BACK
+    cmp bl, 13
+    je .rk_return
     cmp bl, 127
     je .rk_backspace
-
-    ; Check for TAB (9) -> map to VK_TAB
     cmp bl, 9
     je .rk_tab
-
-    ; Check for Ctrl+C (3)
     cmp bl, 3
     je .rk_ctrlc
+    cmp bl, 0x80
+    jae .rk_utf8
 
-    ; Regular printable character or other
+    ; Regular printable character or other control byte
     mov [key_char], bl
-    mov word [key_vkey], 0      ; no special vkey
+    cmp bl, 32
+    jb .rk_done
+    mov [key_ubuf], bl
+    mov byte [key_ulen], 1
     jmp .rk_done
 
 .rk_return:
@@ -1597,42 +1827,149 @@ read_key:
 .rk_ctrlc:
     ; Set ctrl_c flag directly
     mov byte [ctrl_c_flag], 1
-    mov word [key_vkey], 0
     mov byte [key_char], 3
     jmp .rk_done
 
-.rk_escape:
-    ; Try to read next byte - could be CSI sequence
-    mov eax, SYS_READ
-    mov edi, STDIN_FD
-    lea rsi, [key_buf + 1]
-    mov edx, 1
+.rk_gone:
+    ; The terminal vanished (hangup, closed pty): nobody can read the prompt
+    ; any more, so leave instead of spinning on a dead descriptor.
+    call restore_terminal
+    mov edi, 1
+    mov eax, SYS_EXIT
     syscall
-    cmp eax, 1
-    jne .rk_esc_only
 
-    cmp byte [key_buf + 1], '['
-    je .rk_csi
-
-    ; Not a CSI sequence, treat as just ESC
-.rk_esc_only:
-    mov byte [key_char], 27
-    mov word [key_vkey], 0
+; --- UTF-8: collect lead byte + continuation bytes into key_ubuf ---
+.rk_utf8:
+    cmp bl, 0xC2
+    jb .rk_done                     ; stray continuation / overlong lead
+    mov r12d, 2
+    cmp bl, 0xE0
+    jb .rk_u_go
+    mov r12d, 3
+    cmp bl, 0xF0
+    jb .rk_u_go
+    mov r12d, 4
+    cmp bl, 0xF5
+    jae .rk_done
+.rk_u_go:
+    mov [key_ubuf], bl
+    mov r13d, 1
+.rk_u_loop:
+    cmp r13d, r12d
+    jae .rk_u_done
+    call rk_getc_wait
+    test eax, eax
+    js .rk_done                     ; truncated: drop it
+    mov ecx, eax
+    and cl, 0xC0
+    cmp cl, 0x80
+    jne .rk_u_bad
+    lea rcx, [key_ubuf]
+    mov [rcx + r13], al
+    inc r13d
+    jmp .rk_u_loop
+.rk_u_bad:
+    inc eax                         ; not a continuation: it starts the next key
+    mov [key_pushback], eax
+    jmp .rk_done
+.rk_u_done:
+    mov [key_ulen], r12b
     jmp .rk_done
 
+; --- ESC: lone ESC, CSI, SS3 or Alt+key ---
+.rk_escape:
+    call rk_getc_wait
+    test eax, eax
+    jns .rk_esc_next
+    cmp eax, -2
+    jne .rk_done                    ; EOF: the next read reports it
+    mov byte [key_char], 27         ; nothing followed: a real Escape
+    jmp .rk_done
+.rk_esc_next:
+    cmp al, '['
+    je .rk_csi
+    cmp al, 'O'
+    je .rk_ss3
+    jmp .rk_done                    ; Alt+key: swallowed
+
+.rk_ss3:
+    call rk_getc_wait
+    test eax, eax
+    js .rk_done
+    mov ebx, eax
+    xor ecx, ecx                    ; no modifier
+    jmp .rk_final_plain
+
 .rk_csi:
-    ; Read the CSI parameter byte(s)
-    mov eax, SYS_READ
-    mov edi, STDIN_FD
-    lea rsi, [key_buf + 2]
-    mov edx, 1
-    syscall
-    cmp eax, 1
-    jne .rk_done
+    xor r12d, r12d                  ; first parameter
+    xor r13d, r13d                  ; second parameter
+    mov dword [rsp], 0              ; ';' seen
+    mov dword [rsp + 4], 0          ; bytes seen
+.rk_csi_next:
+    call rk_getc_wait
+    test eax, eax
+    js .rk_done                     ; timeout / EOF: abandon the sequence
+    mov ebx, eax
+    inc dword [rsp + 4]
+    cmp dword [rsp + 4], 32
+    ja .rk_done                     ; runaway sequence
+    cmp bl, 0x40
+    jae .rk_csi_final
+    cmp bl, ';'
+    je .rk_csi_sep
+    cmp bl, '0'
+    jb .rk_csi_next                 ; intermediate byte
+    cmp bl, '9'
+    ja .rk_csi_next                 ; ':' '<' '=' '>' '?'
+    sub ebx, '0'
+    cmp dword [rsp], 0
+    jne .rk_csi_p2
+    imul r12d, r12d, 10
+    add r12d, ebx
+    cmp r12d, 100000
+    jbe .rk_csi_next
+    mov r12d, 100000
+    jmp .rk_csi_next
+.rk_csi_p2:
+    cmp dword [rsp], 1
+    jne .rk_csi_next
+    imul r13d, r13d, 10
+    add r13d, ebx
+    cmp r13d, 100000
+    jbe .rk_csi_next
+    mov r13d, 100000
+    jmp .rk_csi_next
+.rk_csi_sep:
+    inc dword [rsp]
+    jmp .rk_csi_next
 
-    movzx ebx, byte [key_buf + 2]
+.rk_csi_final:
+    cmp bl, 0x7F
+    jae .rk_done
+    mov ecx, [rsp]                  ; nonzero = a modifier parameter was sent
+    cmp bl, '~'
+    jne .rk_final_plain
+    test ecx, ecx
+    jnz .rk_done
+    cmp r12d, 200
+    je .rk_paste_on
+    cmp r12d, 201
+    je .rk_paste_off
+    cmp r12d, 1
+    je .rk_home
+    cmp r12d, 7
+    je .rk_home
+    cmp r12d, 4
+    je .rk_end
+    cmp r12d, 8
+    je .rk_end
+    cmp r12d, 3
+    je .rk_del
+    jmp .rk_done                    ; Insert, PgUp, PgDn, F5..F12
 
-    ; Decode CSI sequences
+.rk_final_plain:
+    test ecx, ecx
+    jnz .rk_done
     cmp bl, 'A'
     je .rk_up
     cmp bl, 'B'
@@ -1645,94 +1982,17 @@ read_key:
     je .rk_home
     cmp bl, 'F'
     je .rk_end
-
-    ; Check for extended sequences like ESC[3~ (Delete)
-    cmp bl, '3'
-    je .rk_maybe_delete
-    cmp bl, '1'
-    je .rk_maybe_home_ext
-    cmp bl, '4'
-    je .rk_maybe_end_ext
-    cmp bl, '2'
-    je .rk_maybe_paste
-
-    ; Unknown CSI sequence
     jmp .rk_done
 
-.rk_maybe_paste:
-    ; Bracketed paste: ESC[200~ (start) or ESC[201~ (end). Consume
-    ; up to and including '~' so it never enters the edit buffer.
-    mov eax, SYS_READ
-    mov edi, STDIN_FD
-    lea rsi, [key_buf + 3]
-    mov edx, 1
-    syscall
-    cmp eax, 1
-    jne .rk_done
-    cmp byte [key_buf + 3], '0'
-    jne .rk_done                    ; not 20...; give up
-    mov eax, SYS_READ
-    mov edi, STDIN_FD
-    lea rsi, [key_buf + 4]
-    mov edx, 1
-    syscall
-    cmp eax, 1
-    jne .rk_done
-    ; Skip any remaining chars up to '~' (paste markers are short)
-.rk_paste_skip:
-    mov eax, SYS_READ
-    mov edi, STDIN_FD
-    lea rsi, [key_buf + 5]
-    mov edx, 1
-    syscall
-    cmp eax, 1
-    jne .rk_done
-    cmp byte [key_buf + 5], '~'
-    je .rk_done                     ; marker consumed, key was 0 → nothing inserted
-    jmp .rk_paste_skip
-
-.rk_maybe_delete:
-    ; Read the tilde
-    mov eax, SYS_READ
-    mov edi, STDIN_FD
-    lea rsi, [key_buf + 3]
-    mov edx, 1
-    syscall
-    cmp eax, 1
-    jne .rk_done
-    cmp byte [key_buf + 3], '~'
-    jne .rk_done
+.rk_paste_on:
+    mov byte [paste_active], 1
+    jmp .rk_done
+.rk_paste_off:
+    mov byte [paste_active], 0
+    jmp .rk_done
+.rk_del:
     mov word [key_vkey], VK_DELETE
     jmp .rk_done
-
-.rk_maybe_home_ext:
-    ; ESC[1~ = Home (some terminals)
-    mov eax, SYS_READ
-    mov edi, STDIN_FD
-    lea rsi, [key_buf + 3]
-    mov edx, 1
-    syscall
-    cmp eax, 1
-    jne .rk_done
-    cmp byte [key_buf + 3], '~'
-    jne .rk_done
-    mov word [key_vkey], VK_HOME
-    jmp .rk_done
-
-.rk_maybe_end_ext:
-    ; ESC[4~ = End (some terminals)
-    mov eax, SYS_READ
-    mov edi, STDIN_FD
-    lea rsi, [key_buf + 3]
-    mov edx, 1
-    syscall
-    cmp eax, 1
-    jne .rk_done
-    cmp byte [key_buf + 3], '~'
-    jne .rk_done
-    mov word [key_vkey], VK_END
-    jmp .rk_done
-
 .rk_up:
     mov word [key_vkey], VK_UP
     jmp .rk_done
@@ -1750,10 +2010,11 @@ read_key:
     jmp .rk_done
 .rk_end:
     mov word [key_vkey], VK_END
-    jmp .rk_done
 
 .rk_done:
     add rsp, 24
+    pop r13
+    pop r12
     pop rbx
     pop rbp
     ret
@@ -1778,6 +2039,17 @@ read_line:
     mov byte [line_buf], 0
     mov byte [history_browsing], 0
     mov byte [tab_active], 0
+    mov byte [paste_active], 0
+    mov byte [hl_cache_valid], 0    ; PATH or aliases may have changed
+
+    ; A new line starts browsing at the newest entry. Ctrl+C and an empty
+    ; Enter never reach history_add, so an earlier Up must not carry over.
+    mov eax, [history_write_idx]
+    mov [history_nav_idx], eax
+    mov dword [history_nav_steps], 0
+
+    ; A ^C that interrupted a child is not meant for this line
+    mov byte [ctrl_c_flag], 0
 
 .rl_loop:
     ; Check for pending Ctrl+C
@@ -1790,6 +2062,25 @@ read_line:
     ; Load virtual key and ascii char
     movzx ebx, word [key_vkey]
     movzx r12d, byte [key_char]
+
+    ; Inside a bracketed paste only text counts: a pasted newline or Tab
+    ; becomes a space, every other control byte is dropped, so nothing
+    ; pasted can run a command or trigger an editing key.
+    cmp byte [paste_active], 0
+    je .rl_not_paste
+    cmp bx, VK_RETURN
+    je .rl_paste_space
+    cmp bx, VK_TAB
+    je .rl_paste_space
+    cmp byte [key_ulen], 0
+    je .rl_loop
+    jmp .rl_not_paste
+.rl_paste_space:
+    mov byte [key_ubuf], ' '
+    mov byte [key_ulen], 1
+    xor ebx, ebx
+    mov r12d, ' '
+.rl_not_paste:
 
     ; Cancel tab completion on any non-tab key
     cmp bx, VK_TAB
@@ -1851,37 +2142,55 @@ read_line:
     je .rl_ctrl_y
     cmp r12d, 4             ; Ctrl+D = EOF (empty) / delete-char
     je .rl_ctrl_d
-    cmp r12d, 32
-    jb .rl_loop
-    cmp r12d, 126
-    ja .rl_loop
+
+    ; A printable key: one ASCII byte or a whole UTF-8 character
+    movzx r8d, byte [key_ulen]
+    test r8d, r8d
+    jz .rl_loop
 
     ; Buffer full?
-    cmp dword [line_len], MAX_INPUT - 2
-    jge .rl_loop
+    mov eax, [line_len]
+    add eax, r8d
+    cmp eax, MAX_INPUT - 2
+    ja .rl_loop
 
-    ; Insert character at cursor position by shifting right
+    ; Insert at cursor position: shift the tail right by the key's length
+    lea rdi, [line_buf]
     mov ecx, [line_len]
     mov edx, [line_cursor]
 .rl_shift_r:
     cmp ecx, edx
     jle .rl_ins
-    lea rax, [line_buf]
-    mov r8b, [rax + rcx - 1]
-    mov [rax + rcx], r8b
     dec ecx
+    movzx eax, byte [rdi + rcx]
+    lea r9, [rcx + r8]
+    mov [rdi + r9], al
     jmp .rl_shift_r
 .rl_ins:
-    lea rax, [line_buf]
-    mov [rax + rdx], r12b
-    inc dword [line_len]
-    inc dword [line_cursor]
+    xor ecx, ecx
+.rl_ins_copy:
+    movzx eax, byte [key_ubuf + rcx]
+    lea r9, [rdx + rcx]
+    mov [rdi + r9], al
+    inc ecx
+    cmp ecx, r8d
+    jb .rl_ins_copy
+    add [line_len], r8d
+    add [line_cursor], r8d
     mov ecx, [line_len]
-    mov byte [rax + rcx], 0
+    mov byte [rdi + rcx], 0
     call redraw_line
     jmp .rl_loop
 
 .rl_enter:
+    ; Park the cursor behind the last character so the newline lands below
+    ; the whole (possibly wrapped) line
+    mov eax, [line_len]
+    cmp eax, [line_cursor]
+    je .rl_enter_copy
+    mov [line_cursor], eax
+    call update_cursor_pos
+.rl_enter_copy:
     ; Copy line_buf to input_buf
     lea rsi, [line_buf]
     lea rdi, [input_buf]
@@ -1898,60 +2207,78 @@ read_line:
     jmp .rl_done
 
 .rl_backspace:
-    cmp dword [line_cursor], 0
-    je .rl_loop
     mov ecx, [line_cursor]
-    mov edx, [line_len]
+    test ecx, ecx
+    jz .rl_loop
     lea rdi, [line_buf]
-.rl_bs_shift:
-    cmp ecx, edx
-    jge .rl_bs_end
+    mov edx, ecx                    ; end of the range to remove
+.rl_bs_back:                        ; step back to the start of the character
+    dec ecx
+    jz .rl_bs_do
     mov al, [rdi + rcx]
-    mov [rdi + rcx - 1], al
-    inc ecx
-    jmp .rl_bs_shift
-.rl_bs_end:
-    dec dword [line_cursor]
-    dec dword [line_len]
-    mov ecx, [line_len]
-    mov byte [rdi + rcx], 0
+    and al, 0xC0
+    cmp al, 0x80
+    je .rl_bs_back
+.rl_bs_do:
+    mov esi, ecx
+    call line_remove
     call redraw_line
     jmp .rl_loop
 
 .rl_delete:
-    mov eax, [line_cursor]
-    cmp eax, [line_len]
-    jge .rl_loop
-    mov ecx, [line_cursor]
-    inc ecx
-    mov edx, [line_len]
-    lea rdi, [line_buf]
-.rl_del_shift:
-    cmp ecx, edx
-    jge .rl_del_end
-    mov al, [rdi + rcx]
-    mov [rdi + rcx - 1], al
-    inc ecx
-    jmp .rl_del_shift
-.rl_del_end:
-    dec dword [line_len]
+    mov esi, [line_cursor]
     mov ecx, [line_len]
-    mov byte [rdi + rcx], 0
+    cmp esi, ecx
+    jge .rl_loop
+    lea rdi, [line_buf]
+    lea edx, [rsi + 1]
+.rl_del_fwd:                        ; swallow the continuation bytes
+    cmp edx, ecx
+    jge .rl_del_do
+    mov al, [rdi + rdx]
+    and al, 0xC0
+    cmp al, 0x80
+    jne .rl_del_do
+    inc edx
+    jmp .rl_del_fwd
+.rl_del_do:
+    call line_remove
     call redraw_line
     jmp .rl_loop
 
 .rl_left:
-    cmp dword [line_cursor], 0
-    je .rl_loop
-    dec dword [line_cursor]
+    mov ecx, [line_cursor]
+    test ecx, ecx
+    jz .rl_loop
+    lea rdi, [line_buf]
+.rl_left_back:
+    dec ecx
+    jz .rl_left_set
+    mov al, [rdi + rcx]
+    and al, 0xC0
+    cmp al, 0x80
+    je .rl_left_back
+.rl_left_set:
+    mov [line_cursor], ecx
     call update_cursor_pos
     jmp .rl_loop
 
 .rl_right:
-    mov eax, [line_cursor]
-    cmp eax, [line_len]
+    mov ecx, [line_cursor]
+    mov edx, [line_len]
+    cmp ecx, edx
     jge .rl_loop
-    inc dword [line_cursor]
+    lea rdi, [line_buf]
+.rl_right_fwd:
+    inc ecx
+    cmp ecx, edx
+    jge .rl_right_set
+    mov al, [rdi + rcx]
+    and al, 0xC0
+    cmp al, 0x80
+    je .rl_right_fwd
+.rl_right_set:
+    mov [line_cursor], ecx
     call update_cursor_pos
     jmp .rl_loop
 
@@ -1981,17 +2308,8 @@ read_line:
 ; --- Ctrl+L: Clear screen and redraw prompt with current line ---
 .rl_ctrl_l:
     call clear_screen
-    ; Reprint prompt using themed prompt function
-    call print_prompt
-    ; Redraw current line content and position cursor
-    mov edx, [line_len]
-    test edx, edx
-    jz .rl_ctrl_l_cur
-    lea rdi, [line_buf]
-    mov esi, edx
-    call print_string_len
-.rl_ctrl_l_cur:
-    call update_cursor_pos
+    mov dword [cursor_row], 0       ; the cursor is home, on the prompt's row
+    call redraw_line
     jmp .rl_loop
 
 ; --- Ctrl+K: Kill from cursor to end of line into kill_buf ---
@@ -2060,28 +2378,21 @@ read_line:
 .rl_ctrl_d:
     mov ecx, [line_len]
     test ecx, ecx
-    jnz .rl_cd_delete
+    jnz .rl_delete
+    cmp byte [ash_cont], 0
+    jne .rl_cd_block
     call print_newline
     call restore_terminal
-    xor edi, edi
+    mov edi, [last_exit_status]     ; leave with the last status, like exit
     mov eax, SYS_EXIT
     syscall
-.rl_cd_delete:
-    mov edx, [line_cursor]
-    cmp edx, ecx
-    jge .rl_loop
-    lea rdi, [line_buf]
-.rl_cd_shift:
-    mov al, [rdi + rdx + 1]
-    mov [rdi + rdx], al
-    inc edx
-    cmp edx, ecx
-    jl .rl_cd_shift
-    dec dword [line_len]
-    mov edx, [line_len]
-    mov byte [rdi + rdx], 0
-    call redraw_line
-    jmp .rl_loop
+.rl_cd_block:
+    ; EOF inside an unfinished if/while/for: report it and fall back to the
+    ; primary prompt instead of closing the shell
+    call print_newline
+    call ash_feed_eof
+    mov byte [input_buf], 0
+    jmp .rl_done
 
 ; --- Ctrl+W: Delete word backward from cursor ---
 .rl_ctrl_w:
@@ -2156,6 +2467,13 @@ read_line:
 
 .rl_ctrlc:
     mov byte [ctrl_c_flag], 0
+    ; ^C goes behind the text, not into the middle of a wrapped line
+    mov eax, [line_len]
+    cmp eax, [line_cursor]
+    je .rl_ctrlc_at_end
+    mov [line_cursor], eax
+    call update_cursor_pos
+.rl_ctrlc_at_end:
     mov byte [ash_cont], 0          ; Ctrl+C also drops an unfinished block
     mov dword [ash_pending_len], 0
     mov dword [line_len], 0
@@ -2172,12 +2490,107 @@ read_line:
     pop rbp
     ret
 
+; ----------------------------------------------------------------------------
+; line_remove - delete line_buf[esi..edx) and leave the cursor at esi
+; ----------------------------------------------------------------------------
+line_remove:
+    lea rdi, [line_buf]
+    mov eax, [line_len]
+    sub eax, edx
+    inc eax                         ; bytes after the range, plus the NUL
+    mov r8d, esi
+    mov r9d, edx
+.lr_loop:
+    mov cl, [rdi + r9]
+    mov [rdi + r8], cl
+    inc r8d
+    inc r9d
+    dec eax
+    jnz .lr_loop
+    sub edx, esi
+    sub [line_len], edx
+    mov [line_cursor], esi
+    ret
+
 ; ============================================================================
-; redraw_line - Redraw the full prompt and line buffer
+; Screen output for the line editor
 ;
-; Writes: \r + ANSI green + path_buf + ANSI white + "> " + ANSI default
-;         + line_buf content + ANSI clear-to-eol
-; Then positions cursor at the correct column using ESC[{col}G.
+; The line is drawn from the first row of the prompt every time. cursor_row
+; remembers which row (counted from that first row) the terminal cursor is
+; on, so a prompt plus command that wraps past the terminal width is erased
+; and redrawn in place. All output of one redraw is collected in ob_buf and
+; written with a single write(2).
+; ============================================================================
+%define OB_SIZE 8192
+section .bss
+    cursor_row          resd 1      ; terminal cursor row, 0 = first prompt row
+    ob_active           resb 1      ; print_string_len appends to ob_buf
+    ob_len              resd 1
+    ob_buf              resb OB_SIZE
+section .data
+    ansi_clear_eos      db 27, "[J"
+section .text
+
+; ob_begin - start collecting output
+ob_begin:
+    mov dword [ob_len], 0
+    mov byte [ob_active], 1
+    ret
+
+; ob_end - stop collecting and write what was collected
+ob_end:
+    mov byte [ob_active], 0
+; ob_flush - write ob_buf to the terminal
+ob_flush:
+    mov edx, [ob_len]
+    test edx, edx
+    jz .obf_ret
+    lea rsi, [ob_buf]
+.obf_again:
+    mov edi, 1
+    mov eax, SYS_WRITE
+    syscall
+    test rax, rax
+    jle .obf_done
+    add rsi, rax
+    sub rdx, rax
+    jnz .obf_again
+.obf_done:
+    mov dword [ob_len], 0
+.obf_ret:
+    ret
+
+; write_csi_num - write ESC [ <eax> <cl> (cursor movement) to the output
+write_csi_num:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 16
+
+    mov ebx, ecx                ; final byte
+    lea r12, [ansi_num_buf]
+    mov byte [r12], 27          ; ESC
+    mov byte [r12 + 1], '['
+    lea rdi, [r12 + 2]
+    call uint_to_str            ; eax = number -> digits at rdi, ecx = count
+    mov [r12 + rcx + 2], bl
+    lea esi, [rcx + 3]
+    lea rdi, [ansi_num_buf]
+    call print_string_len
+
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
+; redraw_line - Redraw the prompt and the (highlighted) line buffer
+;
+; Back to the first prompt row, replay the cached prompt, draw the line, push
+; a pending wrap through if the text ends exactly at the right margin, erase
+; whatever an earlier longer draw left, then put the cursor on line_cursor.
 ; ============================================================================
 redraw_line:
     push rbp
@@ -2188,30 +2601,75 @@ redraw_line:
     push r14
     sub rsp, 32
 
-    ; Move to start of line with \r
+    ; The window may have been resized since the last prompt
+    cmp byte [winch_pending], 0
+    je .rd_size_ok
+    mov byte [winch_pending], 0
+    call update_term_size
+.rd_size_ok:
+    call ob_begin
+
     lea rdi, [str_cr]
     mov esi, 1
     call print_string_len
-
-    ; Reprint only the prompt line itself: the "[127]" exit hint and the
-    ; stats line sit above it and were printed once already.
-    mov byte [prompt_redraw], 1
-    call print_prompt
+    mov eax, [cursor_row]
+    test eax, eax
+    jz .rd_at_top
+    mov ecx, 'A'
+    call write_csi_num
+.rd_at_top:
+    call print_prompt_line
 
     ; --- Syntax highlighting for line content (ash/highlight.asm) ---
     call hl_draw_line
 
-.rd_clear:
-    ; Clear from cursor to end of line (removes any leftover chars)
-    lea rdi, [ansi_clear_eol]
-    mov esi, ansi_clear_eol_len
+    ; r12d = cells used by prompt + text = where the cursor is now
+    lea rdi, [line_buf]
+    mov esi, [line_len]
+    call utf8_cols
+    add eax, [prompt_total_len]
+    mov r12d, eax
+    call cur_cols
+    mov ecx, eax
+    mov eax, r12d
+    xor edx, edx
+    div ecx                     ; eax = end row, edx = end column
+    mov r14d, eax
+    test edx, edx
+    jnz .rd_erase
+    test r12d, r12d
+    jz .rd_erase
+    lea rdi, [wrap_nudge]       ; text fills the last column: wrap now, so the
+    mov esi, 2                  ; erase below does not hit the last character
+    call print_string_len
+.rd_erase:
+    lea rdi, [ansi_clear_eos]
+    mov esi, 3
     call print_string_len
 
-    ; Position cursor: column = prompt_total_len + line_cursor + 1 (1-based)
-    mov eax, [prompt_total_len]
-    add eax, [line_cursor]
-    inc eax                     ; 1-based column for ANSI
-    call write_ansi_cursor_col
+    ; Cursor target: prompt + the text before line_cursor
+    lea rdi, [line_buf]
+    mov esi, [line_cursor]
+    call utf8_cols
+    add eax, [prompt_total_len]
+    mov r13d, eax
+    call cur_cols
+    mov ecx, eax
+    mov eax, r13d
+    xor edx, edx
+    div ecx                     ; eax = target row, edx = target column
+    mov [cursor_row], eax
+    mov ebx, edx
+    sub r14d, eax               ; rows between the end of the text and it
+    jle .rd_col
+    mov eax, r14d
+    mov ecx, 'A'
+    call write_csi_num
+.rd_col:
+    lea eax, [rbx + 1]
+    mov ecx, 'G'
+    call write_csi_num
+    call ob_end
 
     add rsp, 32
     pop r14
@@ -2222,60 +2680,48 @@ redraw_line:
     ret
 
 ; ============================================================================
-; update_cursor_pos - Move cursor to correct position in line
-; Computes column = prompt_total_len + line_cursor + 1 (1-based)
-; and writes ESC[{col}G escape sequence.
+; update_cursor_pos - Move the cursor to line_cursor without redrawing
+; Works out the target row and column from the text before the cursor and
+; moves relative to cursor_row.
 ; ============================================================================
 update_cursor_pos:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 16
-
-    mov eax, [prompt_total_len]
-    add eax, [line_cursor]
-    inc eax                     ; 1-based
-    call write_ansi_cursor_col
-
-    leave
-    ret
-
-; ============================================================================
-; write_ansi_cursor_col - Write ESC[{number}G to stdout
-; eax = column number (1-based)
-; Builds the escape sequence in ansi_num_buf and writes it.
-; ============================================================================
-write_ansi_cursor_col:
     push rbp
     mov rbp, rsp
     push rbx
     push r12
     sub rsp, 16
 
-    mov ebx, eax               ; save column number
-
-    ; Build ESC[
-    lea r12, [ansi_num_buf]
-    mov byte [r12], 27          ; ESC
-    mov byte [r12 + 1], '['
-    lea rdi, [r12 + 2]
-
-    ; Convert number to decimal string
-    mov eax, ebx
-    call uint_to_str            ; rdi = buffer, eax = number, returns length in ecx
-
-    ; Append 'G'
-    lea rax, [r12 + 2]
-    add rax, rcx                ; point past the number digits
-    mov byte [rax], 'G'
-    inc rax
-    mov byte [rax], 0           ; null terminate (not needed for write, but safe)
-
-    ; Calculate total length: 2 (ESC[) + number_len + 1 (G)
-    lea esi, [ecx + 3]          ; 2 + digits + 1
-
-    ; Write it
-    lea rdi, [ansi_num_buf]
-    call print_string_len
+    call ob_begin
+    lea rdi, [line_buf]
+    mov esi, [line_cursor]
+    call utf8_cols
+    add eax, [prompt_total_len]
+    mov r12d, eax
+    call cur_cols
+    mov ecx, eax
+    mov eax, r12d
+    xor edx, edx
+    div ecx                     ; eax = target row, edx = target column
+    mov ebx, edx
+    mov ecx, [cursor_row]
+    mov [cursor_row], eax
+    cmp eax, ecx
+    je .ucp_col
+    jb .ucp_up
+    sub eax, ecx
+    mov ecx, 'B'
+    call write_csi_num
+    jmp .ucp_col
+.ucp_up:
+    sub ecx, eax
+    mov eax, ecx
+    mov ecx, 'A'
+    call write_csi_num
+.ucp_col:
+    lea eax, [rbx + 1]
+    mov ecx, 'G'
+    call write_csi_num
+    call ob_end
 
     add rsp, 16
     pop r12
@@ -2375,10 +2821,10 @@ history_add:
     lea rsi, [history_buf]
     add rsi, rax
 
-    ; Compare with new string
+    ; Compare with new string (commands are case-sensitive)
     mov rdi, r12
     ; rsi already points to last entry
-    call str_icompare
+    call hist_streq
     test eax, eax
     jz .ha_done                 ; duplicate, skip
 
@@ -2422,6 +2868,7 @@ history_add:
     ; Reset navigation state
     mov eax, [history_write_idx]
     mov [history_nav_idx], eax
+    mov dword [history_nav_steps], 0
     mov byte [history_browsing], 0
 
     add rsp, 24
@@ -2432,10 +2879,35 @@ history_add:
     ret
 
 ; ============================================================================
+; hist_streq - eax = 0 if the NUL-terminated strings at rdi and rsi are equal
+; ============================================================================
+hist_streq:
+.hse_loop:
+    mov al, [rdi]
+    cmp al, [rsi]
+    jne .hse_ne
+    test al, al
+    jz .hse_eq
+    inc rdi
+    inc rsi
+    jmp .hse_loop
+.hse_eq:
+    xor eax, eax
+    ret
+.hse_ne:
+    mov eax, 1
+    ret
+
+; ============================================================================
 ; history_navigate_up - Navigate to the previous (older) history entry
 ; Saves current line on first navigation, then walks backwards through
-; the circular buffer.
+; the circular buffer. history_nav_steps counts how far back we are (1 = the
+; newest entry), so the oldest entry is reachable even in a full ring where
+; its index equals the write index.
 ; ============================================================================
+section .bss
+    history_nav_steps   resd 1
+section .text
 history_navigate_up:
     push rbp
     mov rbp, rsp
@@ -2449,6 +2921,11 @@ history_navigate_up:
     test eax, eax
     jz .hnu_done
 
+    ; Already on the oldest entry?
+    mov ecx, [history_nav_steps]
+    cmp ecx, eax
+    jae .hnu_done
+
     ; Save current line if this is the first navigation press
     cmp byte [history_browsing], 0
     jne .hnu_nav
@@ -2458,22 +2935,15 @@ history_navigate_up:
     call str_copy
 
 .hnu_nav:
-    ; Move nav index backwards with wrap
-    mov eax, [history_nav_idx]
-    test eax, eax
-    jnz .hnu_dec
-    mov eax, HISTORY_COUNT
-.hnu_dec:
-    dec eax
-
-    ; Check if we've reached the oldest entry (cannot go further back)
-    mov ecx, [history_write_idx]
-    sub ecx, [history_count]
-    jge .hnu_check
-    add ecx, HISTORY_COUNT
-.hnu_check:
-    cmp eax, ecx
-    je .hnu_done                ; at oldest entry, stop
+    ; One step further back: index = write_idx - steps (mod HISTORY_COUNT)
+    mov ecx, [history_nav_steps]
+    inc ecx
+    mov [history_nav_steps], ecx
+    mov eax, [history_write_idx]
+    sub eax, ecx
+    jge .hnu_idx
+    add eax, HISTORY_COUNT
+.hnu_idx:
 
     ; Load history entry into line_buf
     mov [history_nav_idx], eax
@@ -2512,16 +2982,16 @@ history_navigate_down:
     cmp byte [history_browsing], 0
     je .hnd_done
 
-    ; Move nav index forward with wrap
-    mov eax, [history_nav_idx]
-    inc eax
-    cmp eax, HISTORY_COUNT
-    jl .hnd_nowrap
-    xor eax, eax
-.hnd_nowrap:
-    ; Check if we've reached the write pointer (back to current)
-    cmp eax, [history_write_idx]
-    je .hnd_restore
+    ; One step forward; past the newest entry the saved line comes back
+    mov ecx, [history_nav_steps]
+    dec ecx
+    mov [history_nav_steps], ecx
+    jz .hnd_restore
+    mov eax, [history_write_idx]
+    sub eax, ecx
+    jge .hnd_idx
+    add eax, HISTORY_COUNT
+.hnd_idx:
 
     ; Load history entry into line_buf
     mov [history_nav_idx], eax
@@ -2540,6 +3010,7 @@ history_navigate_down:
 
 .hnd_restore:
     ; Restore the saved line (what user was typing before navigating)
+    mov eax, [history_write_idx]
     mov [history_nav_idx], eax
     mov byte [history_browsing], 0
     lea rdi, [line_buf]
@@ -2562,8 +3033,21 @@ history_navigate_down:
 ; ============================================================================
 ; tab_complete - File/directory tab completion using getdents64
 ; Called from read_line when Tab is pressed.
-; Uses line_buf/line_cursor to find prefix, opens directory, iterates entries.
+;
+; The first Tab remembers the word under the cursor (tab_name_prefix), the
+; text behind the cursor (tab_tail) and starts at match 0. Every Tab - the
+; first and each repeat - opens the directory, walks it to the
+; tab_cycle_idx-th match, closes it again and rebuilds the line as
+;     text before the word + directory part + name (+ "/") + tail.
+; Past the last match the cycle starts over. Nothing stays open between key
+; presses, so an abandoned cycle leaks nothing, and a directory of any size
+; is read to its end.
 ; ============================================================================
+section .bss
+    tab_cycle_idx       resd 1      ; which match the next Tab inserts
+    tab_tail            resb MAX_INPUT
+    tab_tail_len        resd 1
+section .text
 tab_complete:
     push rbp
     mov rbp, rsp
@@ -2572,13 +3056,13 @@ tab_complete:
     push r13
     push r14
     push r15
-    sub rsp, 56
+    sub rsp, 24
 
-    ; ------ Check if we are continuing a previous tab cycle ------
+    ; ------ Continuing a previous tab cycle? ------
     cmp byte [tab_active], 1
-    je .tc_next
+    je .tc_derive
 
-    ; ====== FIRST TAB: extract prefix, open dir, find first match ======
+    ; ====== FIRST TAB: remember the word, the tail, start at match 0 ======
 
     ; Find the start of the word being completed (scan backwards from cursor)
     mov r12d, [line_cursor]         ; r12d = word start position
@@ -2616,33 +3100,45 @@ tab_complete:
     lea r8, [tab_name_prefix]
     mov byte [r8 + rbx], 0
 
-    ; Split into directory part and name part
-    ; Find last '/' in tab_name_prefix
+    ; Keep the text behind the cursor: the completion goes in front of it
+    mov ecx, [line_cursor]
+    mov edx, [line_len]
+    lea rsi, [line_buf]
+    lea rdi, [tab_tail]
+    xor eax, eax
+.tc_cp_tail:
+    cmp ecx, edx
+    jae .tc_tail_done
+    mov r8b, [rsi + rcx]
+    mov [rdi + rax], r8b
+    inc ecx
+    inc eax
+    jmp .tc_cp_tail
+.tc_tail_done:
+    mov byte [rdi + rax], 0
+    mov [tab_tail_len], eax
+
+    mov dword [tab_cycle_idx], 0
+    mov byte [tab_active], 1
+
+.tc_derive:
+    ; Split the stored word at its last '/': r15d = where the name starts
     lea rdi, [tab_name_prefix]
-    mov ecx, ebx
-    xor r14d, r14d                  ; r14d = 0 means no slash found
-    mov r15d, 0                     ; r15d = position after last slash (name start)
+    mov ecx, [tab_name_prefix_len]
+    xor r15d, r15d                  ; no slash: the name is the whole word
 .tc_find_slash:
     test ecx, ecx
     jz .tc_slash_done
     dec ecx
     cmp byte [rdi + rcx], '/'
     jne .tc_find_slash
-    ; Found slash at position ecx
-    mov r14d, 1                     ; flag: slash found
-    lea r15d, [ecx + 1]            ; name part starts after slash
-    jmp .tc_slash_done2
+    lea r15d, [rcx + 1]
 .tc_slash_done:
-    ; No slash found -- directory is ".", name prefix is the whole word
-    xor r15d, r15d                  ; name starts at 0
-.tc_slash_done2:
 
-    ; Open the directory
-    cmp r14d, 0
-    je .tc_open_dot
-
-    ; There is a directory part: copy dir path to find_pattern, null-terminate at slash
+    ; The directory to read goes to find_pattern: "." or the part before the name
     lea rdi, [find_pattern]
+    test r15d, r15d
+    jz .tc_dir_dot
     lea rsi, [tab_name_prefix]
     xor ecx, ecx
 .tc_cp_dir:
@@ -2653,219 +3149,204 @@ tab_complete:
     inc ecx
     jmp .tc_cp_dir
 .tc_cp_dir_done:
-    ; If r15d > 0, we have "dir/" -- null-terminate. If the prefix was just "/",
-    ; keep the "/" itself so we open root.
+    ; "dir/" loses its trailing '/'; a lone "/" stays so we open the root
     cmp r15d, 1
     jle .tc_dir_root
-    mov byte [rdi + rcx - 1], 0    ; replace the trailing '/' with null
-    jmp .tc_do_open_dir
+    mov byte [rdi + rcx - 1], 0
+    jmp .tc_scan_dir
 .tc_dir_root:
     mov byte [rdi + rcx], 0
-.tc_do_open_dir:
+    jmp .tc_scan_dir
+.tc_dir_dot:
+    mov word [rdi], 0x002E          ; "."
+
+.tc_scan_dir:
+    ; open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     lea rdi, [find_pattern]
-    jmp .tc_open_call
-
-.tc_open_dot:
-    ; Open current directory "."
-    lea rdi, [str_dot]
-
-.tc_open_call:
-    ; open(dir_path, O_RDONLY | O_DIRECTORY, 0)
-    mov eax, SYS_OPEN
-    mov esi, O_RDONLY | O_DIRECTORY
+    mov esi, O_RDONLY | O_DIRECTORY | 0x80000
     xor edx, edx
+    mov eax, SYS_OPEN
     syscall
     test rax, rax
-    js .tc_done                     ; open failed
+    js .tc_giveup
+    mov ebx, eax                    ; ebx = directory fd
+    xor r13d, r13d                  ; r13d = matches passed so far
 
-    mov [tab_dir_fd], eax           ; save directory fd
-
-    ; Read first batch of dirents
-    mov edi, [tab_dir_fd]
+.tc_read:
+    mov edi, ebx
     lea rsi, [dirent_buf]
     mov edx, DIRENT_BUF_SIZE
     mov eax, SYS_GETDENTS64
     syscall
     test rax, rax
-    jle .tc_close_done              ; no entries or error
+    jle .tc_dir_end                 ; end of directory (or a read error)
+    mov r14d, eax                   ; bytes in dirent_buf
+    xor r12d, r12d                  ; offset of the next entry
 
-    mov [tab_dirent_bytes], eax
-    mov dword [tab_dirent_offset], 0
-
-    mov byte [tab_active], 1
-    jmp .tc_find_match
-
-    ; ====== NEXT TAB: continue from where we left off ======
-.tc_next:
-    ; Advance past current entry
+.tc_entry:
+    cmp r12d, r14d
+    jae .tc_read
     lea rsi, [dirent_buf]
-    mov eax, [tab_dirent_offset]
-    movzx ecx, word [rsi + rax + DIRENT_D_RECLEN]
-    add eax, ecx
-    mov [tab_dirent_offset], eax
-
-    ; ====== FIND MATCH: iterate dirent buffer ======
-.tc_find_match:
-    lea rsi, [dirent_buf]
-    mov eax, [tab_dirent_offset]
-
-.tc_entry_loop:
-    cmp eax, [tab_dirent_bytes]
-    jge .tc_refill                  ; exhausted current buffer
-
-    ; Get pointer to this dirent entry
-    lea rbx, [rsi + rax]           ; rbx = dirent entry base
-
-    ; Get d_name
-    lea r13, [rbx + DIRENT_D_NAME]
+    add rsi, r12                    ; rsi = this entry
+    movzx eax, word [rsi + DIRENT_D_RECLEN]
+    add r12d, eax
+    lea r9, [rsi + DIRENT_D_NAME]   ; r9 = d_name
 
     ; Skip "." and ".."
-    cmp byte [r13], '.'
-    jne .tc_check_prefix
-    cmp byte [r13 + 1], 0
-    je .tc_skip_entry
-    cmp byte [r13 + 1], '.'
-    jne .tc_check_prefix
-    cmp byte [r13 + 2], 0
-    je .tc_skip_entry
+    cmp byte [r9], '.'
+    jne .tc_pfx
+    cmp byte [r9 + 1], 0
+    je .tc_entry
+    cmp byte [r9 + 1], '.'
+    jne .tc_pfx
+    cmp byte [r9 + 2], 0
+    je .tc_entry
 
-.tc_check_prefix:
-    ; Check if d_name starts with our name prefix (after the last '/')
-    ; The name prefix to match is tab_name_prefix[r15d..end]
+.tc_pfx:
+    ; d_name must start with the typed name (case-insensitive)
     lea r8, [tab_name_prefix]
-    add r8, r15                     ; r8 = pointer to name-only prefix
+    add r8, r15
     mov ecx, [tab_name_prefix_len]
-    sub ecx, r15d                   ; ecx = length of name-only prefix
-
-    ; If prefix length is 0, everything matches
-    test ecx, ecx
-    jz .tc_match_found
-
-    ; Compare ecx chars
+    sub ecx, r15d
     xor edx, edx
 .tc_cmp_loop:
     cmp edx, ecx
-    jge .tc_match_found
+    jge .tc_ctl
     movzx edi, byte [r8 + rdx]
-    movzx r9d, byte [r13 + rdx]
-    ; Case-insensitive comparison
+    movzx r10d, byte [r9 + rdx]
     cmp dil, 'A'
     jb .tc_cmp_s2
     cmp dil, 'Z'
     ja .tc_cmp_s2
     add dil, 32
 .tc_cmp_s2:
-    cmp r9b, 'A'
+    cmp r10b, 'A'
     jb .tc_cmp_check
-    cmp r9b, 'Z'
+    cmp r10b, 'Z'
     ja .tc_cmp_check
-    add r9b, 32
+    add r10b, 32
 .tc_cmp_check:
-    cmp dil, r9b
-    jne .tc_skip_entry
+    cmp dil, r10b
+    jne .tc_entry
     inc edx
     jmp .tc_cmp_loop
 
-.tc_match_found:
-    ; Save offset for next iteration
-    mov eax, [tab_dirent_offset]
-    ; (tab_dirent_offset already points to this entry)
-
-    ; Build the replacement text:
-    ; If there was a dir prefix, it's tab_name_prefix[0..r15d-1] + d_name
-    ; Otherwise just d_name
-
-    ; Replace text in line_buf starting at tab_base_pos
-    lea r8, [line_buf]
-    mov ecx, [tab_base_pos]
-    add r8, rcx                     ; r8 = insertion point
-
-    ; Copy dir prefix part first (if any)
+.tc_ctl:
+    ; A name with control bytes would garble the line: never offer it
     xor edx, edx
-    cmp r15d, 0
-    je .tc_copy_name
-    lea r9, [tab_name_prefix]
-.tc_copy_dir_prefix:
-    cmp edx, r15d
-    jge .tc_copy_name
+.tc_ctl_loop:
     movzx eax, byte [r9 + rdx]
-    mov [r8 + rdx], al
-    inc edx
-    jmp .tc_copy_dir_prefix
-
-.tc_copy_name:
-    ; edx = current offset in insertion, copy d_name
-    xor ecx, ecx
-.tc_copy_dname:
-    movzx eax, byte [r13 + rcx]
     test al, al
-    jz .tc_copy_done
-    mov [r8 + rdx], al
+    jz .tc_matched
+    cmp al, 0x20
+    jb .tc_entry
+    cmp al, 0x7F
+    je .tc_entry
     inc edx
+    jmp .tc_ctl_loop
+
+.tc_matched:
+    cmp r13d, [tab_cycle_idx]
+    je .tc_insert
+    inc r13d
+    jmp .tc_entry
+
+.tc_dir_end:
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    cmp dword [tab_cycle_idx], 0
+    je .tc_giveup                   ; nothing matches at all
+    mov dword [tab_cycle_idx], 0    ; past the last match: start over
+    jmp .tc_scan_dir
+
+.tc_insert:
+    ; rsi = the chosen entry. The dirent data stays valid after the close.
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    inc dword [tab_cycle_idx]
+    lea r9, [rsi + DIRENT_D_NAME]
+    movzx r10d, byte [rsi + DIRENT_D_TYPE]
+
+    xor ecx, ecx                    ; ecx = length of d_name
+.tc_nlen:
+    cmp byte [r9 + rcx], 0
+    je .tc_nlen_done
     inc ecx
-    jmp .tc_copy_dname
+    jmp .tc_nlen
+.tc_nlen_done:
 
-.tc_copy_done:
-    ; Check if it's a directory -- append '/'
-    movzx eax, byte [rbx + DIRENT_D_TYPE]
-    cmp al, DT_DIR
-    jne .tc_finalize
-    mov byte [r8 + rdx], '/'
-    inc edx
+    ; New cursor = word start + directory part + name (+ "/")
+    xor edx, edx
+    cmp r10b, DT_DIR
+    sete dl                         ; edx = 1 when a '/' follows
+    mov r8d, [tab_base_pos]
+    add r8d, r15d
+    add r8d, ecx
+    add r8d, edx
+    mov eax, r8d
+    add eax, [tab_tail_len]
+    cmp eax, MAX_INPUT - 2
+    ja .tc_done                     ; would overflow the line: leave it be
 
-.tc_finalize:
-    ; Update line_len and line_cursor
+    lea rdi, [line_buf]
     mov eax, [tab_base_pos]
-    add eax, edx
+    add rdi, rax
+    lea rsi, [tab_name_prefix]
+    mov eax, r15d                   ; directory part
+.tc_w1:
+    test eax, eax
+    jz .tc_w2
+    mov r11b, [rsi]
+    mov [rdi], r11b
+    inc rsi
+    inc rdi
+    dec eax
+    jmp .tc_w1
+.tc_w2:
+    mov rsi, r9
+    mov eax, ecx                    ; name
+.tc_w3:
+    test eax, eax
+    jz .tc_w4
+    mov r11b, [rsi]
+    mov [rdi], r11b
+    inc rsi
+    inc rdi
+    dec eax
+    jmp .tc_w3
+.tc_w4:
+    test edx, edx
+    jz .tc_w5
+    mov byte [rdi], '/'
+    inc rdi
+.tc_w5:
+    mov [line_cursor], r8d
+    lea rsi, [tab_tail]
+    mov eax, [tab_tail_len]
+.tc_w6:
+    test eax, eax
+    jz .tc_w7
+    mov r11b, [rsi]
+    mov [rdi], r11b
+    inc rsi
+    inc rdi
+    dec eax
+    jmp .tc_w6
+.tc_w7:
+    mov byte [rdi], 0
+    mov eax, r8d
+    add eax, [tab_tail_len]
     mov [line_len], eax
-    mov [line_cursor], eax
-    lea rax, [line_buf]
-    mov ecx, [line_len]
-    mov byte [rax + rcx], 0
-
-    ; Redraw the line
     call redraw_line
     jmp .tc_done
 
-.tc_skip_entry:
-    ; Advance to next dirent entry
-    lea rsi, [dirent_buf]
-    mov eax, [tab_dirent_offset]
-    movzx ecx, word [rsi + rax + DIRENT_D_RECLEN]
-    add eax, ecx
-    mov [tab_dirent_offset], eax
-    jmp .tc_entry_loop
-
-.tc_refill:
-    ; Try to read more dirents (wrap around: lseek to 0 and re-read)
-    mov edi, [tab_dir_fd]
-    xor esi, esi                    ; offset = 0
-    xor edx, edx                    ; SEEK_SET = 0
-    mov eax, SYS_LSEEK
-    syscall
-
-    mov edi, [tab_dir_fd]
-    lea rsi, [dirent_buf]
-    mov edx, DIRENT_BUF_SIZE
-    mov eax, SYS_GETDENTS64
-    syscall
-    test rax, rax
-    jle .tc_close_done              ; nothing more
-
-    mov [tab_dirent_bytes], eax
-    mov dword [tab_dirent_offset], 0
-    jmp .tc_find_match
-
-.tc_close_done:
-    ; Close the directory fd
-    mov edi, [tab_dir_fd]
-    mov eax, SYS_CLOSE
-    syscall
-    mov dword [tab_dir_fd], -1
+.tc_giveup:
     mov byte [tab_active], 0
 
 .tc_done:
-    add rsp, 56
+    add rsp, 24
     pop r15
     pop r14
     pop r13
@@ -2963,6 +3444,8 @@ dispatch_command:
 
     ; Assume success by default (overwritten on failure). Done after the
     ; expansion so "$?" still sees the previous command's status.
+    mov eax, [last_exit_status]
+    mov [prev_exit_status], eax     ; a bare "exit" reports this one
     mov dword [last_exit_status], 0
 
     ; Check aliases. The alias text is syntax, so its own $VAR and $( ) are
@@ -4298,7 +4781,8 @@ check_alias:
     jmp .ca_loop
 
 .ca_match:
-    ; The expansion must fit in a command line
+    ; The expansion (alias value + rest of the line) has to fit a command
+    ; line. If it does not, run nothing rather than a different command.
     lea rdi, [rbx + ALIAS_NAME_SIZE]
     call str_len
     mov r12d, eax
@@ -4981,12 +5465,18 @@ handler_cls:
     ret
 
 ; ---------- handler_exit ----------
+; dispatch_command clears last_exit_status before it runs a handler, so a bare
+; "exit" takes the status the previous command left in prev_exit_status.
+section .bss
+    prev_exit_status    resd 1
+section .text
 handler_exit:
+    sub rsp, 8                      ; keep the call below 16-byte aligned
     ; Restore terminal to cooked mode before exiting
     call restore_terminal
 
     ; exit with the status of the last command (like sh)
-    mov edi, [last_exit_status]
+    mov edi, [prev_exit_status]
     mov eax, SYS_EXIT
     syscall
     ; Does not return
@@ -5031,7 +5521,7 @@ handler_date:
     mov eax, SYS_CLOCK_GETTIME
     syscall
 
-    ; Add timezone offset (configurable via $ASM_TZ, default PKT UTC+5)
+    ; Add the timezone offset ($ASM_TZ, $TZ or the build default)
     call resolve_tz_offset
     mov rdi, [timespec_buf]
     add rdi, rax
@@ -5121,8 +5611,12 @@ handler_date:
 .hd_ampm_done:
     call print_cstring
 
-    ; 6. " PKT "
-    lea rdi, [str_pkt]
+    ; 6. Zone name (" PKT ", " +0530 ", " EST ")
+    lea rdi, [str_space]
+    call print_cstring
+    lea rdi, [tz_label]
+    call print_cstring
+    lea rdi, [str_space]
     call print_cstring
 
     ; 7. Year
@@ -5137,75 +5631,253 @@ handler_date:
     ret
 
 ; ============================================================================
-; resolve_tz_offset — return tz offset in seconds (rax)
-; Reads $ASM_TZ once, caches result. Accepts decimal integer with optional
-; leading '-'. Falls back to TZ_OFFSET_SECONDS if unset or unparseable.
+; resolve_tz_offset - return the offset from UTC in seconds (rax) and leave the
+; zone name to print in tz_label. Looked up on every call, so changing the
+; variables takes effect at once. Order:
+;   $ASM_TZ  seconds east of UTC (signed integer, nothing else allowed);
+;            the name shown is the offset as "+HHMM"
+;   $TZ      "NAME", "NAMEh[:mm[:ss]]" or "<NAME>h[:mm[:ss]]" with the POSIX
+;            sign (positive = west of UTC); zone files such as
+;            "Europe/Paris" and daylight saving rules are not understood
+;   build default (TZ_OFFSET_SECONDS, shown as TZ_NAME_DEFAULT)
+; A value that cannot be read is skipped, never half-used.
 ; ============================================================================
+%define TZ_MAX_SECONDS  93600           ; 26 hours, beyond any real zone
+section .data
+    tz_env_tz_str   db "TZ", 0
+    tz_default_name db TZ_NAME_DEFAULT, 0
+section .bss
+    tz_label        resb 24
+section .text
 resolve_tz_offset:
-    cmp byte [tz_offset_resolved], 0
-    jne .rto_cached
-
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 8
+    push r12
 
     lea rdi, [tz_env_name_str]
     call getenv_internal
     test rax, rax
+    jz .rto_posix
+    mov rdi, rax
+    call tz_parse_seconds
+    test edx, edx
+    jnz .rto_posix
+    call tz_numeric_label
+    jmp .rto_ret
+
+.rto_posix:
+    lea rdi, [tz_env_tz_str]
+    call getenv_internal
+    test rax, rax
+    jz .rto_default
+    mov rsi, rax
+    lea rdi, [tz_label]
+    xor ecx, ecx                    ; ecx = length of the name
+    cmp byte [rsi], '<'
+    je .rto_quoted
+
+    ; Plain name: at least three letters
+.rto_name:
+    movzx eax, byte [rsi]
+    mov edx, eax
+    or edx, 0x20
+    sub edx, 'a'
+    cmp edx, 25
+    ja .rto_name_end
+    cmp ecx, 15
+    jae .rto_default
+    mov [rdi + rcx], al
+    inc ecx
+    inc rsi
+    jmp .rto_name
+.rto_name_end:
+    cmp ecx, 3
+    jb .rto_default
+    jmp .rto_after_name
+
+.rto_quoted:
+    inc rsi
+.rto_qloop:
+    movzx eax, byte [rsi]
+    cmp al, '>'
+    je .rto_qend
+    test al, al
+    jz .rto_default
+    cmp ecx, 15
+    jae .rto_default
+    mov [rdi + rcx], al
+    inc ecx
+    inc rsi
+    jmp .rto_qloop
+.rto_qend:
+    inc rsi
+    test ecx, ecx
     jz .rto_default
 
-    ; Parse signed integer from [rax]
-    mov rbx, rax
-    xor r8d, r8d                    ; sign flag (0 = +, 1 = -)
-    cmp byte [rbx], '-'
-    jne .rto_plus
-    mov r8d, 1
-    inc rbx
-    jmp .rto_parse
-.rto_plus:
-    cmp byte [rbx], '+'
-    jne .rto_parse
-    inc rbx
-.rto_parse:
-    xor rax, rax
-    xor r9d, r9d                    ; digits seen
-.rto_digit:
-    movzx ecx, byte [rbx]
-    cmp cl, '0'
-    jb .rto_done_parse
-    cmp cl, '9'
-    ja .rto_done_parse
-    sub cl, '0'
-    imul rax, rax, 10
-    add rax, rcx
-    inc rbx
-    inc r9d
-    jmp .rto_digit
-.rto_done_parse:
-    test r9d, r9d
-    jz .rto_default
-    test r8d, r8d
-    jz .rto_store
+.rto_after_name:
+    mov byte [rdi + rcx], 0
+    xor eax, eax
+    cmp byte [rsi], 0
+    je .rto_ret                     ; a bare name means UTC
+    mov r12d, 1                     ; r12d = 1 while the offset is west of UTC
+    cmp byte [rsi], '-'
+    jne .rto_notminus
+    xor r12d, r12d
+    inc rsi
+    jmp .rto_hours
+.rto_notminus:
+    cmp byte [rsi], '+'
+    jne .rto_hours
+    inc rsi
+.rto_hours:
+    call tz_num2
+    test edx, edx
+    jnz .rto_default
+    cmp eax, 24
+    ja .rto_default
+    imul ebx, eax, 3600
+    cmp byte [rsi], ':'
+    jne .rto_tail
+    inc rsi
+    call tz_num2
+    test edx, edx
+    jnz .rto_default
+    cmp eax, 59
+    ja .rto_default
+    imul eax, eax, 60
+    add ebx, eax
+    cmp byte [rsi], ':'
+    jne .rto_tail
+    inc rsi
+    call tz_num2
+    test edx, edx
+    jnz .rto_default
+    cmp eax, 59
+    ja .rto_default
+    add ebx, eax
+.rto_tail:
+    cmp byte [rsi], 0
+    jne .rto_default                ; daylight saving part or other text
+    mov eax, ebx
+    test r12d, r12d
+    jz .rto_ret
     neg rax
-.rto_store:
-    mov [tz_offset_cache], rax
-    mov byte [tz_offset_resolved], 1
-    add rsp, 8
+    jmp .rto_ret
+
+.rto_default:
+    lea rdi, [tz_label]
+    lea rsi, [tz_default_name]
+    call str_copy
+    mov rax, TZ_OFFSET_SECONDS
+
+.rto_ret:
+    pop r12
     pop rbx
     pop rbp
     ret
 
-.rto_default:
-    mov qword [tz_offset_cache], TZ_OFFSET_SECONDS
-    mov byte [tz_offset_resolved], 1
-    add rsp, 8
-    pop rbx
-    pop rbp
-    ; fall through
+; tz_parse_seconds - rdi = text "[+-]digits". Returns rax = value and edx = 0,
+; or edx = 1 when the text is empty, has other characters or is out of range.
+tz_parse_seconds:
+    xor eax, eax
+    xor r8d, r8d                    ; r8d = 1 for a minus sign
+    xor r9d, r9d                    ; r9d = digits seen
+    cmp byte [rdi], '-'
+    jne .tps_plus
+    mov r8d, 1
+    inc rdi
+    jmp .tps_digit
+.tps_plus:
+    cmp byte [rdi], '+'
+    jne .tps_digit
+    inc rdi
+.tps_digit:
+    movzx ecx, byte [rdi]
+    test ecx, ecx
+    jz .tps_end
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .tps_bad
+    inc r9d
+    cmp r9d, 7
+    ja .tps_bad
+    imul rax, rax, 10
+    add rax, rcx
+    inc rdi
+    jmp .tps_digit
+.tps_end:
+    test r9d, r9d
+    jz .tps_bad
+    cmp rax, TZ_MAX_SECONDS
+    ja .tps_bad
+    test r8d, r8d
+    jz .tps_ok
+    neg rax
+.tps_ok:
+    xor edx, edx
+    ret
+.tps_bad:
+    mov edx, 1
+    ret
 
-.rto_cached:
-    mov rax, [tz_offset_cache]
+; tz_num2 - rsi = text. Reads one or two digits into eax and advances rsi.
+; edx = 0 on success, 1 if no digit is there. Changes only eax, ecx, edx, rsi.
+tz_num2:
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    cmp eax, 9
+    ja .tn_bad
+    inc rsi
+    movzx ecx, byte [rsi]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .tn_ok
+    imul eax, eax, 10
+    add eax, ecx
+    inc rsi
+.tn_ok:
+    xor edx, edx
+    ret
+.tn_bad:
+    mov edx, 1
+    ret
+
+; tz_numeric_label - rax = offset in seconds (|rax| <= TZ_MAX_SECONDS). Writes
+; "+HHMM" to tz_label and leaves rax unchanged.
+tz_numeric_label:
+    push rax
+    lea rdi, [tz_label]
+    mov byte [rdi], '+'
+    test rax, rax
+    jns .tnl_abs
+    mov byte [rdi], '-'
+    neg rax
+.tnl_abs:
+    xor edx, edx
+    mov ecx, 3600
+    div ecx                         ; eax = hours, edx = seconds left
+    mov r8d, edx
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rdi + 1], al
+    add dl, '0'
+    mov [rdi + 2], dl
+    mov eax, r8d
+    xor edx, edx
+    mov ecx, 60
+    div ecx                         ; eax = minutes
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rdi + 3], al
+    add dl, '0'
+    mov [rdi + 4], dl
+    mov byte [rdi + 5], 0
+    pop rax
     ret
 
 ; ---------- handler_time ----------
@@ -5432,6 +6104,12 @@ handler_echo:
 
 ; ---------- handler_title ----------
 ; Set terminal title using ANSI escape: "\e]0;<title>\a"
+; Control bytes are dropped from the text, so a title taken from a variable
+; or a file name cannot end the sequence early and smuggle in its own.
+; Nothing is sent when output is not an interactive terminal.
+section .bss
+    title_buf       resb MAX_INPUT
+section .text
 handler_title:
     push rbp
     mov rbp, rsp
@@ -5442,14 +6120,35 @@ handler_title:
     jz .ht_done
     cmp byte [rdi], 0
     je .ht_done
+    cmp byte [color_enabled], 0
+    je .ht_done
+    cmp byte [redir_stdout_active], 0
+    jne .ht_done
     mov rbx, rdi
+
+    ; Copy the printable bytes
+    lea rdi, [title_buf]
+.ht_copy:
+    movzx eax, byte [rbx]
+    inc rbx
+    test al, al
+    jz .ht_copied
+    cmp al, 0x20
+    jb .ht_copy
+    cmp al, 0x7f
+    je .ht_copy
+    mov [rdi], al
+    inc rdi
+    jmp .ht_copy
+.ht_copied:
+    mov byte [rdi], 0
 
     ; Write "\e]0;"
     lea rdi, [ansi_title_pre]
     call print_cstring
 
     ; Write the title text
-    mov rdi, rbx
+    lea rdi, [title_buf]
     call print_cstring
 
     ; Write BEL (0x07) -- the ansi_title_post should contain this
@@ -5461,6 +6160,34 @@ handler_title:
     pop rbx
     pop rbp
     ret
+
+; ---------- put_dec ----------
+; Write eax (10..999) as decimal at [rdi] and advance rdi past it.
+put_dec:
+    cmp eax, 100
+    jb .pd_two
+    xor edx, edx
+    mov ecx, 100
+    div ecx                         ; eax = hundreds, edx = rest
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov eax, edx
+.pd_two:
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rdi], al
+    add dl, '0'
+    mov [rdi + 1], dl
+    add rdi, 2
+    ret
+
+section .data
+    err_color_usage     db "Usage: color <bg><fg>  (two hex digits, e.g. color 0A)", 10, 0
+    err_color_usage_len equ $ - err_color_usage - 1
+section .text
 
 ; ---------- handler_color ----------
 ; Parse 2 hex digits (bg nibble, fg nibble in Windows scheme).
@@ -5492,145 +6219,79 @@ handler_color:
     ; First hex digit = background (Windows convention)
     movzx eax, byte [rbx]
     call hex_to_int
+    cmp eax, 15
+    ja .hco_usage
     mov r12d, eax                   ; r12d = bg index (0-15)
 
     ; Second hex digit = foreground
     movzx eax, byte [rbx + 1]
     call hex_to_int
+    cmp eax, 15
+    ja .hco_usage
     mov r13d, eax                   ; r13d = fg index (0-15)
+
+    ; Nothing but spaces may follow
+    cmp byte [rbx + 2], 0
+    je .hco_args_ok
+    cmp byte [rbx + 2], ' '
+    jne .hco_usage
+.hco_args_ok:
+
+    ; Colour escapes only make sense on an interactive colour terminal
+    cmp byte [color_enabled], 0
+    je .hco_done
+    cmp byte [redir_stdout_active], 0
+    jne .hco_done
 
     ; Convert fg index to ANSI code
     ; 0-7: normal (30 + win_to_ansi[n]), 8-15: bright (90 + win_to_ansi[n-8])
     lea rax, [win_to_ansi]
+    mov ecx, 30
     cmp r13d, 8
-    jge .hco_fg_bright
-    movzx r13d, byte [rax + r13]
-    add r13d, 30                    ; normal fg: 30-37
-    jmp .hco_fg_set
-.hco_fg_bright:
-    mov ecx, r13d
-    sub ecx, 8
-    movzx r13d, byte [rax + rcx]
-    add r13d, 90                    ; bright fg: 90-97
+    jb .hco_fg_set
+    sub r13d, 8
+    mov ecx, 90                     ; bright fg: 90-97
 .hco_fg_set:
+    movzx r13d, byte [rax + r13]
+    add r13d, ecx
 
     ; Convert bg index to ANSI code
     ; 0-7: normal (40 + win_to_ansi[n]), 8-15: bright (100 + win_to_ansi[n-8])
-    lea rax, [win_to_ansi]
+    mov ecx, 40
     cmp r12d, 8
-    jge .hco_bg_bright
-    movzx r12d, byte [rax + r12]
-    add r12d, 40                    ; normal bg: 40-47
-    jmp .hco_bg_set
-.hco_bg_bright:
-    mov ecx, r12d
-    sub ecx, 8
-    movzx r12d, byte [rax + rcx]
-    add r12d, 100                   ; bright bg: 100-107
+    jb .hco_bg_set
+    sub r12d, 8
+    mov ecx, 100                    ; bright bg: 100-107
 .hco_bg_set:
+    movzx r12d, byte [rax + r12]
+    add r12d, ecx
 
     ; Build ANSI sequence: ESC [ <fg> ; <bg> m
     lea rdi, [num_buf]
     mov byte [rdi], 0x1B            ; ESC
-    mov byte [rdi+1], '['
-    mov r8d, 2                      ; write offset
-
-    ; Write fg number (2-3 digits)
+    mov byte [rdi + 1], '['
+    add rdi, 2
     mov eax, r13d
-    xor edx, edx
-    mov ecx, 100
-    div ecx                         ; eax=hundreds, edx=remainder
-    test eax, eax
-    jz .hco_fg_no100
-    add al, '0'
-    lea rax, [num_buf]
-    mov [rax + r8], al
-    inc r8d
-    mov eax, edx
-    xor edx, edx
-    mov ecx, 10
-    div ecx
-    add al, '0'
-    lea rax, [num_buf]
-    mov [rax + r8], al
-    inc r8d
-    add dl, '0'
-    mov [rax + r8], dl
-    inc r8d
-    jmp .hco_fg_written
-.hco_fg_no100:
-    mov eax, edx
-    xor edx, edx
-    mov ecx, 10
-    div ecx
-    test al, al
-    jz .hco_fg_1dig
-    add al, '0'
-    lea rax, [num_buf]
-    mov [rax + r8], al
-    inc r8d
-.hco_fg_1dig:
-    add dl, '0'
-    lea rax, [num_buf]
-    mov [rax + r8], dl
-    inc r8d
-.hco_fg_written:
-
-    ; Semicolon
-    lea rax, [num_buf]
-    mov byte [rax + r8], ';'
-    inc r8d
-
-    ; Write bg number (2-3 digits)
+    call put_dec
+    mov byte [rdi], ';'
+    inc rdi
     mov eax, r12d
-    xor edx, edx
-    mov ecx, 100
-    div ecx
-    test eax, eax
-    jz .hco_bg_no100
-    add al, '0'
-    lea rax, [num_buf]
-    mov [rax + r8], al
-    inc r8d
-    mov eax, edx
-    xor edx, edx
-    mov ecx, 10
-    div ecx
-    add al, '0'
-    lea rax, [num_buf]
-    mov [rax + r8], al
-    inc r8d
-    add dl, '0'
-    mov [rax + r8], dl
-    inc r8d
-    jmp .hco_bg_written
-.hco_bg_no100:
-    mov eax, edx
-    xor edx, edx
-    mov ecx, 10
-    div ecx
-    test al, al
-    jz .hco_bg_1dig
-    add al, '0'
-    lea rax, [num_buf]
-    mov [rax + r8], al
-    inc r8d
-.hco_bg_1dig:
-    add dl, '0'
-    lea rax, [num_buf]
-    mov [rax + r8], dl
-    inc r8d
-.hco_bg_written:
-
-    ; Terminating 'm'
-    lea rax, [num_buf]
-    mov byte [rax + r8], 'm'
-    inc r8d
+    call put_dec
+    mov byte [rdi], 'm'
+    inc rdi
 
     ; Print the ANSI sequence
+    lea rsi, [num_buf]
+    sub rdi, rsi
+    mov esi, edi
     lea rdi, [num_buf]
-    mov esi, r8d
     call print_string_len
+    jmp .hco_done
+
+.hco_usage:
+    lea rdi, [err_color_usage]
+    mov esi, err_color_usage_len
+    call report_error_len
 
 .hco_done:
     add rsp, 8
@@ -5640,8 +6301,73 @@ handler_color:
     pop rbp
     ret
 
+; ---------- change_dir ----------
+; chdir() that keeps `cd -`, $PWD and $OLDPWD in step.
+; rdi = path. Returns eax = 0, or -errno. On success path_buf holds the new
+; working directory. The old directory is recorded only after the chdir
+; worked, so a failed cd leaves `cd -` pointing where it did.
+change_dir:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 16
+
+    mov rbx, rdi                    ; rbx = target
+
+    ; Where are we now? Fails when the current directory was removed.
+    lea rdi, [file_path_buf]
+    mov esi, MAX_PATH_BUF
+    mov eax, SYS_GETCWD
+    syscall
+    mov r12d, eax                   ; r12d <= 0: old directory unknown
+
+    mov rdi, rbx
+    mov eax, SYS_CHDIR
+    syscall
+    test rax, rax
+    js .cdr_ret                     ; eax = -errno
+
+    test r12d, r12d
+    jle .cdr_pwd
+    lea rdi, [prev_dir_buf]
+    lea rsi, [file_path_buf]
+    call str_copy
+    mov byte [has_prev_dir], 1
+    lea rdi, [str_oldpwd]
+    lea rsi, [file_path_buf]
+    call setenv_internal
+
+.cdr_pwd:
+    lea rdi, [path_buf]
+    mov esi, MAX_PATH_BUF
+    mov eax, SYS_GETCWD
+    syscall
+    test rax, rax
+    jle .cdr_ok
+    lea rdi, [str_pwd]
+    lea rsi, [path_buf]
+    call setenv_internal
+
+.cdr_ok:
+    xor eax, eax
+
+.cdr_ret:
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+section .data
+    str_pwd         db "PWD", 0
+    str_oldpwd      db "OLDPWD", 0
+    err_no_cwd      db "Error: Could not determine the current directory.", 10, 0
+    err_no_cwd_len  equ $ - err_no_cwd - 1
+section .text
+
 ; ---------- handler_cd ----------
-; Change directory. Supports "cd -" to go to previous directory.
+; Change directory. "cd -" goes to the previous directory, "cd" alone to $HOME.
 handler_cd:
     push rbp
     mov rbp, rsp
@@ -5650,11 +6376,12 @@ handler_cd:
     sub rsp, 16
 
     mov rbx, rdi                    ; rbx = args
+    xor r12d, r12d                  ; r12d = 1 for "cd -" (shows the new dir)
 
     test rbx, rbx
-    jz .hcd_show
+    jz .hcd_home
     cmp byte [rbx], 0
-    je .hcd_show
+    je .hcd_home
 
     ; Check for "cd -"
     cmp byte [rbx], '-'
@@ -5665,30 +6392,18 @@ handler_cd:
     ; cd - : go to previous directory
     cmp byte [has_prev_dir], 0
     je .hcd_no_prev
+    lea rbx, [prev_dir_buf]
+    mov r12d, 1
 
-    ; Save current dir to temp
-    lea rdi, [file_path_buf]
-    mov esi, MAX_PATH_BUF
-    mov eax, SYS_GETCWD
-    syscall
-
-    ; chdir to prev_dir_buf
-    lea rdi, [prev_dir_buf]
-    mov eax, SYS_CHDIR
-    syscall
-    test rax, rax
+.hcd_change:
+    mov rdi, rbx
+    call change_dir
+    test eax, eax
     js .hcd_err
-
-    ; Copy old cwd (file_path_buf) to prev_dir_buf
-    lea rdi, [prev_dir_buf]
-    lea rsi, [file_path_buf]
-    call str_copy
+    test r12d, r12d
+    jz .hcd_done
 
     ; Print new directory
-    lea rdi, [path_buf]
-    mov esi, MAX_PATH_BUF
-    mov eax, SYS_GETCWD
-    syscall
     lea rdi, [path_buf]
     call print_cstring
     call print_newline
@@ -5697,54 +6412,23 @@ handler_cd:
 .hcd_no_prev:
     lea rdi, [err_no_prev_dir]
     mov esi, err_no_prev_len
-    call print_string_len
+    call report_error_len
     jmp .hcd_done
-
-.hcd_change:
-    ; Save current directory to prev_dir_buf
-    lea rdi, [prev_dir_buf]
-    mov esi, MAX_PATH_BUF
-    mov eax, SYS_GETCWD
-    syscall
-    mov byte [has_prev_dir], 1
-
-    ; chdir to argument
-    mov rdi, rbx
-    mov eax, SYS_CHDIR
-    syscall
-    test rax, rax
-    jns .hcd_done
 
 .hcd_err:
     lea rdi, [err_cd_msg]
     mov esi, err_cd_len
-    call print_string_len
+    call report_error_len
     jmp .hcd_done
 
-.hcd_show:
+.hcd_home:
     ; No args: go to $HOME (POSIX behaviour). Fall back to printing cwd if HOME unset.
     lea rdi, [str_home]
     call getenv_internal
     test rax, rax
     jz .hcd_print_cwd
-
-    ; Save current dir to prev_dir_buf before changing
-    lea rdi, [prev_dir_buf]
-    mov esi, MAX_PATH_BUF
-    mov eax, SYS_GETCWD
-    syscall
-    mov byte [has_prev_dir], 1
-
-    mov rdi, rax
-    ; rax already holds HOME value ptr; move into rdi for chdir
-    lea rdi, [str_home]
-    call getenv_internal
-    mov rdi, rax
-    mov eax, SYS_CHDIR
-    syscall
-    test rax, rax
-    js .hcd_err
-    jmp .hcd_done
+    mov rbx, rax
+    jmp .hcd_change
 
 .hcd_print_cwd:
     lea rdi, [path_buf]
@@ -5773,31 +6457,165 @@ handler_pwd:
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
     syscall
+    test rax, rax
+    jle .hpw_err
 
     lea rdi, [path_buf]
     call print_cstring
     call print_newline
+    jmp .hpw_done
 
+.hpw_err:
+    ; The directory was removed under us
+    lea rdi, [err_no_cwd]
+    mov esi, err_no_cwd_len
+    call report_error_len
+
+.hpw_done:
     leave
     ret
 
+; ---------- passwd_find_uid ----------
+; rdi = buffer holding /etc/passwd, esi = its length, edx = uid.
+; Returns rax = login name (NUL-terminated in place) or 0. Registers only.
+passwd_find_uid:
+    mov esi, esi
+    lea r8, [rdi + rsi]             ; end of data
+    mov r9, rdi                     ; scan pointer
+.pfu_line:
+    cmp r9, r8
+    jae .pfu_none
+    mov r10, r9                     ; line start = name
+.pfu_f1:
+    cmp r9, r8
+    jae .pfu_none
+    movzx eax, byte [r9]
+    cmp al, 10
+    je .pfu_skip
+    inc r9
+    cmp al, ':'
+    jne .pfu_f1
+    lea r11, [r9 - 1]               ; the colon after the name
+.pfu_f2:
+    cmp r9, r8
+    jae .pfu_none
+    movzx eax, byte [r9]
+    cmp al, 10
+    je .pfu_skip
+    inc r9
+    cmp al, ':'
+    jne .pfu_f2
+    xor ecx, ecx                    ; uid value
+    xor esi, esi                    ; digits seen
+.pfu_f3:
+    cmp r9, r8
+    jae .pfu_none
+    movzx eax, byte [r9]
+    sub eax, '0'
+    cmp eax, 9
+    ja .pfu_f3_end
+    imul ecx, ecx, 10
+    add ecx, eax
+    inc esi
+    inc r9
+    jmp .pfu_f3
+.pfu_f3_end:
+    test esi, esi
+    jz .pfu_skip
+    cmp byte [r9], ':'
+    jne .pfu_skip
+    cmp ecx, edx
+    jne .pfu_skip
+    mov byte [r11], 0
+    mov rax, r10
+    ret
+.pfu_skip:
+    cmp r9, r8
+    jae .pfu_none
+    cmp byte [r9], 10
+    je .pfu_next
+    inc r9
+    jmp .pfu_skip
+.pfu_next:
+    inc r9
+    jmp .pfu_line
+.pfu_none:
+    xor eax, eax
+    ret
+
+section .data
+    passwd_path     db "/etc/passwd", 0
+    err_whoami      db "whoami: cannot find a name for the current user.", 10, 0
+section .bss
+    passwd_buf      resb 32768
+section .text
+
 ; ---------- handler_whoami ----------
+; The name belonging to the effective uid (from /etc/passwd), so it cannot be
+; faked with $USER. Falls back to $USER when the user is not listed.
 handler_whoami:
     push rbp
     mov rbp, rsp
+    push rbx
+    push r12
     sub rsp, 16
 
+    mov eax, SYS_GETEUID
+    syscall
+    mov ebx, eax                    ; ebx = uid
+
+    lea rdi, [passwd_path]
+    xor esi, esi                    ; O_RDONLY
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .hw_env
+    mov r12d, eax                   ; r12d = fd
+
+    mov edi, r12d
+    lea rsi, [passwd_buf]
+    mov edx, 32768
+    mov eax, SYS_READ
+    syscall
+    mov [rbp - 24], eax             ; bytes read (or -errno)
+
+    mov edi, r12d
+    mov eax, SYS_CLOSE
+    syscall
+
+    mov esi, [rbp - 24]
+    test esi, esi
+    jle .hw_env
+    lea rdi, [passwd_buf]
+    mov edx, ebx
+    call passwd_find_uid
+    test rax, rax
+    jz .hw_env
+    mov rdi, rax
+    jmp .hw_print
+
+.hw_env:
     lea rdi, [str_user]
     call getenv_internal
     test rax, rax
-    jz .hw_done
-
+    jz .hw_err
     mov rdi, rax
+
+.hw_print:
     call print_cstring
     call print_newline
+    jmp .hw_done
+
+.hw_err:
+    lea rdi, [err_whoami]
+    call report_error_cstr
 
 .hw_done:
-    leave
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
 ; ---------- handler_dir ----------
@@ -5814,50 +6632,41 @@ handler_dir:
 
     mov rbx, rdi                    ; rbx = optional path argument
 
-    ; Print header
-    call print_newline
-    lea rdi, [dir_header]
-    call print_cstring
-
-    ; Determine which directory to list
+    ; Pick the directory: the argument, else the current one
     test rbx, rbx
     jz .hd_use_cwd
     cmp byte [rbx], 0
     je .hd_use_cwd
-
-    ; Use the provided path
-    mov rdi, rbx
-    call print_cstring
-    call print_newline
-    call print_newline
-
-    ; Open the specified directory
-    mov rdi, rbx
+    mov r15, rbx                    ; r15 = name shown in the header
     jmp .hd_open_dir
 
 .hd_use_cwd:
-    ; Print current working directory in header
     lea rdi, [path_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
     syscall
-    lea rdi, [path_buf]
-    call print_cstring
-    call print_newline
-    call print_newline
-
-    lea rdi, [str_dot]
+    lea r15, [path_buf]
+    lea rbx, [str_dot]
 
 .hd_open_dir:
-    mov r15, rdi                    ; save dir path for fstatat
-    ; open(path, O_RDONLY | O_DIRECTORY, 0)
+    ; open(path, O_RDONLY | O_DIRECTORY, 0) before anything is printed, so a
+    ; bad path gives an error and no header
+    mov rdi, rbx
     mov esi, O_RDONLY | O_DIRECTORY
     xor edx, edx
     mov eax, SYS_OPEN
     syscall
     test rax, rax
-    js .hd_done
+    js .hd_open_fail
     mov r12d, eax                   ; r12d = directory fd
+
+    call print_newline
+    lea rdi, [dir_header]
+    call print_cstring
+    mov rdi, r15
+    call print_cstring
+    call print_newline
+    call print_newline
 
 .hd_read_batch:
     ; getdents64(fd, buf, bufsize)
@@ -5910,7 +6719,7 @@ handler_dir:
     js .hd_size_unknown
 
     ; Print file size from stat_buf + STAT_ST_SIZE (8 bytes)
-    mov eax, [stat_buf + STAT_ST_SIZE]  ; low 32 bits of size
+    mov rax, [stat_buf + STAT_ST_SIZE]
     call print_number_9pad
     lea rdi, [str_space]
     call print_cstring
@@ -5948,7 +6757,14 @@ handler_dir:
 
 .hd_done:
     call print_newline
+    jmp .hd_exit
 
+.hd_open_fail:
+    neg eax
+    mov edi, eax
+    call print_last_error
+
+.hd_exit:
     add rsp, 40
     pop r15
     pop r14
@@ -5958,40 +6774,122 @@ handler_dir:
     pop rbp
     ret
 
+; ---------- open_intr ----------
+; open_intr(rdi = path, esi = flags) -> rax = fd or -errno (read-only opens)
+; Like open(2), but a FIFO whose writer has not arrived yet does not hold the
+; shell until one does: the wait is cut short by Ctrl+C (-EINTR).
+%define O_NONBLOCK          0x800
+%define F_SETFL             4
+%define SYS_POLL            7
+%define SYS_FCNTL           72
+
+open_intr:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 16                     ; [rsp] = struct pollfd
+
+    or esi, O_NONBLOCK
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .oi_ret
+    mov ebx, eax
+    mov edi, ebx
+    lea rsi, [stat_buf]
+    mov eax, SYS_FSTAT
+    syscall
+    test rax, rax
+    js .oi_blocking
+    mov eax, [stat_buf + STAT_ST_MODE]
+    and eax, 0o170000
+    cmp eax, 0o010000               ; S_IFIFO
+    jne .oi_blocking
+.oi_poll:
+    cmp byte [ctrl_c_flag], 0
+    jne .oi_intr
+    mov [rsp], ebx                  ; pollfd.fd
+    mov dword [rsp + 4], 1          ; events = POLLIN, revents = 0
+    mov rdi, rsp
+    mov esi, 1
+    mov edx, 100                    ; look at Ctrl+C every 100 ms
+    mov eax, SYS_POLL
+    syscall
+    test rax, rax
+    jle .oi_poll                    ; timeout or a signal
+.oi_blocking:
+    mov edi, ebx                    ; reads and writes block again from here on
+    mov esi, F_SETFL
+    xor edx, edx
+    mov eax, SYS_FCNTL
+    syscall
+    mov eax, ebx
+    jmp .oi_ret
+.oi_intr:
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    mov rax, -4                     ; -EINTR
+.oi_ret:
+    add rsp, 16
+    pop rbx
+    pop rbp
+    ret
+
 ; ---------- handler_type ----------
-; Display file contents
+; Display file contents (type FILE, cat FILE). `cat` with options, several
+; files or no file at all is handed to /bin/cat, which handles stdin too.
+IO_BUF_SIZE equ 65536           ; shared by type/cat and grep
+section .bss
+    io_buf          resb IO_BUF_SIZE
+section .text
 handler_type:
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 24
+    push r12
+    sub rsp, 16
 
-    test rdi, rdi
+    mov r12, rdi                    ; r12 = args (may be NULL)
+    test r12, r12
     jz .hty_noargs
-    cmp byte [rdi], 0
+    cmp byte [r12], 0
     je .hty_noargs
 
-    ; open(filename, O_RDONLY, 0)
+    ; An option or "-" (stdin) is for /bin/cat
+    cmp byte [r12], '-'
+    jne .hty_open
+    movzx eax, byte [input_buf]
+    or al, 0x20
+    cmp al, 'c'
+    je .hty_external
+
+.hty_open:
+    ; open(filename, O_RDONLY, 0); Ctrl+C can end the wait on a FIFO
+    mov rdi, r12
     mov esi, O_RDONLY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
+    call open_intr
     test rax, rax
     js .hty_err
     mov ebx, eax                    ; ebx = file descriptor
 
 .hty_read:
-    ; read(fd, read_buffer, READ_BUF_SIZE)
+    cmp byte [ctrl_c_flag], 0       ; ^C raised by SIGINT stops a long file
+    jne .hty_interrupted
+
+    ; read(fd, io_buf, IO_BUF_SIZE)
     mov edi, ebx
-    lea rsi, [read_buffer]
-    mov edx, READ_BUF_SIZE
+    lea rsi, [io_buf]
+    mov edx, IO_BUF_SIZE
     mov eax, SYS_READ
     syscall
     test rax, rax
-    jle .hty_close                  ; EOF or error
+    jz .hty_close                   ; EOF
+    js .hty_read_err
 
     ; Print what was read
-    lea rdi, [read_buffer]
+    lea rdi, [io_buf]
     mov esi, eax
     call print_string_len
     jmp .hty_read
@@ -6002,19 +6900,72 @@ handler_type:
     syscall
     jmp .hty_done
 
+.hty_read_err:
+    mov r12d, eax
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    mov edi, r12d
+    neg edi                         ; EISDIR for a directory, EIO ...
+    call print_last_error
+    jmp .hty_done
+
+.hty_interrupted:
+    mov byte [ctrl_c_flag], 0
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    mov dword [last_exit_status], 130
+    jmp .hty_done
+
 .hty_noargs:
+    ; Plain `cat` reads stdin; `type` needs a file
+    movzx eax, byte [input_buf]
+    or al, 0x20
+    cmp al, 'c'
+    je .hty_external
     lea rdi, [err_args_msg]
     mov esi, err_args_len
-    call print_string_len
+    call report_error_len
     jmp .hty_done
 
 .hty_err:
+    cmp byte [ctrl_c_flag], 0       ; Ctrl+C ended the open of a FIFO
+    jne .hty_aborted
+    ; "cat a b" is not a file called "a b": let /bin/cat take the list
+    movzx eax, byte [input_buf]
+    or al, 0x20
+    cmp al, 'c'
+    jne .hty_err_msg
+    mov rdi, r12
+.hty_find_space:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .hty_err_msg
+    cmp al, ' '
+    je .hty_external
+    inc rdi
+    jmp .hty_find_space
+.hty_err_msg:
     lea rdi, [err_file_msg]
     mov esi, err_file_len
-    call print_string_len
+    call report_error_len
+    jmp .hty_done
+
+.hty_external:
+    ; input_buf still holds the whole command line
+    call stats_begin
+    call execute_external
+    call stats_end
+    jmp .hty_done
+
+.hty_aborted:
+    mov byte [ctrl_c_flag], 0
+    mov dword [last_exit_status], 130
 
 .hty_done:
-    add rsp, 24
+    add rsp, 16
+    pop r12
     pop rbx
     pop rbp
     ret
@@ -6043,9 +6994,12 @@ handler_mkdir:
     cmp byte [rbx + 1], 'p'
     jne .hmk_go
     cmp byte [rbx + 2], ' '
+    je .hmk_flag_p
+    cmp byte [rbx + 2], 0
     jne .hmk_go
+.hmk_flag_p:
     mov r12d, 1
-    add rbx, 3
+    add rbx, 2                      ; at the space, or at the end for a bare "-p"
     ; skip extra spaces
 .hmk_skip_sp:
     cmp byte [rbx], ' '
@@ -6114,7 +7068,20 @@ handler_mkdir:
     test rax, rax
     jns .hmk_done
     cmp eax, -17
+    jne .hmk_rec_err
+    ; The name already exists: fine for -p only if it is a directory
+    mov rdi, r13
+    lea rsi, [stat_buf]
+    mov eax, SYS_STAT
+    syscall
+    test rax, rax
+    js .hmk_exists
+    mov eax, [stat_buf + STAT_ST_MODE]
+    and eax, S_IFMT
+    cmp eax, S_IFDIR
     je .hmk_done
+.hmk_exists:
+    mov eax, -17
 .hmk_rec_err:
     neg eax
     mov edi, eax
@@ -6124,7 +7091,7 @@ handler_mkdir:
 .hmk_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
-    call print_string_len
+    call report_error_len
 
 .hmk_done:
     add rsp, 16
@@ -6160,7 +7127,7 @@ handler_rmdir:
 .hrd_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
-    call print_string_len
+    call report_error_len
 
 .hrd_done:
     leave
@@ -6186,27 +7153,28 @@ handler_del:
     neg eax
     mov edi, eax
     call print_last_error
+    mov dword [last_exit_status], 1
     jmp .hdl_done
 
 .hdl_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
     call print_string_len
+    mov dword [last_exit_status], 1
 
 .hdl_done:
     leave
     ret
 
 ; ---------- handler_copy ----------
-; Copy file: parse_two_args, open src, open dst, read/write loop, close both
+; Plain copy without the undo bookkeeping (handler_copy_safe in
+; ash/tools.asm is what the command table uses). Parses "src dst" and lets
+; tl_copy_cmd do the work: it refuses folders and copying a file onto itself,
+; keeps the source's permissions and reports every failure.
 handler_copy:
     push rbp
     mov rbp, rsp
     push rbx
-    push r12
-    push r13
-    push r14
-    push r15
     sub rsp, 24
 
     test rdi, rdi
@@ -6218,97 +7186,18 @@ handler_copy:
     test rdx, rdx
     jz .hcp_err
 
-    mov r12, rax                    ; r12 = source path
-    mov r13, rdx                    ; r13 = dest path
-
-    ; Open source: open(src, O_RDONLY, 0)
-    mov rdi, r12
-    mov esi, O_RDONLY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .hcp_src_err
-    mov ebx, eax                    ; ebx = src fd
-
-    ; Open dest: open(dst, O_WRONLY|O_CREAT|O_TRUNC, 0644)
-    mov rdi, r13
-    mov esi, O_WRONLY | O_CREAT | O_TRUNC
-    mov edx, PERM_0644
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .hcp_dst_err
-    mov r12d, eax                   ; r12d = dst fd
-
-.hcp_loop:
-    ; read(src_fd, read_buffer, READ_BUF_SIZE)
-    mov edi, ebx
-    lea rsi, [read_buffer]
-    mov edx, READ_BUF_SIZE
-    mov eax, SYS_READ
-    syscall
-    test rax, rax
-    jz .hcp_close_both              ; EOF
-    js .hcp_read_err                ; read error
-
-    ; write(dst_fd, read_buffer, bytes_read) — handle partial writes
-    mov r14, rax                    ; r14 = total bytes remaining
-    lea r15, [read_buffer]          ; r15 = current write pointer
-.hcp_write_loop:
-    mov edi, r12d
-    mov rsi, r15
-    mov rdx, r14
-    mov eax, SYS_WRITE
-    syscall
-    test rax, rax
-    js .hcp_write_err               ; EIO, ENOSPC, EPIPE etc.
-    add r15, rax                    ; advance pointer by bytes written
-    sub r14, rax                    ; decrement remaining
-    jnz .hcp_write_loop             ; loop until all bytes written
-    jmp .hcp_loop
-
-.hcp_read_err:
-    lea rdi, [err_copy_read_msg]
-    mov esi, err_copy_read_len
-    call print_string_len
-    jmp .hcp_close_both
-
-.hcp_write_err:
-    lea rdi, [err_copy_write_msg]
-    mov esi, err_copy_write_len
-    call print_string_len
-    jmp .hcp_close_both
-
-.hcp_close_both:
-    ; Close dst
-    mov edi, r12d
-    mov eax, SYS_CLOSE
-    syscall
-.hcp_dst_err:
-    ; Close src
-    mov edi, ebx
-    mov eax, SYS_CLOSE
-    syscall
+    mov rdi, rax
+    mov rsi, rdx
+    call tl_copy_cmd
     jmp .hcp_done
-
-.hcp_src_err:
-    lea rdi, [err_file_msg]
-    mov esi, err_file_len
-    call print_string_len
-    jmp .hcp_done
-
 .hcp_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
     call print_string_len
+    mov dword [last_exit_status], 1
 
 .hcp_done:
     add rsp, 24
-    pop r15
-    pop r14
-    pop r13
-    pop r12
     pop rbx
     pop rbp
     ret
@@ -6342,12 +7231,14 @@ handler_rename:
     neg eax
     mov edi, eax
     call print_last_error
+    mov dword [last_exit_status], 1
     jmp .hmv_done
 
 .hmv_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
     call print_string_len
+    mov dword [last_exit_status], 1
 
 .hmv_done:
     add rsp, 24
@@ -6413,42 +7304,48 @@ handler_set:
     jmp .hs_done
 
 .hs_notfound:
-    ; Variable not found -- print error
-    lea rdi, [err_file_msg]
-    mov esi, err_file_len
-    call print_string_len
+    ; Variable not found -- "set: NAME: not defined" on stderr
+    lea rdi, [err_set_pre]
+    call report_error_cstr
+    mov rdi, rbx
+    call report_error_cstr
+    lea rdi, [err_set_post]
+    call report_error_cstr
     jmp .hs_done
 
 .hs_list:
-    ; List all environment variables from saved_envp
-    mov rax, [saved_envp]
-    test rax, rax
-    jz .hs_done
-    mov r12, rax                    ; r12 = char** envp
+    ; Inherited variables first, minus the ones the overlay overrides or unset
+    mov r12, [saved_envp]
+    test r12, r12
+    jz .hs_list_overlay
 
 .hs_list_loop:
     mov rdi, [r12]                  ; load envp[i]
     test rdi, rdi
     jz .hs_list_overlay             ; end of envp array
 
+    call env_is_shadowed
+    test eax, eax
+    jnz .hs_list_next
+    mov rdi, [r12]
     call print_cstring
     call print_newline
+.hs_list_next:
     add r12, 8                      ; next pointer
     jmp .hs_list_loop
 
 .hs_list_overlay:
-    ; Also print env_overlay entries
-    mov eax, [env_overlay_count]
-    test eax, eax
-    jz .hs_done
+    ; Then the variables set in this shell
     lea r12, [env_overlay]
     xor r13d, r13d
 .hs_overlay_loop:
     cmp r13d, [env_overlay_count]
     jge .hs_done
     mov rdi, r12
-    cmp byte [rdi], 0
-    je .hs_overlay_next
+    call env_slot_exportable
+    test eax, eax
+    jz .hs_overlay_next
+    mov rdi, r12
     call print_cstring
     call print_newline
 .hs_overlay_next:
@@ -6488,33 +7385,40 @@ handler_pushd:
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
     syscall
+    test rax, rax
+    jle .hpd_nocwd                  ; current directory was removed
 
     inc dword [dir_stack_top]
 
     ; chdir to argument
     mov rdi, rbx
-    mov eax, SYS_CHDIR
-    syscall
-    test rax, rax
+    call change_dir
+    test eax, eax
     jns .hpd_done
 
     ; chdir failed -- undo stack push
     dec dword [dir_stack_top]
     lea rdi, [err_cd_msg]
     mov esi, err_cd_len
-    call print_string_len
+    call report_error_len
+    jmp .hpd_done
+
+.hpd_nocwd:
+    lea rdi, [err_no_cwd]
+    mov esi, err_no_cwd_len
+    call report_error_len
     jmp .hpd_done
 
 .hpd_full:
     lea rdi, [err_stack_full]
     mov esi, err_stack_f_len
-    call print_string_len
+    call report_error_len
     jmp .hpd_done
 
 .hpd_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
-    call print_string_len
+    call report_error_len
 
 .hpd_done:
     add rsp, 24
@@ -6536,29 +7440,74 @@ handler_popd:
     imul eax, MAX_PATH_BUF
     lea rdi, [dir_stack]
     add rdi, rax
-    mov eax, SYS_CHDIR
-    syscall
-    test rax, rax
+    call change_dir
+    test eax, eax
     jns .hpo_done
 
-    ; chdir failed -- restore stack
-    inc dword [dir_stack_top]
+    ; The saved directory is gone. The entry stays dropped, otherwise popd
+    ; would fail on it forever.
     lea rdi, [err_cd_msg]
     mov esi, err_cd_len
-    call print_string_len
+    call report_error_len
     jmp .hpo_done
 
 .hpo_empty:
     lea rdi, [err_stack_empty]
     mov esi, err_stack_e_len
-    call print_string_len
+    call report_error_len
 
 .hpo_done:
     leave
     ret
 
+; ---------- alias_find ----------
+; rdi = alias name. Returns rax = its table entry, or 0. Names compare
+; without regard to case, as when an alias is looked up for a command.
+alias_find:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    mov r13, rdi
+    lea rbx, [alias_table]
+    xor r12d, r12d
+.af_loop:
+    cmp r12d, [alias_count]
+    jge .af_none
+    mov rdi, r13
+    mov rsi, rbx
+    call str_icompare
+    test eax, eax
+    jz .af_hit
+    add rbx, ALIAS_ENTRY_SIZE
+    inc r12d
+    jmp .af_loop
+.af_hit:
+    mov rax, rbx
+    jmp .af_ret
+.af_none:
+    xor eax, eax
+.af_ret:
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+section .data
+    err_alias_long      db "Error: alias name or command too long.", 10, 0
+    err_alias_long_len  equ $ - err_alias_long - 1
+    err_alias_pre       db "alias: ", 0
+    err_alias_nf_post   db ": not found.", 10, 0
+section .text
+
 ; ---------- handler_alias ----------
 ; Create/list aliases. Format: alias name=command
+; "alias" lists them all, "alias name" shows one.
 handler_alias:
     push rbp
     mov rbp, rsp
@@ -6578,7 +7527,7 @@ handler_alias:
 .hal_find_eq:
     movzx eax, byte [r12]
     test al, al
-    jz .hal_list                    ; no '=' means just list
+    jz .hal_show                    ; no '=': show this alias
     cmp al, '='
     je .hal_set
     inc r12
@@ -6588,69 +7537,71 @@ handler_alias:
     mov byte [r12], 0              ; null-terminate alias name
     lea r13, [r12 + 1]            ; r13 = alias command
 
+    ; The name and the command each have a fixed-size field
+    mov rdi, rbx
+    call str_len
+    test eax, eax
+    jz .hal_too_long
+    cmp eax, ALIAS_NAME_SIZE - 1
+    ja .hal_too_long
+    mov rdi, r13
+    call str_len
+    cmp eax, ALIAS_CMD_SIZE - 1
+    ja .hal_too_long
+
+    ; Redefining an existing alias needs no free slot
+    mov rdi, rbx
+    call alias_find
+    test rax, rax
+    jnz .hal_have_entry
+
     cmp dword [alias_count], ALIAS_COUNT
     jge .hal_full
-
-    ; Check if alias already exists -- update it
-    lea r8, [alias_table]
-    xor ecx, ecx
-.hal_find:
-    cmp ecx, [alias_count]
-    jge .hal_add_new
-
-    push rcx
-    push r8
-    mov rdi, rbx                   ; alias name we're looking for
-    mov rsi, r8                    ; existing alias name
-    call str_icompare
-    pop r8
-    pop rcx
-    test eax, eax
-    jz .hal_update
-
-    add r8, ALIAS_ENTRY_SIZE
-    inc ecx
-    jmp .hal_find
-
-.hal_update:
-    ; Update the command part
-    lea rdi, [r8 + ALIAS_NAME_SIZE]
-    mov rsi, r13
-    call str_copy
-    jmp .hal_done
-
-.hal_add_new:
-    ; Add new alias entry
     mov eax, [alias_count]
     imul eax, ALIAS_ENTRY_SIZE
     lea rdi, [alias_table]
     add rdi, rax
+    mov r12, rdi
     mov rsi, rbx                   ; alias name
     call str_copy
+    inc dword [alias_count]
+    jmp .hal_value
 
-    mov eax, [alias_count]
-    imul eax, ALIAS_ENTRY_SIZE
-    lea rdi, [alias_table]
-    add rdi, rax
-    add rdi, ALIAS_NAME_SIZE
+.hal_have_entry:
+    mov r12, rax
+.hal_value:
+    lea rdi, [r12 + ALIAS_NAME_SIZE]
     mov rsi, r13                   ; alias command
     call str_copy
-
-    inc dword [alias_count]
     jmp .hal_done
 
-.hal_list:
-    mov ecx, [alias_count]
-    test ecx, ecx
-    jz .hal_done
+.hal_show:
+    mov rdi, rbx
+    call alias_find
+    test rax, rax
+    jz .hal_not_found
+    mov r12, rax
+    jmp .hal_print_one
 
+.hal_list:
     lea r12, [alias_table]
     xor ebx, ebx
 
 .hal_list_loop:
     cmp ebx, [alias_count]
     jge .hal_done
+    call .hal_print_entry
+    add r12, ALIAS_ENTRY_SIZE
+    inc ebx
+    jmp .hal_list_loop
 
+.hal_print_one:
+    call .hal_print_entry
+    jmp .hal_done
+
+; prints "name=command" for the entry in r12
+.hal_print_entry:
+    sub rsp, 8
     mov rdi, r12                   ; alias name
     call print_cstring
     lea rdi, [str_equals]
@@ -6658,15 +7609,28 @@ handler_alias:
     lea rdi, [r12 + ALIAS_NAME_SIZE] ; alias command
     call print_cstring
     call print_newline
+    add rsp, 8
+    ret
 
-    add r12, ALIAS_ENTRY_SIZE
-    inc ebx
-    jmp .hal_list_loop
+.hal_not_found:
+    lea rdi, [err_alias_pre]
+    call report_error_cstr
+    mov rdi, rbx
+    call report_error_cstr
+    lea rdi, [err_alias_nf_post]
+    call report_error_cstr
+    jmp .hal_done
+
+.hal_too_long:
+    lea rdi, [err_alias_long]
+    mov esi, err_alias_long_len
+    call report_error_len
+    jmp .hal_done
 
 .hal_full:
     lea rdi, [err_alias_full]
     mov esi, err_alias_f_len
-    call print_string_len
+    call report_error_len
 
 .hal_done:
     add rsp, 24
@@ -6677,58 +7641,47 @@ handler_alias:
     ret
 
 ; ============================================================================
-; handler_unalias - Remove an alias by name (soft-delete: clear first byte)
+; handler_unalias - Remove an alias by name; later entries move up so the
+; slot is free again and the table never holds holes
 ; ============================================================================
 handler_unalias:
     push rbp
     mov rbp, rsp
-    push rbx
-    push r12
-    push r13
-    sub rsp, 8
+    sub rsp, 16
 
     test rdi, rdi
     jz .hua_usage
     cmp byte [rdi], 0
     je .hua_usage
 
-    mov r12, rdi
-    lea rbx, [alias_table]
-    xor r13d, r13d                   ; r13 = index (str_icompare clobbers rcx)
-.hua_scan:
-    cmp r13d, [alias_count]
-    jge .hua_notfound
-    cmp byte [rbx], 0
-    je .hua_next
-    mov rdi, r12
-    mov rsi, rbx
-    call str_icompare
-    test eax, eax
-    jnz .hua_next
-    mov byte [rbx], 0
+    call alias_find
+    test rax, rax
+    jz .hua_notfound
+
+    mov rdi, rax                    ; entry being removed
+    lea rsi, [rax + ALIAS_ENTRY_SIZE]
+    mov eax, [alias_count]
+    imul eax, ALIAS_ENTRY_SIZE
+    lea rcx, [alias_table]
+    add rcx, rax                    ; end of the used entries
+    sub rcx, rsi                    ; bytes behind the removed entry
+    rep movsb                       ; copies downwards, so overlap is fine
+    dec dword [alias_count]
     jmp .hua_done
-.hua_next:
-    add rbx, ALIAS_ENTRY_SIZE
-    inc r13d
-    jmp .hua_scan
 
 .hua_usage:
     lea rdi, [err_unalias_usage]
     mov esi, err_unalias_usage_len
-    call print_string_len
+    call report_error_len
     jmp .hua_done
 
 .hua_notfound:
     lea rdi, [err_unalias_notfound]
     mov esi, err_unalias_notfound_len
-    call print_string_len
+    call report_error_len
 
 .hua_done:
-    add rsp, 8
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
+    leave
     ret
 
 ; ============================================================================
@@ -6737,6 +7690,11 @@ handler_unalias:
 ; Captures exit status in last_exit_status.
 ; ============================================================================
 %define WNOHANG  1
+%define WUNTRACED  2
+%define WCONTINUED 8
+%define EINTR      4
+%define JOB_RUNNING 1                   ; job_state values
+%define JOB_STOPPED 2
 
 execute_external:
     push rbp
@@ -6795,8 +7753,21 @@ execute_external:
     jmp .ee_done
 
 .ee_legacy:
+    ; A background job needs a free slot (finished jobs are dropped first).
+    ; With none left it runs in the foreground instead, as a normal command.
+    test r14d, r14d
+    jz .ee_launch
+    call job_slots_free
+    test eax, eax
+    jnz .ee_launch
+    lea rdi, [jobs_full_msg]
+    call print_cstring
+    xor r14d, r14d
+
+.ee_launch:
     ; Restore terminal to cooked mode so child process gets sane terminal
     call restore_terminal
+    call jc_prepare                 ; the child starts its own process group
 
     ; fork()
     mov eax, SYS_FORK
@@ -6806,6 +7777,12 @@ execute_external:
     jnz .ee_parent                  ; parent: rax = child PID
 
     ; ====== CHILD PROCESS ======
+    mov edi, 1                      ; a foreground job takes the terminal
+    test r14d, r14d
+    jz .ee_child_group
+    xor edi, edi
+.ee_child_group:
+    call jc_child_setup
 
     ; Handle redirection with dup2
     cmp byte [redir_stdout_active], 0
@@ -6815,6 +7792,10 @@ execute_external:
     mov esi, 1                      ; stdout
     mov eax, SYS_DUP2
     syscall
+    cmp edi, 1                      ; the original must not leak into the command
+    je .ee_child_check_in
+    mov eax, SYS_CLOSE
+    syscall
 
 .ee_child_check_in:
     cmp byte [redir_stdin_active], 0
@@ -6823,6 +7804,10 @@ execute_external:
     mov edi, [redir_stdin_fd]
     xor esi, esi                    ; stdin
     mov eax, SYS_DUP2
+    syscall
+    test edi, edi
+    jz .ee_child_exec
+    mov eax, SYS_CLOSE
     syscall
 
 .ee_child_exec:
@@ -6858,32 +7843,24 @@ execute_external:
 .ee_parent:
     mov ebx, eax                    ; ebx = child PID
 
+    mov edi, ebx                    ; same grouping from this side, so the
+    mov esi, 1                      ; child's group exists before anyone waits
+    test r14d, r14d
+    jz .ee_parent_group
+    xor esi, esi
+.ee_parent_group:
+    call jc_parent_after_fork
+
     ; Check if background mode
     test r14d, r14d
     jnz .ee_background
 
     ; --- Foreground: wait for child ---
+    ; Exit code, or 128 + signal when the child was killed (as ASH does)
     mov edi, ebx
-    lea rsi, [pid_buf]              ; reuse as status location
-    xor edx, edx                    ; options = 0
-    xor r10d, r10d                  ; rusage = NULL
-    mov eax, SYS_WAIT4
-    syscall
-
-    ; Extract exit status
-    mov eax, [pid_buf]
-    ; Check WIFEXITED: (status & 0x7F) == 0
-    test al, 0x7F
-    jnz .ee_signaled
-    ; WEXITSTATUS: (status >> 8) & 0xFF
-    shr eax, 8
-    and eax, 0xFF
+    xor esi, esi
+    call jc_wait_fg
     mov [last_exit_status], eax
-    jmp .ee_restore
-
-.ee_signaled:
-    ; Child was killed by a signal -- treat as failure
-    mov dword [last_exit_status], 1
 
 .ee_restore:
     ; Re-enable raw mode for our terminal
@@ -6896,51 +7873,11 @@ execute_external:
     ; Re-enable raw mode first
     call setup_raw_mode
 
-    ; Find an empty slot in job table
-    xor ecx, ecx                    ; slot index
-
-.ee_find_slot:
-    cmp ecx, JOB_MAX
-    jge .ee_table_full
-
-    lea rdi, [job_pids]
-    cmp qword [rdi + rcx*8], 0
-    je .ee_store_job
-
-    inc ecx
-    jmp .ee_find_slot
-
-.ee_store_job:
-    ; Store the PID
-    lea rdi, [job_pids]
-    mov rax, rbx                    ; child PID (zero-extended from ebx)
-    mov [rdi + rcx*8], rax
-
-    ; Copy the command string into job_cmds[slot]
-    mov eax, ecx
-    imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
-    lea rsi, [input_buf]
-
-    ; Copy up to JOB_CMD_SIZE-1 chars
-    push rcx                        ; save slot index
-    xor edx, edx
-
-.ee_copy_cmd:
-    cmp edx, JOB_CMD_SIZE - 1
-    jge .ee_copy_cmd_done
-    movzx eax, byte [rsi + rdx]
-    test al, al
-    jz .ee_copy_cmd_done
-    mov [rdi + rdx], al
-    inc edx
-    jmp .ee_copy_cmd
-
-.ee_copy_cmd_done:
-    mov byte [rdi + rdx], 0         ; null-terminate
-    pop rcx
-
-    inc dword [job_count]
+    mov edi, ebx
+    mov esi, [jc_pgid]              ; 0 without job control
+    mov edx, JOB_RUNNING
+    xor ecx, ecx
+    call job_add                    ; a slot was free before the fork
 
     ; Print "[bg] PID XXXX\n"
     lea rdi, [jobs_bg_started_msg]
@@ -6948,21 +7885,6 @@ execute_external:
     mov eax, ebx
     call print_number
     call print_newline
-
-    jmp .ee_done
-
-.ee_table_full:
-    ; Job table full - print warning and wait foreground instead
-    lea rdi, [jobs_full_msg]
-    call print_cstring
-
-    ; Fall back to foreground wait
-    mov edi, ebx
-    lea rsi, [pid_buf]
-    xor edx, edx
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
 
     jmp .ee_done
 
@@ -7000,6 +7922,10 @@ print_string_len:
     test esi, esi
     jz .psl_done
 
+    ; A redraw collects its pieces and writes them once
+    cmp byte [ob_active], 0
+    jne .psl_collect
+
     ; Determine output fd
     cmp byte [redir_stdout_active], 0
     jne .psl_file
@@ -7019,6 +7945,38 @@ print_string_len:
     mov edi, [redir_stdout_fd]
     mov eax, SYS_WRITE
     syscall
+    jmp .psl_done
+
+.psl_collect:
+    mov eax, [ob_len]
+    mov ecx, eax
+    add ecx, esi
+    cmp ecx, OB_SIZE
+    jbe .psl_append
+    push rdi                        ; does not fit: write what is there first
+    push rsi
+    call ob_flush
+    pop rsi
+    pop rdi
+    xor eax, eax
+    cmp esi, OB_SIZE
+    jbe .psl_append
+    mov edx, esi                    ; larger than the whole buffer: direct
+    mov rsi, rdi
+    mov edi, 1
+    mov eax, SYS_WRITE
+    syscall
+    jmp .psl_done
+.psl_append:
+    mov r8d, esi
+    mov ecx, esi
+    mov rdx, rdi
+    lea rdi, [ob_buf]
+    add rdi, rax
+    mov rsi, rdx
+    rep movsb
+    add [ob_len], r8d
+    jmp .psl_done
 
 .psl_done:
     leave
@@ -7063,6 +8021,32 @@ print_newline:
 
     leave
     ret
+
+; ---------- report_error_len ----------
+; rdi = message, esi = length. Builtin error text goes to stderr, never into
+; a redirected stdout file, and the command is marked as failed so that
+; "cd /x && ..." and "if mkdir d; then" see the failure.
+report_error_len:
+    mov dword [last_exit_status], 1
+    test esi, esi
+    jz .rel_ret
+    mov edx, esi
+    mov rsi, rdi
+    mov edi, STDERR_FD
+    mov eax, SYS_WRITE
+    syscall
+.rel_ret:
+    ret
+
+; ---------- report_error_cstr ----------
+; rdi = NUL-terminated message; same as report_error_len.
+report_error_cstr:
+    xor esi, esi
+.rec_len:
+    cmp byte [rdi + rsi], 0
+    je report_error_len
+    inc esi
+    jmp .rec_len
 
 ; ---------- str_icompare ----------
 ; Case-insensitive full string compare.
@@ -7214,22 +8198,23 @@ parse_two_args:
     ret
 
 ; ---------- hex_to_int ----------
-; Convert hex char in al to integer 0-15. Returns: eax = value.
+; Convert hex char in al to integer 0-15. Returns: eax = value, or -1 if the
+; character is not a hex digit.
 hex_to_int:
     cmp al, '0'
-    jb .hti_zero
+    jb .hti_bad
     cmp al, '9'
     jbe .hti_digit
-    cmp al, 'a'
-    jb .hti_upper
-    cmp al, 'f'
-    jbe .hti_lower
     cmp al, 'A'
-    jb .hti_zero
+    jb .hti_bad
     cmp al, 'F'
     jbe .hti_upper
-.hti_zero:
-    xor eax, eax
+    cmp al, 'a'
+    jb .hti_bad
+    cmp al, 'f'
+    jbe .hti_lower
+.hti_bad:
+    mov eax, -1
     ret
 .hti_digit:
     sub al, '0'
@@ -7412,6 +8397,175 @@ print_ansi_num:
     ret
 
 ; ============================================================================
+; Environment overlay
+;
+; Variables set by the shell live in env_overlay as "NAME=VALUE" slots in
+; front of the inherited environment (saved_envp). Names are case-sensitive,
+; as on any Unix. A slot whose first byte is NUL is free and gets reused.
+; A bare "NAME" slot (no '=') hides an inherited variable that was unset.
+; ============================================================================
+
+section .data
+    err_env_full    db "Error: environment full, variable not set.", 10, 0
+    err_env_long    db "Error: variable too long, not set.", 10, 0
+    err_env_name    db "Error: invalid variable name.", 10, 0
+section .text
+
+; ----------------------------------------------------------------------------
+; env_find_slot - find NAME in the overlay (exact match)
+; rdi = name, edx = name length. Returns rax = slot or 0. The slot holds
+; either "NAME=VALUE" or a bare "NAME" (unset marker). Keeps rdi, rsi, rdx;
+; clobbers rax, rcx, r8, r9.
+; ----------------------------------------------------------------------------
+env_find_slot:
+    test edx, edx
+    jz .efs_none
+    lea r8, [env_overlay]
+    mov r9d, [env_overlay_count]
+.efs_slot:
+    test r9d, r9d
+    jz .efs_none
+    xor ecx, ecx
+.efs_cmp:
+    cmp ecx, edx
+    jae .efs_tail
+    movzx eax, byte [r8 + rcx]
+    cmp al, [rdi + rcx]
+    jne .efs_next
+    inc ecx
+    jmp .efs_cmp
+.efs_tail:
+    movzx eax, byte [r8 + rdx]
+    cmp al, '='
+    je .efs_hit
+    test al, al
+    jz .efs_hit
+.efs_next:
+    add r8, ENV_OVERLAY_SIZE
+    dec r9d
+    jmp .efs_slot
+.efs_hit:
+    mov rax, r8
+    ret
+.efs_none:
+    xor eax, eax
+    ret
+
+; ----------------------------------------------------------------------------
+; env_find_inherited - find NAME in the inherited environment (exact match)
+; rdi = name, edx = name length. Returns rax = "NAME=VALUE" entry or 0.
+; Keeps rdi, rsi, rdx; clobbers rax, rcx, r8, r9.
+; ----------------------------------------------------------------------------
+env_find_inherited:
+    test edx, edx
+    jz .efi_none
+    mov r8, [saved_envp]
+    test r8, r8
+    jz .efi_none
+.efi_loop:
+    mov r9, [r8]
+    test r9, r9
+    jz .efi_none
+    xor ecx, ecx
+.efi_cmp:
+    cmp ecx, edx
+    jae .efi_tail
+    movzx eax, byte [r9 + rcx]
+    cmp al, [rdi + rcx]
+    jne .efi_next
+    inc ecx
+    jmp .efi_cmp
+.efi_tail:
+    cmp byte [r9 + rdx], '='
+    je .efi_hit
+.efi_next:
+    add r8, 8
+    jmp .efi_loop
+.efi_hit:
+    mov rax, r9
+    ret
+.efi_none:
+    xor eax, eax
+    ret
+
+; ----------------------------------------------------------------------------
+; env_name_len - length of the NAME part of a "NAME=VALUE" string
+; rdi = entry. Returns edx. Clobbers rax.
+; ----------------------------------------------------------------------------
+env_name_len:
+    xor edx, edx
+.enl_loop:
+    movzx eax, byte [rdi + rdx]
+    test al, al
+    jz .enl_done
+    cmp al, '='
+    je .enl_done
+    inc edx
+    jmp .enl_loop
+.enl_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; env_alloc_slot - take a free overlay slot (reusing unset ones first)
+; Returns rax = slot, or 0 when the table is full. Clobbers rcx.
+; ----------------------------------------------------------------------------
+env_alloc_slot:
+    lea rax, [env_overlay]
+    xor ecx, ecx
+.eas_scan:
+    cmp ecx, [env_overlay_count]
+    jae .eas_append
+    cmp byte [rax], 0
+    je .eas_ret
+    add rax, ENV_OVERLAY_SIZE
+    inc ecx
+    jmp .eas_scan
+.eas_append:
+    cmp ecx, ENV_OVERLAY_COUNT
+    jae .eas_full
+    inc dword [env_overlay_count]
+.eas_ret:
+    ret
+.eas_full:
+    xor eax, eax
+    ret
+
+; ----------------------------------------------------------------------------
+; env_trim_count - forget free slots at the end of the overlay table
+; Clobbers rax, rcx, rdx.
+; ----------------------------------------------------------------------------
+env_trim_count:
+    mov eax, [env_overlay_count]
+    lea rdx, [env_overlay]
+.etc_loop:
+    test eax, eax
+    jz .etc_done
+    lea ecx, [rax - 1]
+    imul ecx, ecx, ENV_OVERLAY_SIZE
+    cmp byte [rdx + rcx], 0
+    jne .etc_done
+    dec eax
+    jmp .etc_loop
+.etc_done:
+    mov [env_overlay_count], eax
+    ret
+
+; ----------------------------------------------------------------------------
+; env_is_shadowed - does the overlay hold an entry for this inherited string?
+; rdi = "NAME=VALUE" inherited entry. Returns eax = 1 if so (a value or an
+; unset marker), else 0. Keeps rdi; clobbers rax, rcx, rdx, r8, r9.
+; ----------------------------------------------------------------------------
+env_is_shadowed:
+    sub rsp, 8                      ; keep the stack 16-byte aligned for the calls
+    call env_name_len
+    call env_find_slot
+    add rsp, 8
+    test rax, rax
+    setnz al
+    movzx eax, al
+    ret
+
+; ============================================================================
 ; getenv_internal - Look up environment variable
 ; rdi = variable name (null-terminated)
 ; Returns: rax = pointer to value (after '='), or 0 if not found.
@@ -7423,87 +8577,36 @@ getenv_internal:
     push rbx
     push r12
     push r13
-    push r14
-    sub rsp, 16
+    sub rsp, 8
 
     mov r12, rdi                    ; r12 = variable name to find
-
-    ; Get length of variable name
     call str_len
     mov r13d, eax                   ; r13d = name length
 
-    ; ---- Search env_overlay first ----
-    mov eax, [env_overlay_count]
-    test eax, eax
-    jz .ge_search_envp
-
-    lea rbx, [env_overlay]
-    xor r14d, r14d                  ; index
-
-.ge_overlay_loop:
-    cmp r14d, [env_overlay_count]
-    jge .ge_search_envp
-
-    ; Compare first r13d chars of overlay entry with our name
     mov rdi, r12
-    mov rsi, rbx
     mov edx, r13d
-    call str_icompare_n
-    test eax, eax
-    jnz .ge_overlay_next
-
-    ; Check that the char at position r13d is '='
-    cmp byte [rbx + r13], '='
-    jne .ge_overlay_next
-
-    ; Found! Return pointer to value (after '=')
-    lea rax, [rbx + r13 + 1]
-    jmp .ge_done
-
-.ge_overlay_next:
-    add rbx, ENV_OVERLAY_SIZE
-    inc r14d
-    jmp .ge_overlay_loop
-
-    ; ---- Search saved_envp ----
-.ge_search_envp:
-    mov rax, [saved_envp]
+    call env_find_slot
     test rax, rax
-    jz .ge_not_found
-    mov rbx, rax                    ; rbx = char** envp
-
-.ge_envp_loop:
-    mov rdi, [rbx]                  ; envp[i]
-    test rdi, rdi
-    jz .ge_not_found                ; end of envp
-
-    ; Compare first r13d chars with our name
-    mov rsi, rdi                    ; envp entry
-    mov rdi, r12                    ; our name
-    mov edx, r13d
-    call str_icompare_n
-    test eax, eax
-    jnz .ge_envp_next
-
-    ; Check for '=' at position r13d in the envp entry
-    mov rax, [rbx]
+    jz .ge_inherited
     cmp byte [rax + r13], '='
-    jne .ge_envp_next
-
-    ; Found! Return pointer to value
+    jne .ge_not_found               ; unset marker: the inherited one is hidden
     lea rax, [rax + r13 + 1]
     jmp .ge_done
 
-.ge_envp_next:
-    add rbx, 8
-    jmp .ge_envp_loop
+.ge_inherited:
+    mov rdi, r12
+    mov edx, r13d
+    call env_find_inherited
+    test rax, rax
+    jz .ge_done
+    lea rax, [rax + r13 + 1]
+    jmp .ge_done
 
 .ge_not_found:
     xor eax, eax
 
 .ge_done:
-    add rsp, 16
-    pop r14
+    add rsp, 8
     pop r13
     pop r12
     pop rbx
@@ -7513,7 +8616,9 @@ getenv_internal:
 ; ============================================================================
 ; setenv_internal - Set environment variable in overlay
 ; rdi = name, rsi = value
-; Finds existing entry or creates new one. Format: "KEY=VALUE\0"
+; Finds the existing entry, else the first free slot. Format: "KEY=VALUE\0".
+; Returns eax = 0, or -1 after reporting why the variable could not be set
+; (empty name, no room in the slot, table full). Callers may ignore it.
 ; ============================================================================
 setenv_internal:
     push rbp
@@ -7527,92 +8632,49 @@ setenv_internal:
     mov r12, rdi                    ; r12 = name
     mov r13, rsi                    ; r13 = value
 
-    ; Get name length
-    mov rdi, r12
     call str_len
     mov r14d, eax                   ; r14d = name length
+    test r14d, r14d
+    jz .se_bad_name
 
-    ; Search for existing entry in overlay
-    lea rbx, [env_overlay]
-    xor ecx, ecx
+    mov rdi, r13
+    call str_len
+    lea eax, [rax + r14 + 2]        ; "NAME=" + value + NUL
+    cmp eax, ENV_OVERLAY_SIZE
+    ja .se_too_long
 
-.se_find:
-    cmp ecx, [env_overlay_count]
-    jge .se_add_new
-
-    push rcx
     mov rdi, r12
-    mov rsi, rbx
     mov edx, r14d
-    call str_icompare_n
-    pop rcx
-    test eax, eax
-    jnz .se_find_next
+    call env_find_slot
+    test rax, rax
+    jnz .se_write
+    call env_alloc_slot
+    test rax, rax
+    jz .se_full
 
-    ; Check for '=' at correct position
-    cmp byte [rbx + r14], '='
-    jne .se_find_next
-
-    ; Found existing -- overwrite it
-    jmp .se_write_entry
-
-.se_find_next:
-    add rbx, ENV_OVERLAY_SIZE
-    inc ecx
-    jmp .se_find
-
-.se_add_new:
-    ; Check if there's room
-    cmp dword [env_overlay_count], ENV_OVERLAY_COUNT
-    jge .se_done                    ; table full
-
-    ; rbx already points to the next free slot
-    mov eax, [env_overlay_count]
-    imul eax, ENV_OVERLAY_SIZE
-    lea rbx, [env_overlay]
-    add rbx, rax
-
-    inc dword [env_overlay_count]
-
-.se_write_entry:
-    ; Write "NAME=VALUE\0" into the overlay slot at rbx (bounded)
-    mov rdi, rbx
-    mov r14, rbx
-    add r14, ENV_OVERLAY_SIZE - 1   ; r14 = last writable byte (reserve NUL slot)
+.se_write:
+    mov rdi, rax
     mov rsi, r12
-    ; Copy name
-.se_cp_name:
-    movzx eax, byte [rsi]
-    test al, al
-    jz .se_eq
-    cmp rdi, r14
-    jae .se_terminate
-    mov [rdi], al
-    inc rdi
-    inc rsi
-    jmp .se_cp_name
-
-.se_eq:
-    cmp rdi, r14
-    jae .se_terminate
+    mov ecx, r14d
+    rep movsb                       ; name
     mov byte [rdi], '='
     inc rdi
-
-    ; Copy value
     mov rsi, r13
-.se_cp_value:
-    movzx eax, byte [rsi]
-    test al, al
-    jz .se_terminate
-    cmp rdi, r14
-    jae .se_terminate
-    mov [rdi], al
-    inc rdi
-    inc rsi
-    jmp .se_cp_value
+    call str_copy                   ; value and NUL
+    xor eax, eax
+    jmp .se_done
 
-.se_terminate:
-    mov byte [rdi], 0               ; ensure NUL termination within slot
+.se_bad_name:
+    lea rdi, [err_env_name]
+    jmp .se_fail
+.se_too_long:
+    lea rdi, [err_env_long]
+    jmp .se_fail
+.se_full:
+    lea rdi, [err_env_full]
+.se_fail:
+    call report_error_cstr
+    mov eax, -1
 
 .se_done:
     add rsp, 16
@@ -7624,9 +8686,82 @@ setenv_internal:
     ret
 
 ; ============================================================================
+; unsetenv_internal - Remove a variable
+; rdi = name. An overlay-only variable frees its slot. An inherited one stays
+; in saved_envp, so a bare "NAME" marker takes the slot and hides it from
+; getenv_internal, from `set` and from child processes.
+; ============================================================================
+unsetenv_internal:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    mov r12, rdi                    ; r12 = name
+    call str_len
+    mov r13d, eax                   ; r13d = name length
+    test r13d, r13d
+    jz .ue_done
+
+    mov rdi, r12
+    mov edx, r13d
+    call env_find_inherited
+    xor ebx, ebx
+    test rax, rax
+    setnz bl                        ; ebx = 1 when an inherited copy exists
+
+    mov rdi, r12
+    mov edx, r13d
+    call env_find_slot
+    test rax, rax
+    jnz .ue_have_slot
+    test ebx, ebx
+    jz .ue_done                     ; not set anywhere
+    cmp r13d, ENV_OVERLAY_SIZE - 1
+    ja .ue_done
+    call env_alloc_slot
+    test rax, rax
+    jz .ue_full
+    jmp .ue_marker
+
+.ue_have_slot:
+    test ebx, ebx
+    jnz .ue_marker
+    mov byte [rax], 0               ; free the slot
+    call env_trim_count
+    jmp .ue_done
+
+.ue_marker:
+    mov rdi, rax
+    mov rsi, r12
+    call str_copy                   ; bare NAME
+    jmp .ue_done
+
+.ue_full:
+    lea rdi, [err_env_full]
+    call report_error_cstr
+
+.ue_done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+
+; ============================================================================
 ; build_merged_envp - Fill merged_envp[] with overlay entries + inherited envp
-; Cap at 256 slots including terminating NULL. Overlay entries appear first
-; so getenv() in children returns overridden values.
+; Overlay entries appear first so getenv() in children returns overridden
+; values. Unset markers and names that are not identifiers (the positional
+; parameters of script functions) are not exported, and an inherited variable
+; that the overlay overrides or unsets is left out.
 ; ============================================================================
 build_merged_envp:
     push rbp
@@ -7634,28 +8769,30 @@ build_merged_envp:
     push rbx
     push r12
     push r13
-    sub rsp, 8
+    push r14
+    sub rsp, 16
 
     lea r12, [merged_envp]
     xor r13d, r13d                  ; slot index
 
     ; --- Copy overlay entries ---
-    mov ecx, [env_overlay_count]
-    test ecx, ecx
-    jz .bme_inherited
+    mov r14d, [env_overlay_count]
     lea rbx, [env_overlay]
 .bme_overlay_loop:
-    cmp r13d, 255
+    test r14d, r14d
+    jz .bme_inherited
+    cmp r13d, MERGED_ENVP_MAX - 1
     jge .bme_terminate
-    ; Skip empty slots (first byte NUL)
-    cmp byte [rbx], 0
-    je .bme_next_overlay
+    mov rdi, rbx
+    call env_slot_exportable
+    test eax, eax
+    jz .bme_next_overlay
     mov [r12 + r13*8], rbx
     inc r13d
 .bme_next_overlay:
     add rbx, ENV_OVERLAY_SIZE
-    dec ecx
-    jnz .bme_overlay_loop
+    dec r14d
+    jmp .bme_overlay_loop
 
 .bme_inherited:
     ; --- Copy inherited envp pointers ---
@@ -7663,13 +8800,18 @@ build_merged_envp:
     test rbx, rbx
     jz .bme_terminate
 .bme_env_loop:
-    mov rax, [rbx]
-    test rax, rax
+    mov rdi, [rbx]
+    test rdi, rdi
     jz .bme_terminate
-    cmp r13d, 255
+    cmp r13d, MERGED_ENVP_MAX - 1
     jge .bme_terminate
+    call env_is_shadowed
+    test eax, eax
+    jnz .bme_next_env
+    mov rax, [rbx]
     mov [r12 + r13*8], rax
     inc r13d
+.bme_next_env:
     add rbx, 8
     jmp .bme_env_loop
 
@@ -7677,6 +8819,179 @@ build_merged_envp:
     mov qword [r12 + r13*8], 0
     mov [merged_envp_count], r13d
 
+    add rsp, 16
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; env_slot_exportable - is this overlay slot a real "NAME=VALUE" variable?
+; rdi = slot. Returns eax = 1 if the name starts with a letter or '_' and the
+; entry has a '=', else 0. Free slots, unset markers and the "1", "#", "@"
+; slots used for function arguments give 0. Clobbers rax, rcx.
+; ----------------------------------------------------------------------------
+env_slot_exportable:
+    movzx eax, byte [rdi]
+    cmp al, '_'
+    je .ese_scan
+    or al, 0x20
+    cmp al, 'a'
+    jb .ese_no
+    cmp al, 'z'
+    ja .ese_no
+.ese_scan:
+    xor ecx, ecx
+.ese_loop:
+    movzx eax, byte [rdi + rcx]
+    test al, al
+    jz .ese_no
+    cmp al, '='
+    je .ese_yes
+    inc ecx
+    jmp .ese_loop
+.ese_yes:
+    mov eax, 1
+    ret
+.ese_no:
+    xor eax, eax
+    ret
+
+; ============================================================================
+; handler_unset - Remove a variable (one set with `set`, or an inherited one)
+; ============================================================================
+handler_unset:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+
+    test rdi, rdi
+    jz .hun_usage
+    cmp byte [rdi], 0
+    je .hun_usage
+
+    call unsetenv_internal
+    jmp .hun_done
+
+.hun_usage:
+    lea rdi, [err_unset_usage]
+    mov esi, err_unset_usage_len
+    call report_error_len
+.hun_done:
+    leave
+    ret
+
+; ============================================================================
+; read_script_file - Load a whole script file into script_file_buf
+; rdi = path, esi = 1 to insist that the file belongs to the user or root and
+; is not writable by others (used for autoexec.txt, which is found next to
+; the program). Returns eax = number of bytes (the buffer is NUL-terminated),
+; or a negative code: -1 cannot open, -2 larger than SCRIPT_FILE_MAX,
+; -3 read error or NUL byte inside (the engine works on C strings, so the
+; text after the NUL would silently not run), -4 not trusted.
+; Nothing partial is ever returned, so a cut-off last line cannot run.
+; ============================================================================
+%define SCRIPT_FILE_MAX 65536
+section .data
+    err_autoexec_name db "autoexec.txt: ", 0
+    err_asmrc_name  db ".asmrc: ", 0
+    err_source_name db "source: ", 0
+    err_script_big  db "file is larger than 65536 bytes, not run.", 10, 0
+    err_script_bad  db "unreadable or contains NUL bytes, not run.", 10, 0
+    err_script_trust db "ignored, it must belong to you and not be writable by others.", 10, 0
+section .bss
+    script_file_buf resb SCRIPT_FILE_MAX + 2
+section .text
+read_script_file:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    mov r13d, esi                   ; r13d = trust check wanted
+    mov esi, O_RDONLY
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .rsf_noopen
+    mov ebx, eax                    ; ebx = fd
+
+    test r13d, r13d
+    jz .rsf_start
+
+    ; fstat on the open file, so it cannot be swapped after the check
+    mov edi, ebx
+    lea rsi, [stat_buf]
+    mov eax, SYS_FSTAT
+    syscall
+    test rax, rax
+    js .rsf_untrusted
+    test dword [stat_buf + STAT_ST_MODE], S_IWOTH
+    jnz .rsf_untrusted
+    mov eax, SYS_GETEUID
+    syscall
+    mov ecx, [stat_buf + STAT_ST_UID]
+    test ecx, ecx
+    jz .rsf_start                   ; root's file
+    cmp ecx, eax
+    jne .rsf_untrusted
+
+.rsf_start:
+    xor r12d, r12d                  ; r12d = bytes read so far
+.rsf_read:
+    mov edi, ebx
+    lea rsi, [script_file_buf]
+    add rsi, r12
+    mov edx, SCRIPT_FILE_MAX + 1
+    sub edx, r12d                   ; one byte more than allowed shows it is too big
+    mov eax, SYS_READ
+    syscall
+    cmp rax, -4                     ; EINTR
+    je .rsf_read
+    test rax, rax
+    js .rsf_error
+    jz .rsf_eof
+    add r12d, eax
+    cmp r12d, SCRIPT_FILE_MAX
+    jbe .rsf_read
+    mov r12d, -2
+    jmp .rsf_close
+
+.rsf_eof:
+    lea rdi, [script_file_buf]
+    mov byte [rdi + r12], 0
+    test r12d, r12d
+    jz .rsf_close
+    mov ecx, r12d
+    xor eax, eax
+    repne scasb                     ; any NUL inside the file?
+    jne .rsf_close
+    mov r12d, -3
+    jmp .rsf_close
+
+.rsf_error:
+    mov r12d, -3
+    jmp .rsf_close
+
+.rsf_untrusted:
+    mov r12d, -4
+
+.rsf_close:
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    mov eax, r12d
+    jmp .rsf_ret
+
+.rsf_noopen:
+    mov eax, -1
+
+.rsf_ret:
     add rsp, 8
     pop r13
     pop r12
@@ -7684,60 +8999,27 @@ build_merged_envp:
     pop rbp
     ret
 
-; ============================================================================
-; handler_unset - Remove a name from env_overlay (env vars set via 'set')
-; ============================================================================
-handler_unset:
+; report_script_error - rdi = "name: " prefix, esi = negative code from
+; read_script_file. Says on stderr why the file was not run.
+report_script_error:
     push rbp
     mov rbp, rsp
     push rbx
-    push r12
-    push r13
-    push r14
     sub rsp, 8
 
-    test rdi, rdi
-    jz .hun_usage
-    cmp byte [rdi], 0
-    je .hun_usage
+    mov ebx, esi
+    call report_error_cstr
+    lea rdi, [err_script_big]
+    cmp ebx, -2
+    je .rse_print
+    lea rdi, [err_script_trust]
+    cmp ebx, -4
+    je .rse_print
+    lea rdi, [err_script_bad]
+.rse_print:
+    call report_error_cstr
 
-    ; Use caller's arg as the name; length via str_len
-    mov r12, rdi
-    call str_len
-    mov r13d, eax
-
-    lea rbx, [env_overlay]
-    xor r14d, r14d
-.hun_scan:
-    cmp r14d, [env_overlay_count]
-    jge .hun_done
-    cmp byte [rbx], 0
-    je .hun_next
-    mov rdi, r12
-    mov rsi, rbx
-    mov edx, r13d
-    call str_icompare_n
-    test eax, eax
-    jnz .hun_next
-    cmp byte [rbx + r13], '='
-    jne .hun_next
-    ; Found -- clear slot
-    mov byte [rbx], 0
-    jmp .hun_done
-.hun_next:
-    add rbx, ENV_OVERLAY_SIZE
-    inc r14d
-    jmp .hun_scan
-
-.hun_usage:
-    lea rdi, [err_unset_usage]
-    mov esi, err_unset_usage_len
-    call print_string_len
-.hun_done:
     add rsp, 8
-    pop r14
-    pop r13
-    pop r12
     pop rbx
     pop rbp
     ret
@@ -7775,7 +9057,7 @@ run_autoexec:
 
     lea rdi, [autoexec_path]
     lea rsi, [module_path]
-    mov edx, MAX_PATH_BUF - 1
+    mov edx, MAX_PATH_BUF - 16      ; room for "/autoexec.txt"
     mov eax, SYS_READLINK
     syscall
     test rax, rax
@@ -7811,40 +9093,26 @@ run_autoexec:
     jmp .ra_app
 
 .ra_try_open:
-    ; Try to open the file
+    ; Read the whole file, unless somebody else could have written it
     lea rdi, [module_path]
-    mov esi, O_RDONLY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .ra_done                     ; file doesn't exist
-
-    mov ebx, eax                    ; ebx = fd
-
-    ; Read entire file
-    mov edi, ebx
-    lea rsi, [read_buffer]
-    mov edx, READ_BUF_SIZE - 1
-    mov eax, SYS_READ
-    syscall
-    mov r12d, eax                   ; r12d = bytes read
-
-    ; Close file
-    mov edi, ebx
-    mov eax, SYS_CLOSE
-    syscall
-
-    ; Null-terminate
-    test r12d, r12d
-    jle .ra_done
-    lea rcx, [read_buffer]
-    mov byte [rcx + r12], 0
+    mov esi, 1                      ; check ownership
+    call read_script_file
+    cmp eax, -1
+    je .ra_done                     ; no autoexec.txt
+    test eax, eax
+    js .ra_failed
+    jz .ra_done                     ; empty file
 
     ; Run the whole file through the ASH script engine
-    lea rdi, [read_buffer]
+    lea rdi, [script_file_buf]
     mov esi, 1
     call ash_eval
+    jmp .ra_done
+
+.ra_failed:
+    mov esi, eax
+    lea rdi, [err_autoexec_name]
+    call report_script_error
 
 .ra_done:
     add rsp, 24
@@ -7856,14 +9124,24 @@ run_autoexec:
 
 ; ============================================================================
 ; load_history - Load command history from ~/.asm_history at startup
+; Only the newest part of a big file is read (the last 256 KB, starting at
+; the first complete line), so recent commands win. A file past
+; HISTORY_FILE_MAX is rewritten with just the lines the ring holds.
 ; ============================================================================
+%define HISTORY_FILE_MAX    131072
+section .bss
+    history_tmp_path    resb MAX_PATH_BUF
+section .data
+    str_tmp_suffix      db ".tmp", 0
+section .text
 load_history:
     push rbp
     mov rbp, rsp
     push rbx
     push r12
     push r13
-    sub rsp, 8
+    push r14
+    sub rsp, 32                     ; [rbp-48] read position, [rbp-56] mid-file flag
 
     ; Build path: $HOME/.asm_history
     lea rdi, [str_home]
@@ -7871,9 +9149,16 @@ load_history:
     test rax, rax
     jz .lh_done
 
+    ; A $HOME too long for the path buffers means no history file
+    mov r12, rax
+    mov rdi, rax
+    call str_len
+    cmp eax, MAX_PATH_BUF - 32
+    jae .lh_done
+
     ; Copy HOME to history_file_path
     lea rdi, [history_file_path]
-    mov rsi, rax
+    mov rsi, r12
 .lh_copy_home:
     mov cl, [rsi]
     mov [rdi], cl
@@ -7903,23 +9188,52 @@ load_history:
     js .lh_done                     ; file doesn't exist, OK
     mov ebx, eax                    ; fd
 
+    ; The commands typed here may hold passwords: keep the file private
+    mov eax, 91                     ; SYS_fchmod
+    mov edi, ebx
+    mov esi, 0o600
+    syscall
+
+    ; Size of the file, then where to start reading
+    mov eax, SYS_LSEEK
+    mov edi, ebx
+    xor esi, esi
+    mov edx, 2                      ; SEEK_END
+    syscall
+    mov r14, rax                    ; r14 = file size
+    mov qword [rbp - 56], 0         ; 1 = we start in the middle of the file
+    xor r12d, r12d                  ; total bytes read
+    test rax, rax
+    jle .lh_read_done
+    mov rsi, rax
+    sub rsi, 262143                 ; room for the NUL
+    ja .lh_mid
+    xor esi, esi
+    jmp .lh_seek
+.lh_mid:
+    mov qword [rbp - 56], 1
+.lh_seek:
+    mov eax, SYS_LSEEK
+    mov edi, ebx
+    xor edx, edx                    ; SEEK_SET
+    syscall
+
     ; Read file in a loop into a 256KB buffer (handles multi-chunk files).
-    lea r13, [history_read_buf]     ; current write position
-    xor r12d, r12d                  ; total bytes
+    lea rax, [history_read_buf]
+    mov [rbp - 48], rax             ; current write position
 .lh_read_chunk:
-    mov eax, 262144
+    mov eax, 262143
     sub eax, r12d
-    cmp eax, 1
     jle .lh_read_done               ; buffer full
     mov edi, ebx
-    mov rsi, r13
+    mov rsi, [rbp - 48]
     mov edx, eax
     mov eax, SYS_READ
     syscall
     test rax, rax
     jle .lh_read_done               ; EOF or error
     add r12d, eax
-    add r13, rax
+    add [rbp - 48], rax
     jmp .lh_read_chunk
 .lh_read_done:
 
@@ -7936,10 +9250,20 @@ load_history:
 
     ; Parse lines and add to history buffer
     lea r13, [history_read_buf]
+    cmp qword [rbp - 56], 0
+    je .lh_line
+.lh_skip_partial:                   ; the first line is cut off: drop it
+    movzx eax, byte [r13]
+    test al, al
+    jz .lh_trim
+    inc r13
+    cmp al, 10
+    jne .lh_skip_partial
+
 .lh_line:
     cmp byte [r13], 0
-    je .lh_done
-    ; Copy one line to cmd_line_buf
+    je .lh_trim
+    ; Copy one line to cmd_line_buf, keeping at most one history entry
     lea rdi, [cmd_line_buf]
     xor ecx, ecx
 .lh_cpy:
@@ -7950,9 +9274,11 @@ load_history:
     je .lh_skip_cr
     cmp al, 10
     je .lh_add
+    inc r13
+    cmp ecx, HISTORY_ENTRY_SIZE - 1
+    jae .lh_cpy                     ; the rest of an overlong line is dropped
     mov [rdi + rcx], al
     inc ecx
-    inc r13
     jmp .lh_cpy
 .lh_skip_cr:
     inc r13
@@ -7969,7 +9295,103 @@ load_history:
     call history_add
     jmp .lh_line
 
+.lh_trim:
+    ; An oversized file is cut down to what the ring holds
+    cmp r14, HISTORY_FILE_MAX
+    jbe .lh_done
+    call history_rewrite
+
 .lh_done:
+    add rsp, 32
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; history_rewrite - replace the history file with the entries of the ring,
+; oldest first, through a temporary file renamed over the original
+history_rewrite:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    lea rdi, [history_tmp_path]
+    lea rsi, [history_file_path]
+    call str_copy
+    lea rdi, [history_tmp_path]
+    call str_len
+    lea rdi, [history_tmp_path]
+    add rdi, rax
+    lea rsi, [str_tmp_suffix]
+    call str_copy
+
+    ; All lines into history_read_buf (256000 bytes at most fit)
+    lea r12, [history_read_buf]
+    xor r13d, r13d
+.hr_loop:
+    cmp r13d, [history_count]
+    jae .hr_write
+    mov eax, [history_write_idx]
+    sub eax, [history_count]
+    add eax, r13d
+    jge .hr_idx
+    add eax, HISTORY_COUNT
+.hr_idx:
+    imul eax, HISTORY_ENTRY_SIZE
+    lea rsi, [history_buf]
+    add rsi, rax
+.hr_copy:
+    mov al, [rsi]
+    test al, al
+    jz .hr_eol
+    mov [r12], al
+    inc r12
+    inc rsi
+    jmp .hr_copy
+.hr_eol:
+    mov byte [r12], 10
+    inc r12
+    inc r13d
+    jmp .hr_loop
+
+.hr_write:
+    lea rdi, [history_tmp_path]
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov edx, 0o600
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .hr_done
+    mov ebx, eax
+    lea rsi, [history_read_buf]
+    mov rdx, r12
+    sub rdx, rsi
+    mov r13, rdx                    ; bytes to write
+    mov edi, ebx
+    mov eax, SYS_WRITE
+    syscall
+    mov r12, rax
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    cmp r12, r13
+    jne .hr_discard
+    lea rdi, [history_tmp_path]
+    lea rsi, [history_file_path]
+    mov eax, SYS_RENAME
+    syscall
+    jmp .hr_done
+.hr_discard:
+    lea rdi, [history_tmp_path]
+    mov eax, SYS_UNLINK
+    syscall
+
+.hr_done:
     add rsp, 8
     pop r13
     pop r12
@@ -7980,6 +9402,7 @@ load_history:
 ; ============================================================================
 ; history_save_entry - Append a command to ~/.asm_history
 ; rdi = pointer to null-terminated command string
+; The file is created readable by its owner only.
 ; ============================================================================
 history_save_entry:
     push rbp
@@ -7995,9 +9418,9 @@ history_save_entry:
     cmp byte [rdi], 0
     je .hse_done
 
-    ; Open file for append (create if needed)
-    mov esi, O_WRONLY | O_CREAT | O_APPEND
-    mov edx, FILE_MODE_DEFAULT
+    ; Open file for append (create if needed), O_CLOEXEC
+    mov esi, O_WRONLY | O_CREAT | O_APPEND | 0x80000
+    mov edx, 0o600
     mov eax, SYS_OPEN
     syscall
     test rax, rax
@@ -8051,9 +9474,16 @@ run_asmrc:
     test rax, rax
     jz .rc_done
 
+    ; An absurdly long $HOME cannot be a real home directory
+    mov rbx, rax
+    mov rdi, rax
+    call str_len
+    cmp eax, MAX_PATH_BUF - 16
+    ja .rc_done
+
     ; Copy HOME to asmrc_path
     lea rdi, [asmrc_path]
-    mov rsi, rax
+    mov rsi, rbx
 .rc_copy_home:
     mov cl, [rsi]
     mov [rdi], cl
@@ -8075,38 +9505,24 @@ run_asmrc:
 
 .rc_open:
     lea rdi, [asmrc_path]
-    mov esi, O_RDONLY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .rc_done                     ; file doesn't exist, silent fail
-
-    mov ebx, eax                    ; fd
-
-    ; Read file
-    mov edi, ebx
-    lea rsi, [read_buffer]
-    mov edx, READ_BUF_SIZE - 1
-    mov eax, SYS_READ
-    syscall
-    mov r12d, eax
-
-    ; Close
-    mov edi, ebx
-    mov eax, SYS_CLOSE
-    syscall
-
-    ; Null-terminate
-    test r12d, r12d
-    jle .rc_done
-    lea rcx, [read_buffer]
-    mov byte [rcx + r12], 0
+    xor esi, esi
+    call read_script_file
+    cmp eax, -1
+    je .rc_done                     ; file doesn't exist, silent fail
+    test eax, eax
+    js .rc_failed
+    jz .rc_done
 
     ; Run the whole file through the ASH script engine
-    lea rdi, [read_buffer]
+    lea rdi, [script_file_buf]
     mov esi, 1
     call ash_eval
+    jmp .rc_done
+
+.rc_failed:
+    mov esi, eax
+    lea rdi, [err_asmrc_name]
+    call report_script_error
 
 .rc_done:
     add rsp, 8
@@ -8119,45 +9535,6 @@ run_asmrc:
 ; ============================================================================
 ; ==================== BATCH 2 FUNCTIONS ====================================
 ; ============================================================================
-
-; ============================================================================
-; check_wildcard_in_args - Scan input_buf for '*' or '?' characters
-; We skip the first word (the command name) and only check arguments.
-; Returns: eax = 1 if wildcards found in args, 0 if not.
-; ============================================================================
-check_wildcard_in_args:
-    lea rdi, [input_buf]
-
-    ; Skip first word (the command itself)
-.cwa_skip_cmd:
-    movzx eax, byte [rdi]
-    test al, al
-    jz .cwa_not_found               ; no args at all
-    cmp al, ' '
-    je .cwa_in_args
-    inc rdi
-    jmp .cwa_skip_cmd
-
-.cwa_in_args:
-    ; Now scan the argument portion
-    movzx eax, byte [rdi]
-    test al, al
-    jz .cwa_not_found
-    cmp al, '*'
-    je .cwa_found
-    cmp al, '?'
-    je .cwa_found
-    inc rdi
-    jmp .cwa_in_args
-
-.cwa_found:
-    mov eax, 1
-    ret
-
-.cwa_not_found:
-    xor eax, eax
-    ret
-
 
 ; ============================================================================
 ; handler_source - Execute commands from a user-specified file
@@ -8182,58 +9559,43 @@ handler_source:
     jge .hsrc_depth_err
     inc dword [source_depth]
 
-    ; rdi already points to the filename -- open it
-    mov esi, O_RDONLY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .hsrc_open_err
-    mov ebx, eax                    ; ebx = file descriptor
-
-    ; Read entire file into source_read_buf
-    mov edi, ebx
-    lea rsi, [source_read_buf]
-    mov edx, READ_BUF_SIZE - 1
-    mov eax, SYS_READ
-    syscall
-    mov r12d, eax                   ; r12d = bytes read
-
-    ; Close file
-    mov edi, ebx
-    mov eax, SYS_CLOSE
-    syscall
-
-    ; Check for empty or failed read
-    test r12d, r12d
-    jle .hsrc_done
-
-    ; Null-terminate the buffer
-    lea rcx, [source_read_buf]
-    mov byte [rcx + r12], 0
+    ; Read the whole file (rdi already points to the filename)
+    xor esi, esi
+    call read_script_file
+    cmp eax, -1
+    je .hsrc_open_err
+    test eax, eax
+    js .hsrc_bad_file
+    jz .hsrc_done                   ; empty file
 
     ; Run the whole file through the ASH script engine
-    lea rdi, [source_read_buf]
+    lea rdi, [script_file_buf]
     mov esi, 1
     call ash_eval
+    jmp .hsrc_done
+
+.hsrc_bad_file:
+    mov esi, eax
+    lea rdi, [err_source_name]
+    call report_script_error
     jmp .hsrc_done
 
 .hsrc_noargs:
     lea rdi, [err_source_msg]
     mov esi, err_source_len
-    call print_string_len
+    call report_error_len
     jmp .hsrc_done_nodepth
 
 .hsrc_open_err:
     lea rdi, [err_source_open]
     mov esi, err_source_o_len
-    call print_string_len
+    call report_error_len
     jmp .hsrc_done
 
 .hsrc_depth_err:
     lea rdi, [err_source_depth_msg]
     mov esi, err_source_depth_len
-    call print_string_len
+    call report_error_len
     jmp .hsrc_done_nodepth
 
 .hsrc_done:
@@ -8246,6 +9608,43 @@ handler_source:
     pop rbp
     ret
 
+
+; rhs_note_rows - the search line is on screen: note which row its end is on
+; (a long match wraps like the prompt line does)
+rhs_note_rows:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov ebx, search_prompt_len + search_prompt_e_len
+    add ebx, [search_len]
+    cmp byte [search_match_found], 0
+    je .rnr_nomatch
+    mov eax, [search_match_idx]
+    imul eax, HISTORY_ENTRY_SIZE
+    lea rdi, [history_buf]
+    add rdi, rax
+    call str_len
+    mov esi, eax
+    call utf8_cols
+    add ebx, eax
+    jmp .rnr_calc
+.rnr_nomatch:
+    cmp dword [search_len], 0
+    je .rnr_calc
+    add ebx, search_fail_len
+.rnr_calc:
+    call cur_cols
+    mov ecx, eax
+    lea eax, [rbx - 1]
+    xor edx, edx
+    div ecx                         ; a text ending in the last column has
+    mov [cursor_row], eax           ; its cursor still on that row
+    add rsp, 8
+    pop rbx
+    pop rbp
+    ret
 
 ; ============================================================================
 ; reverse_history_search - Ctrl+R interactive reverse search mode
@@ -8275,14 +9674,21 @@ reverse_history_search:
     mov [search_match_idx], eax
 
 .rhs_redraw_prompt:
-    ; Move to start of line
+    call ob_begin
+
+    ; Back to the first row of what is on screen, then erase it all (the
+    ; search line can wrap just like the prompt line)
     lea rdi, [str_cr]
     mov esi, 1
     call print_string_len
-
-    ; Clear the entire line
-    lea rdi, [ansi_clear_eol]
-    mov esi, ansi_clear_eol_len
+    mov eax, [cursor_row]
+    test eax, eax
+    jz .rhs_top
+    mov ecx, 'A'
+    call write_csi_num
+.rhs_top:
+    lea rdi, [ansi_clear_eos]
+    mov esi, 3
     call print_string_len
 
     ; Print "(reverse-i-search)`"
@@ -8325,6 +9731,8 @@ reverse_history_search:
     call print_string_len
 
 .rhs_read_key:
+    call rhs_note_rows
+    call ob_end
     call read_key
 
     movzx ebx, word [key_vkey]
@@ -8427,22 +9835,10 @@ reverse_history_search:
     mov [line_len], eax
     mov [line_cursor], eax
 
-    lea rdi, [str_cr]
-    mov esi, 1
-    call print_string_len
-    lea rdi, [ansi_clear_eol]
-    mov esi, ansi_clear_eol_len
-    call print_string_len
     call redraw_line
     jmp .rhs_done
 
 .rhs_cancel:
-    lea rdi, [str_cr]
-    mov esi, 1
-    call print_string_len
-    lea rdi, [ansi_clear_eol]
-    mov esi, ansi_clear_eol_len
-    call print_string_len
     call redraw_line
     jmp .rhs_done
 
@@ -8549,6 +9945,7 @@ print_ls_perms:
     push rcx
     push rdi
     push rsi
+    sub rsp, 8                      ; keep the stack 16-byte aligned for the call below
 
     lea rdi, [ls_perms_buf]
     mov esi, ecx
@@ -8641,6 +10038,7 @@ print_ls_perms:
     mov esi, 10
     call print_string_len
 
+    add rsp, 8
     pop rsi
     pop rdi
     pop rcx
@@ -8648,8 +10046,40 @@ print_ls_perms:
     ret
 
 ; ============================================================================
-; handler_ls - List directory contents with optional -l, -a flags and colors
+; handler_ls - List directories (or files) with -l, -a, sorted by name
+; Options may appear anywhere, any number of paths may be given. Colours are
+; used only on an interactive colour terminal, and control bytes in names
+; are shown as '?' when the output is a terminal, so a hostile file name
+; cannot send escape sequences to it.
+; ls_flags: bit 0 = -l, bit 1 = -a, bit 2 = colour, bit 3 = sanitise names.
+; Status: 0, 1 if a path could not be read, 2 for a bad option.
 ; ============================================================================
+%define AT_SYMLINK_NOFOLLOW 0x100
+%define SYS_READLINKAT      267
+%define LS_POOL_SIZE        262144
+%define LS_MAX_ENTRIES      16384
+%define LS_MAX_PATHS        32
+
+section .data
+    ansi_cyan       db 27, "[36m", 0
+    ansi_cyan_len   equ $ - ansi_cyan - 1
+    str_arrow       db " -> ", 0
+    err_ls_usage    db "Usage: ls [-la] [path...]", 10, 0
+    err_ls_usage_len equ $ - err_ls_usage - 1
+    err_ls_many     db "ls: too many paths.", 10, 0
+    err_ls_many_len equ $ - err_ls_many - 1
+    err_ls_cut      db "ls: directory too large, listing truncated.", 10, 0
+    err_ls_cut_len  equ $ - err_ls_cut - 1
+section .bss
+    ls_pool         resb LS_POOL_SIZE   ; [d_type][name\0] for each entry
+    ls_ptrs         resq LS_MAX_ENTRIES
+    ls_paths        resq LS_MAX_PATHS
+    ls_count        resd 1
+    ls_pool_used    resd 1
+    ls_name_buf     resb 4112
+    ls_link_buf     resb 4112
+section .text
+
 handler_ls:
     push rbp
     mov rbp, rsp
@@ -8658,263 +10088,167 @@ handler_ls:
     push r13
     push r14
     push r15
-    sub rsp, 56
+    sub rsp, 24
 
     mov rbx, rdi                    ; rbx = args (may be NULL)
-    mov byte [ls_flags], 0          ; clear flags
-
-    ; --- Parse flags ---
+    mov byte [ls_flags], 0
+    xor r12d, r12d                  ; r12d = number of paths
+    xor r15d, r15d                  ; r15d = 1 once a path failed
     test rbx, rbx
-    jz .ls_no_flags
-    cmp byte [rbx], 0
-    je .ls_no_flags
+    jz .ls_args_done
 
-.ls_parse_flags:
-    cmp byte [rbx], '-'
-    jne .ls_no_flags
-
-    inc rbx                         ; skip '-'
-.ls_flag_loop:
-    movzx eax, byte [rbx]
-    cmp al, 0
-    je .ls_flags_done_advance
-    cmp al, ' '
-    je .ls_flags_done_advance
-    cmp al, 'l'
-    je .ls_set_l
-    cmp al, 'a'
-    je .ls_set_a
-    inc rbx
-    jmp .ls_flag_loop
-
-.ls_set_l:
-    or byte [ls_flags], 1           ; bit 0 = long listing
-    inc rbx
-    jmp .ls_flag_loop
-
-.ls_set_a:
-    or byte [ls_flags], 2           ; bit 1 = show all
-    inc rbx
-    jmp .ls_flag_loop
-
-.ls_flags_done_advance:
+    ; --- Split the arguments into options and paths ---
+.ls_tok:
     cmp byte [rbx], ' '
-    jne .ls_check_more_flags
+    jne .ls_tok_start
     inc rbx
-    jmp .ls_flags_done_advance
-
-.ls_check_more_flags:
-    cmp byte [rbx], '-'
-    je .ls_parse_flags
+    jmp .ls_tok
+.ls_tok_start:
     cmp byte [rbx], 0
-    jne .ls_have_path
-    jmp .ls_use_dot
-
-.ls_no_flags:
-    test rbx, rbx
-    jz .ls_use_dot
+    je .ls_args_done
+    mov r13, rbx                    ; r13 = start of this word
+.ls_tok_end:
     cmp byte [rbx], 0
-    je .ls_use_dot
+    je .ls_tok_have
+    cmp byte [rbx], ' '
+    je .ls_tok_cut
+    inc rbx
+    jmp .ls_tok_end
+.ls_tok_cut:
+    mov byte [rbx], 0
+    inc rbx
+.ls_tok_have:
+    cmp byte [r13], '-'
+    jne .ls_operand
+    cmp byte [r13 + 1], 0
+    je .ls_operand                  ; a lone "-" is a name
+    lea r14, [r13 + 1]
+.ls_opt:
+    movzx eax, byte [r14]
+    test al, al
+    jz .ls_tok
+    cmp al, 'l'
+    je .ls_opt_l
+    cmp al, 'a'
+    je .ls_opt_a
+    jmp .ls_usage
+.ls_opt_l:
+    or byte [ls_flags], 1
+    inc r14
+    jmp .ls_opt
+.ls_opt_a:
+    or byte [ls_flags], 2
+    inc r14
+    jmp .ls_opt
+.ls_operand:
+    cmp r12d, LS_MAX_PATHS
+    jae .ls_too_many
+    lea rax, [ls_paths]
+    mov [rax + r12*8], r13
+    inc r12d
+    jmp .ls_tok
 
-.ls_have_path:
-    mov r15, rbx                    ; r15 = directory path
-    jmp .ls_open_dir
+.ls_args_done:
+    test r12d, r12d
+    jnz .ls_have_paths
+    lea rax, [str_dot]              ; default to "."
+    lea rcx, [ls_paths]
+    mov [rcx], rax
+    mov r12d, 1
 
-.ls_use_dot:
-    lea r15, [str_dot]              ; default to "."
+.ls_have_paths:
+    call ls_output_flags
+    xor r14d, r14d                  ; r14d = index of the current path
 
-.ls_open_dir:
-    mov rdi, r15
-    mov esi, O_RDONLY | O_DIRECTORY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .ls_open_err
-    mov r12d, eax                   ; r12d = directory fd
+.ls_next_path:
+    cmp r14d, r12d
+    jae .ls_finish
+    lea rax, [ls_paths]
+    mov r13, [rax + r14*8]          ; r13 = path
 
-.ls_read_batch:
-    mov edi, r12d
-    lea rsi, [dirent_buf]
-    mov edx, DIRENT_BUF_SIZE
-    mov eax, SYS_GETDENTS64
-    syscall
-    test rax, rax
-    jle .ls_close                   ; 0 = done, negative = error
-
-    mov r13d, eax                   ; r13d = bytes returned
-    xor r14d, r14d                  ; r14d = offset into buffer
-
-.ls_entry:
-    cmp r14d, r13d
-    jge .ls_read_batch
-
-    lea rsi, [dirent_buf]
-    add rsi, r14
-    mov [rbp - 64], rsi             ; save dirent ptr
-
-    lea rbx, [rsi + DIRENT64_D_NAME]
-
-    ; --- Skip . and .. unless -a flag ---
-    cmp byte [rbx], '.'
-    jne .ls_check_hidden
-    cmp byte [rbx + 1], 0
-    je .ls_maybe_skip_dot
-    cmp byte [rbx + 1], '.'
-    jne .ls_check_hidden_dot
-    cmp byte [rbx + 2], 0
-    je .ls_maybe_skip_dot
-    jmp .ls_check_hidden_dot
-
-.ls_maybe_skip_dot:
-    test byte [ls_flags], 2
-    jz .ls_next_entry
-    jmp .ls_do_stat
-
-.ls_check_hidden_dot:
-    test byte [ls_flags], 2
-    jz .ls_next_entry
-    jmp .ls_do_stat
-
-.ls_check_hidden:
-
-.ls_do_stat:
-    mov edi, r12d
-    mov rsi, rbx
+    ; Follow links to see whether it is a directory
+    mov edi, AT_FDCWD
+    mov rsi, r13
     lea rdx, [stat_buf]
     xor r10d, r10d
     mov eax, SYS_NEWFSTATAT
     syscall
+    test rax, rax
+    jns .ls_have_stat
 
-    mov eax, [stat_buf + STAT_ST_MODE]
-    mov ecx, eax
-
-    and eax, 0xF000
-    cmp eax, S_IFDIR
-    je .ls_entry_is_dir
-
-    test ecx, S_IXUSR | S_IXGRP | S_IXOTH
-    jnz .ls_entry_is_exec
-
-    jmp .ls_entry_is_regular
-
-.ls_entry_is_dir:
-    test byte [ls_flags], 1
-    jz .ls_dir_short
-
-    mov ecx, [stat_buf + STAT_ST_MODE]
-    call print_ls_perms
-    lea rdi, [str_two_spaces]
-    call print_cstring
-
-    mov rax, [stat_buf + STAT_ST_SIZE]   ; full 64-bit size
-    call print_number_9pad
-    lea rdi, [str_space]
-    call print_cstring
-
-.ls_dir_short:
-    lea rdi, [ansi_blue]
-    mov esi, ansi_blue_len
-    call print_string_len
-
-    mov rdi, rbx
-    call print_cstring
-
-    lea rdi, [ansi_default]
-    mov esi, ansi_default_len
-    call print_string_len
-
-    test byte [ls_flags], 1
-    jnz .ls_entry_newline
-    lea rdi, [str_two_spaces]
-    call print_cstring
-    jmp .ls_entry_done
-
-.ls_entry_is_exec:
-    test byte [ls_flags], 1
-    jz .ls_exec_short
-
-    mov ecx, [stat_buf + STAT_ST_MODE]
-    call print_ls_perms
-    lea rdi, [str_two_spaces]
-    call print_cstring
-
-    mov rax, [stat_buf + STAT_ST_SIZE]   ; full 64-bit size
-    call print_number_9pad
-    lea rdi, [str_space]
-    call print_cstring
-
-.ls_exec_short:
-    lea rdi, [ansi_green_ls]
-    mov esi, ansi_green_ls_len
-    call print_string_len
-
-    mov rdi, rbx
-    call print_cstring
-
-    lea rdi, [ansi_default]
-    mov esi, ansi_default_len
-    call print_string_len
-
-    test byte [ls_flags], 1
-    jnz .ls_entry_newline
-    lea rdi, [str_two_spaces]
-    call print_cstring
-    jmp .ls_entry_done
-
-.ls_entry_is_regular:
-    test byte [ls_flags], 1
-    jz .ls_reg_short
-
-    mov ecx, [stat_buf + STAT_ST_MODE]
-    call print_ls_perms
-    lea rdi, [str_two_spaces]
-    call print_cstring
-
-    mov rax, [stat_buf + STAT_ST_SIZE]   ; full 64-bit size
-    call print_number_9pad
-    lea rdi, [str_space]
-    call print_cstring
-
-.ls_reg_short:
-    mov rdi, rbx
-    call print_cstring
-
-    test byte [ls_flags], 1
-    jnz .ls_entry_newline
-    lea rdi, [str_two_spaces]
-    call print_cstring
-    jmp .ls_entry_done
-
-.ls_entry_newline:
-    call print_newline
-
-.ls_entry_done:
-
-.ls_next_entry:
-    mov rsi, [rbp - 64]
-    movzx eax, word [rsi + DIRENT64_D_RECLEN]
-    add r14d, eax
-    jmp .ls_entry
-
-.ls_close:
-    test byte [ls_flags], 1
-    jnz .ls_close_fd
-    call print_newline
-
-.ls_close_fd:
-    mov edi, r12d
-    mov eax, SYS_CLOSE
+    ; A dangling link is still something to show
+    mov edi, AT_FDCWD
+    mov rsi, r13
+    lea rdx, [stat_buf]
+    mov r10d, AT_SYMLINK_NOFOLLOW
+    mov eax, SYS_NEWFSTATAT
     syscall
-    jmp .ls_done
-
-.ls_open_err:
+    test rax, rax
+    jns .ls_file_operand
     neg eax
     mov edi, eax
     call print_last_error
+    mov r15d, 1
+    jmp .ls_path_done
+
+.ls_have_stat:
+    mov eax, [stat_buf + STAT_ST_MODE]
+    and eax, S_IFMT
+    cmp eax, S_IFDIR
+    jne .ls_file_operand
+
+    ; A directory. With several paths each gets a heading.
+    cmp r12d, 1
+    jbe .ls_dir_list
+    test r14d, r14d
+    jz .ls_heading
+    call print_newline
+.ls_heading:
+    mov rdi, r13
+    call print_cstring
+    lea rdi, [str_colon]
+    call print_cstring
+    call print_newline
+.ls_dir_list:
+    mov rdi, r13
+    call ls_list_dir
+    or r15d, eax
+    jmp .ls_path_done
+
+.ls_file_operand:
+    mov edi, AT_FDCWD
+    mov rsi, r13
+    xor edx, edx
+    call ls_print_entry
+    test byte [ls_flags], 1
+    jnz .ls_path_done               ; long format ended its line
+    call print_newline
+
+.ls_path_done:
+    inc r14d
+    jmp .ls_next_path
+
+.ls_finish:
+    test r15d, r15d
+    jz .ls_done
+    mov dword [last_exit_status], 1
+    jmp .ls_done
+
+.ls_usage:
+    lea rdi, [err_ls_usage]
+    mov esi, err_ls_usage_len
+    call report_error_len
+    mov dword [last_exit_status], 2
+    jmp .ls_done
+
+.ls_too_many:
+    lea rdi, [err_ls_many]
+    mov esi, err_ls_many_len
+    call report_error_len
+    mov dword [last_exit_status], 2
 
 .ls_done:
-    add rsp, 56
+    add rsp, 24
     pop r15
     pop r14
     pop r13
@@ -8923,10 +10257,425 @@ handler_ls:
     pop rbp
     ret
 
+; ---------- ls_output_flags ----------
+; Sets ls_flags bit 2 (colour) and bit 3 (sanitise names) from where stdout
+; goes. Neither applies to a redirected stdout.
+ls_output_flags:
+    and byte [ls_flags], 3
+    cmp byte [redir_stdout_active], 0
+    jne .lof_done
+    cmp byte [color_enabled], 0
+    je .lof_tty
+    or byte [ls_flags], 4
+.lof_tty:
+    mov eax, SYS_IOCTL
+    mov edi, STDOUT_FD
+    mov esi, TCGETS
+    lea rdx, [termios_probe_buf]
+    syscall
+    test rax, rax
+    js .lof_done
+    or byte [ls_flags], 8
+.lof_done:
+    ret
+
+; ---------- ls_list_dir ----------
+; rdi = directory. Reads every entry, sorts them by name and prints them.
+; Returns eax = 1 if the directory could not be read, else 0.
+ls_list_dir:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 24
+
+    mov esi, O_RDONLY | O_DIRECTORY
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    jns .lld_opened
+    neg eax
+    mov edi, eax
+    call print_last_error
+    mov eax, 1
+    jmp .lld_ret
+
+.lld_opened:
+    mov r12d, eax                   ; r12d = directory fd
+    mov dword [ls_count], 0
+    mov dword [ls_pool_used], 0
+    xor r15d, r15d                  ; r15d = 1 if entries had to be dropped
+
+.lld_read_batch:
+    mov edi, r12d
+    lea rsi, [dirent_buf]
+    mov edx, DIRENT_BUF_SIZE
+    mov eax, SYS_GETDENTS64
+    syscall
+    test rax, rax
+    jle .lld_collected              ; 0 = done, negative = error
+
+    mov r13d, eax                   ; r13d = bytes returned
+    xor r14d, r14d                  ; r14d = offset into buffer
+
+.lld_entry:
+    cmp r14d, r13d
+    jge .lld_read_batch
+
+    lea rsi, [dirent_buf]
+    add rsi, r14
+    movzx eax, word [rsi + DIRENT64_D_RECLEN]
+    mov [rbp - 48], eax             ; length of this record
+    lea rbx, [rsi + DIRENT64_D_NAME]
+    movzx r8d, byte [rsi + DIRENT64_D_TYPE]
+
+    ; Hidden entries (and . and ..) only with -a
+    cmp byte [rbx], '.'
+    jne .lld_add
+    test byte [ls_flags], 2
+    jz .lld_next
+
+.lld_add:
+    xor ecx, ecx                    ; name length
+.lld_len:
+    cmp byte [rbx + rcx], 0
+    je .lld_len_done
+    inc ecx
+    jmp .lld_len
+.lld_len_done:
+    mov eax, [ls_pool_used]
+    lea edx, [rax + rcx + 2]        ; type byte + name + NUL
+    cmp edx, LS_POOL_SIZE
+    ja .lld_full
+    mov r9d, [ls_count]
+    cmp r9d, LS_MAX_ENTRIES
+    jae .lld_full
+    lea rdi, [ls_pool]
+    add rdi, rax                    ; entry
+    lea r10, [ls_ptrs]
+    mov [r10 + r9*8], rdi
+    inc r9d
+    mov [ls_count], r9d
+    mov [ls_pool_used], edx
+    mov [rdi], r8b                  ; d_type
+    inc rdi
+    mov rsi, rbx
+    inc ecx                         ; copy the NUL too
+    rep movsb
+    jmp .lld_next
+
+.lld_full:
+    mov r15d, 1
+
+.lld_next:
+    add r14d, [rbp - 48]
+    jmp .lld_entry
+
+.lld_collected:
+    call ls_sort
+
+    xor r14d, r14d
+.lld_print:
+    cmp r14d, [ls_count]
+    jae .lld_printed
+    lea rax, [ls_ptrs]
+    mov rsi, [rax + r14*8]
+    movzx edx, byte [rsi]
+    inc rsi
+    mov edi, r12d
+    call ls_print_entry
+    inc r14d
+    jmp .lld_print
+
+.lld_printed:
+    test byte [ls_flags], 1
+    jnz .lld_close
+    call print_newline
+
+.lld_close:
+    mov edi, r12d
+    mov eax, SYS_CLOSE
+    syscall
+    xor eax, eax
+    test r15d, r15d
+    jz .lld_ret
+    lea rdi, [err_ls_cut]
+    mov esi, err_ls_cut_len
+    call report_error_len
+    mov eax, 1
+
+.lld_ret:
+    add rsp, 24
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ---------- ls_sort ----------
+; Shell sort of ls_ptrs[0 .. ls_count) by entry name (byte order).
+ls_sort:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    lea r15, [ls_ptrs]
+    mov r12d, [ls_count]
+    mov r13d, r12d
+    shr r13d, 1                     ; r13d = gap
+.lss_gap:
+    test r13d, r13d
+    jz .lss_done
+    mov r14d, r13d                  ; r14d = i
+.lss_outer:
+    cmp r14d, r12d
+    jae .lss_next_gap
+    mov rbx, [r15 + r14*8]          ; rbx = entry to place
+    mov r9d, r14d                   ; r9d = j
+.lss_inner:
+    cmp r9d, r13d
+    jb .lss_place
+    mov eax, r9d
+    sub eax, r13d
+    mov rdi, [r15 + rax*8]
+    mov rsi, rbx
+    call ls_name_cmp
+    test eax, eax
+    jle .lss_place
+    mov eax, r9d
+    sub eax, r13d
+    mov rdx, [r15 + rax*8]
+    mov [r15 + r9*8], rdx
+    sub r9d, r13d
+    jmp .lss_inner
+.lss_place:
+    mov [r15 + r9*8], rbx
+    inc r14d
+    jmp .lss_outer
+.lss_next_gap:
+    shr r13d, 1
+    jmp .lss_gap
+.lss_done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ls_name_cmp - rdi, rsi = entries ([type][name\0]); eax <0, 0, >0.
+; Leaf routine: only eax, ecx and edx change.
+ls_name_cmp:
+    xor ecx, ecx
+.lnc_loop:
+    movzx eax, byte [rdi + rcx + 1]
+    movzx edx, byte [rsi + rcx + 1]
+    cmp eax, edx
+    jne .lnc_diff
+    test eax, eax
+    jz .lnc_eq
+    inc ecx
+    jmp .lnc_loop
+.lnc_diff:
+    sub eax, edx
+    ret
+.lnc_eq:
+    xor eax, eax
+    ret
+
+; ---------- ls_print_entry ----------
+; edi = directory fd (or AT_FDCWD), rsi = name, edx = d_type from the
+; directory record (0 if unknown). Prints one entry: "perms size name" and a
+; newline in long format, "name  " otherwise. Links are not followed, and an
+; entry that cannot be examined is shown from its d_type rather than from the
+; data of the previous entry.
+ls_print_entry:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 16
+
+    mov r12d, edi                   ; r12d = dir fd
+    mov rbx, rsi                    ; rbx = name
+    mov r13d, edx                   ; r13d = d_type
+
+    mov edi, r12d
+    mov rsi, rbx
+    lea rdx, [stat_buf]
+    mov r10d, AT_SYMLINK_NOFOLLOW
+    mov eax, SYS_NEWFSTATAT
+    syscall
+    test rax, rax
+    jns .lpe_have
+
+    ; Could not examine it: regular file of unknown size unless d_type says more
+    mov qword [stat_buf + STAT_ST_SIZE], 0
+    mov dword [stat_buf + STAT_ST_MODE], S_IFREG
+    cmp r13d, DT_DIR
+    jne .lpe_not_dir
+    mov dword [stat_buf + STAT_ST_MODE], S_IFDIR
+.lpe_not_dir:
+    cmp r13d, 10                    ; DT_LNK
+    jne .lpe_have
+    mov dword [stat_buf + STAT_ST_MODE], S_IFLNK
+
+.lpe_have:
+    mov r14d, [stat_buf + STAT_ST_MODE]
+
+    test byte [ls_flags], 1
+    jz .lpe_name
+    mov ecx, r14d
+    call print_ls_perms
+    lea rdi, [str_two_spaces]
+    call print_cstring
+    mov rax, [stat_buf + STAT_ST_SIZE]
+    call print_number_9pad
+    lea rdi, [str_space]
+    call print_cstring
+
+.lpe_name:
+    ; Colour: directories blue, links cyan, executables green
+    xor esi, esi                    ; rsi = colour escape, 0 for none
+    mov eax, r14d
+    and eax, S_IFMT
+    cmp eax, S_IFDIR
+    jne .lpe_not_d
+    lea rsi, [ansi_blue]
+    mov edx, ansi_blue_len
+    jmp .lpe_colour_set
+.lpe_not_d:
+    cmp eax, S_IFLNK
+    jne .lpe_not_l
+    lea rsi, [ansi_cyan]
+    mov edx, ansi_cyan_len
+    jmp .lpe_colour_set
+.lpe_not_l:
+    test r14d, S_IXUSR | S_IXGRP | S_IXOTH
+    jz .lpe_colour_set
+    lea rsi, [ansi_green_ls]
+    mov edx, ansi_green_ls_len
+.lpe_colour_set:
+    test byte [ls_flags], 4
+    jnz .lpe_colour_on
+    xor esi, esi
+.lpe_colour_on:
+    mov r13, rsi                    ; r13 = colour escape or 0
+    test r13, r13
+    jz .lpe_print_name
+    mov rdi, r13
+    mov esi, edx
+    call print_string_len
+
+.lpe_print_name:
+    mov rdi, rbx
+    call ls_emit_name
+
+    test r13, r13
+    jz .lpe_after_name
+    lea rdi, [ansi_default]
+    mov esi, ansi_default_len
+    call print_string_len
+
+.lpe_after_name:
+    test byte [ls_flags], 1
+    jz .lpe_short
+
+    ; Long format: show where a link points
+    mov eax, r14d
+    and eax, S_IFMT
+    cmp eax, S_IFLNK
+    jne .lpe_newline
+    mov edi, r12d
+    mov rsi, rbx
+    lea rdx, [ls_link_buf]
+    mov r10d, 4096
+    mov eax, SYS_READLINKAT
+    syscall
+    test rax, rax
+    jle .lpe_newline
+    lea rdi, [ls_link_buf]
+    mov byte [rdi + rax], 0
+    lea rdi, [str_arrow]
+    call print_cstring
+    lea rdi, [ls_link_buf]
+    call ls_emit_name
+.lpe_newline:
+    call print_newline
+    jmp .lpe_done
+
+.lpe_short:
+    lea rdi, [str_two_spaces]
+    call print_cstring
+
+.lpe_done:
+    add rsp, 16
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ---------- ls_emit_name ----------
+; rdi = name. Prints it; on a terminal control bytes become '?'.
+ls_emit_name:
+    test byte [ls_flags], 8
+    jz print_cstring
+    lea rsi, [ls_name_buf]
+    xor ecx, ecx
+.len_loop:
+    movzx eax, byte [rdi + rcx]
+    test al, al
+    jz .len_done
+    cmp ecx, 4095
+    jae .len_done
+    cmp al, 0x20
+    jb .len_bad
+    cmp al, 0x7f
+    jne .len_store
+.len_bad:
+    mov al, '?'
+.len_store:
+    mov [rsi + rcx], al
+    inc ecx
+    jmp .len_loop
+.len_done:
+    mov byte [rsi + rcx], 0
+    mov rdi, rsi
+    jmp print_cstring
+
 
 ; ============================================================================
 ; handler_grep - Simple substring search in a file with color highlighting
+; Status: 0 a line matched, 1 none did, 2 the file could not be read.
 ; ============================================================================
+GREP_LINE_MAX equ 65535
+section .data
+    err_grep_long   db "grep: pattern too long.", 10, 0
+    err_grep_long_len equ $ - err_grep_long - 1
+    err_grep_cut    db "grep: line too long, truncated.", 10, 0
+    err_grep_cut_len equ $ - err_grep_cut - 1
+    grep_bin_pre    db "Binary file ", 0
+    grep_bin_post   db " matches", 10, 0
+section .bss
+    grep_binary     resb 1          ; the file holds NUL bytes: only report a match
+section .text
 handler_grep:
     push rbp
     mov rbp, rsp
@@ -8948,19 +10697,17 @@ handler_grep:
     test rdx, rdx
     jz .grep_usage
 
-    mov r12, rax                    ; r12 = pattern
+    mov r12, rax                    ; r12 = pattern (stays in input_buf)
     mov r13, rdx                    ; r13 = filename
-
-    lea rdi, [grep_pattern_buf]
-    mov rsi, r12
-    call str_copy
-    lea r12, [grep_pattern_buf]
+    mov [rbp - 104], rdx
 
     mov rdi, r12
     call str_len
     mov r14d, eax                   ; r14d = pattern length
     test r14d, r14d
     jz .grep_usage
+    cmp r14d, 255
+    ja .grep_pat_long
 
     mov rdi, r13
     mov esi, O_RDONLY
@@ -8972,15 +10719,21 @@ handler_grep:
     mov ebx, eax                    ; ebx = file descriptor
 
     xor r15d, r15d                  ; line buffer write position
+    mov dword [rbp - 88], 1         ; status: 1 until a line matches
+    mov dword [rbp - 92], 0         ; set once a long line was cut
+    mov byte [grep_binary], 0
 
 .grep_read_chunk:
+    cmp byte [ctrl_c_flag], 0       ; ^C raised by SIGINT stops a long file
+    jne .grep_interrupted
     mov edi, ebx
-    lea rsi, [read_buffer]
-    mov edx, READ_BUF_SIZE
+    lea rsi, [io_buf]
+    mov edx, IO_BUF_SIZE
     mov eax, SYS_READ
     syscall
     test rax, rax
-    jle .grep_flush_last
+    jz .grep_flush_last
+    js .grep_read_err
 
     mov r13d, eax
     xor ecx, ecx
@@ -8989,14 +10742,29 @@ handler_grep:
     cmp ecx, r13d
     jge .grep_read_chunk
 
-    movzx eax, byte [read_buffer + rcx]
+    movzx eax, byte [io_buf + rcx]
     cmp al, 10
     je .grep_end_line
-
-    cmp r15d, 4094
-    jge .grep_skip_byte
+    test al, al
+    jnz .grep_store
+    mov byte [grep_binary], 1       ; NUL byte: binary file
+.grep_store:
+    cmp r15d, GREP_LINE_MAX - 1
+    jge .grep_cut_byte
     mov [grep_line_buf + r15], al
     inc r15d
+    jmp .grep_skip_byte
+
+.grep_cut_byte:
+    ; Keep the first part of an overlong line, say so once
+    cmp dword [rbp - 92], 0
+    jne .grep_skip_byte
+    mov dword [rbp - 92], 1
+    mov [rbp - 80], ecx
+    lea rdi, [err_grep_cut]
+    mov esi, err_grep_cut_len
+    call report_error_len
+    mov ecx, [rbp - 80]
 
 .grep_skip_byte:
     inc ecx
@@ -9013,7 +10781,13 @@ handler_grep:
     mov rdx, r12
     mov ecx, r14d
     call grep_print_highlighted_line
+    test eax, eax
+    jz .grep_line_done
+    mov dword [rbp - 88], 0
+    cmp byte [grep_binary], 0
+    jne .grep_binary_match
 
+.grep_line_done:
     mov ecx, [rbp - 80]
     mov r13d, [rbp - 84]
 
@@ -9032,23 +10806,73 @@ handler_grep:
     mov rdx, r12
     mov ecx, r14d
     call grep_print_highlighted_line
+    test eax, eax
+    jz .grep_close
+    mov dword [rbp - 88], 0
+    cmp byte [grep_binary], 0
+    jne .grep_binary_match
 
 .grep_close:
     mov edi, ebx
     mov eax, SYS_CLOSE
     syscall
+    mov eax, [rbp - 88]
+    cmp dword [rbp - 92], 0         ; a cut line makes the result unreliable
+    je .grep_set_status
+    mov eax, 2
+.grep_set_status:
+    mov [last_exit_status], eax
+    jmp .grep_done
+
+.grep_binary_match:
+    ; Say that the file matched instead of dumping binary data
+    lea rdi, [grep_bin_pre]
+    call print_cstring
+    mov rdi, [rbp - 104]
+    call print_cstring
+    lea rdi, [grep_bin_post]
+    call print_cstring
+    jmp .grep_close
+
+.grep_interrupted:
+    mov byte [ctrl_c_flag], 0
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    mov dword [last_exit_status], 130
+    jmp .grep_done
+
+.grep_read_err:
+    ; EISDIR for a directory, EIO ...
+    mov r12d, eax
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    mov edi, r12d
+    neg edi
+    call print_last_error
+    mov dword [last_exit_status], 2
     jmp .grep_done
 
 .grep_usage:
     lea rdi, [err_grep_usage]
     mov esi, err_grep_usage_len
-    call print_string_len
+    call report_error_len
+    mov dword [last_exit_status], 2
+    jmp .grep_done
+
+.grep_pat_long:
+    lea rdi, [err_grep_long]
+    mov esi, err_grep_long_len
+    call report_error_len
+    mov dword [last_exit_status], 2
     jmp .grep_done
 
 .grep_file_err:
     lea rdi, [err_file_msg]
     mov esi, err_file_len
-    call print_string_len
+    call report_error_len
+    mov dword [last_exit_status], 2
 
 .grep_done:
     add rsp, 72
@@ -9064,6 +10888,9 @@ handler_grep:
 ; ============================================================================
 ; grep_print_highlighted_line - Print line with pattern highlighted
 ; rdi = line, esi = line length, rdx = pattern, ecx = pattern length
+; Returns eax = 1 if the line contains the pattern (and was printed, unless
+; the file is binary), else 0. Prints each stretch of text with one write.
+; Highlighting is only used on an interactive colour terminal.
 ; ============================================================================
 grep_print_highlighted_line:
     push rbp
@@ -9080,79 +10907,88 @@ grep_print_highlighted_line:
     mov r14, rdx
     mov r15d, ecx
 
-    xor ebx, ebx
-.ghl_first_scan:
+    xor ebx, ebx                    ; ebx = scan position
+    mov dword [rbp - 48], 0         ; start of text not yet printed
+    mov dword [rbp - 52], 0         ; 1 once a match was seen
+
+.ghl_scan:
     mov eax, r13d
     sub eax, ebx
     cmp eax, r15d
-    jl .ghl_no_match
+    jl .ghl_end
+
+    movzx eax, byte [r12 + rbx]
+    cmp al, [r14]
+    jne .ghl_next
 
     lea rdi, [r12 + rbx]
     mov rsi, r14
     mov ecx, r15d
     call grep_memcmp
     test eax, eax
-    jz .ghl_found_first
-    inc ebx
-    jmp .ghl_first_scan
+    jnz .ghl_next
 
-.ghl_no_match:
-    jmp .ghl_done
+    ; A match at ebx
+    mov dword [rbp - 52], 1
+    cmp byte [grep_binary], 0
+    jne .ghl_end                    ; binary: one match is all we need
 
-.ghl_found_first:
-    xor ebx, ebx
-
-.ghl_print_loop:
-    cmp ebx, r13d
-    jge .ghl_print_newline
-
-    mov eax, r13d
-    sub eax, ebx
-    cmp eax, r15d
-    jl .ghl_print_rest
-
-    lea rdi, [r12 + rbx]
-    mov rsi, r14
-    mov ecx, r15d
-    call grep_memcmp
-    test eax, eax
-    jz .ghl_print_match
-
-    lea rdi, [r12 + rbx]
-    mov esi, 1
+    ; Text before the match
+    mov esi, ebx
+    sub esi, [rbp - 48]
+    jz .ghl_match_text
+    mov eax, [rbp - 48]
+    lea rdi, [r12 + rax]
     call print_string_len
-    inc ebx
-    jmp .ghl_print_loop
+.ghl_match_text:
+    cmp byte [color_enabled], 0
+    je .ghl_plain_match
+    cmp byte [redir_stdout_active], 0
+    jne .ghl_plain_match
 
-.ghl_print_match:
     lea rdi, [ansi_red_hi]
     mov esi, ansi_red_hi_len
     call print_string_len
+    lea rdi, [r12 + rbx]
+    mov esi, r15d
+    call print_string_len
+    lea rdi, [ansi_default]
+    mov esi, ansi_default_len
+    call print_string_len
+    jmp .ghl_matched
 
+.ghl_plain_match:
     lea rdi, [r12 + rbx]
     mov esi, r15d
     call print_string_len
 
-    lea rdi, [ansi_default]
-    mov esi, ansi_default_len
-    call print_string_len
-
+.ghl_matched:
     add ebx, r15d
-    jmp .ghl_print_loop
+    mov [rbp - 48], ebx
+    jmp .ghl_scan
 
-.ghl_print_rest:
-    mov eax, r13d
-    sub eax, ebx
-    test eax, eax
-    jz .ghl_print_newline
-    lea rdi, [r12 + rbx]
-    mov esi, eax
+.ghl_next:
+    inc ebx
+    jmp .ghl_scan
+
+.ghl_end:
+    cmp dword [rbp - 52], 0
+    je .ghl_done
+    cmp byte [grep_binary], 0
+    jne .ghl_done
+
+    ; Rest of the line, then the newline
+    mov esi, r13d
+    sub esi, [rbp - 48]
+    jz .ghl_newline
+    mov eax, [rbp - 48]
+    lea rdi, [r12 + rax]
     call print_string_len
-
-.ghl_print_newline:
+.ghl_newline:
     call print_newline
 
 .ghl_done:
+    mov eax, [rbp - 52]
     add rsp, 40
     pop r15
     pop r14
@@ -9302,7 +11138,7 @@ handler_uptime:
 .uptime_err:
     lea rdi, [err_file_msg]
     mov esi, err_file_len
-    call print_string_len
+    call report_error_len
 
 .uptime_done:
     add rsp, 32
@@ -9388,7 +11224,7 @@ handler_free:
 .free_err:
     lea rdi, [err_file_msg]
     mov esi, err_file_len
-    call print_string_len
+    call report_error_len
     jmp .free_done
 
 
@@ -9418,6 +11254,8 @@ handler_calc:
 
     mov rdi, r12
     call calc_parse_number
+    cmp rcx, 2
+    je .calc_overflow
     test rcx, rcx
     jz .calc_usage
     mov r13, rax
@@ -9441,7 +11279,7 @@ handler_calc:
     je .calc_have_op
     cmp al, '/'
     je .calc_have_op
-    jmp .calc_print_result
+    jmp .calc_usage                 ; unknown operator or trailing text
 
 .calc_have_op:
     inc r12
@@ -9452,6 +11290,8 @@ handler_calc:
 
     mov rdi, r12
     call calc_parse_number
+    cmp rcx, 2
+    je .calc_overflow
     test rcx, rcx
     jz .calc_usage
     mov r15, rax
@@ -9469,22 +11309,30 @@ handler_calc:
 
 .calc_add:
     add r13, r15
+    jo .calc_overflow
     jmp .calc_loop
 
 .calc_sub:
     sub r13, r15
+    jo .calc_overflow
     jmp .calc_loop
 
 .calc_mul:
-    mov rax, r13
-    imul r15
-    mov r13, rax
+    imul r13, r15
+    jo .calc_overflow
     jmp .calc_loop
 
 .calc_div:
     test r15, r15
     jz .calc_div_zero
 
+    ; INT64_MIN / -1 does not fit and would raise #DE
+    cmp r15, -1
+    jne .calc_do_div
+    mov rax, 0x8000000000000000
+    cmp r13, rax
+    je .calc_overflow
+.calc_do_div:
     mov rax, r13
     cqo
     idiv r15
@@ -9508,13 +11356,19 @@ handler_calc:
 .calc_div_zero:
     lea rdi, [err_div_zero]
     mov esi, err_div_zero_len
-    call print_string_len
+    call report_error_len
+    jmp .calc_done
+
+.calc_overflow:
+    lea rdi, [err_overflow]
+    mov esi, err_overflow_len
+    call report_error_len
     jmp .calc_done
 
 .calc_usage:
     lea rdi, [err_calc_usage]
     mov esi, err_calc_usage_len
-    call print_string_len
+    call report_error_len
 
 .calc_done:
     add rsp, 40
@@ -9530,70 +11384,83 @@ handler_calc:
 ; ============================================================================
 ; calc_parse_number - Parse a signed decimal integer from string
 ; rdi = pointer to string
-; Returns: rax = number, rdx = ptr after number, rcx = 1 if ok, 0 if error
+; Returns: rax = number, rdx = ptr after number,
+;          rcx = 1 if ok, 0 if no number there, 2 if it does not fit in 64 bits
 ; ============================================================================
 calc_parse_number:
-    push rbx
-    push r12
-
-    mov rax, rdi
+    mov r8, rdi
 .cpn_skip:
-    cmp byte [rax], ' '
+    cmp byte [r8], ' '
     jne .cpn_check_sign
-    inc rax
+    inc r8
     jmp .cpn_skip
 
 .cpn_check_sign:
-    xor r12d, r12d
-    cmp byte [rax], '-'
+    xor r11d, r11d                  ; r11d = 1 for a leading '-'
+    cmp byte [r8], '-'
     jne .cpn_check_plus
-    mov r12d, 1
-    inc rax
+    mov r11d, 1
+    inc r8
     jmp .cpn_digits
 
 .cpn_check_plus:
-    cmp byte [rax], '+'
+    cmp byte [r8], '+'
     jne .cpn_digits
-    inc rax
+    inc r8
 
 .cpn_digits:
-    xor rbx, rbx
-    xor ecx, ecx
+    xor r9d, r9d                    ; r9 = magnitude
+    xor r10d, r10d                  ; r10d = digits seen
 
 .cpn_digit_loop:
-    movzx edx, byte [rax]
-    sub dl, '0'
-    cmp dl, 9
+    movzx esi, byte [r8]
+    sub esi, '0'
+    cmp esi, 9
     ja .cpn_done_digits
-    imul rbx, 10
-    movzx edx, dl
-    add rbx, rdx
-    inc ecx
-    inc rax
+    mov rax, r9
+    mov ecx, 10
+    mul rcx
+    jc .cpn_overflow
+    add rax, rsi
+    jc .cpn_overflow
+    mov r9, rax
+    inc r10d
+    inc r8
     jmp .cpn_digit_loop
 
 .cpn_done_digits:
-    test ecx, ecx
+    test r10d, r10d
     jz .cpn_error
 
-    test r12d, r12d
+    ; The magnitude may reach 2^63 only for a negative number
+    mov rax, 0x8000000000000000
+    test r11d, r11d
     jz .cpn_positive
-    neg rbx
+    cmp r9, rax
+    ja .cpn_overflow
+    neg r9
+    jmp .cpn_ok
 
 .cpn_positive:
-    mov rdx, rax
-    mov rax, rbx
+    cmp r9, rax
+    jae .cpn_overflow
+
+.cpn_ok:
+    mov rax, r9
+    mov rdx, r8
     mov ecx, 1
-    pop r12
-    pop rbx
+    ret
+
+.cpn_overflow:
+    xor eax, eax
+    mov rdx, r8
+    mov ecx, 2
     ret
 
 .cpn_error:
     xor eax, eax
     xor edx, edx
     xor ecx, ecx
-    pop r12
-    pop rbx
     ret
 
 
@@ -9602,46 +11469,342 @@ calc_parse_number:
 ; ============================================================================
 
 ; ============================================================================
+; Prompt
+;
+; print_prompt runs once per command. It prints the status hint and the OSC
+; marks, renders the visible prompt ("user@host:/cwd (branch)$ ") into
+; prompt_buf and records how many terminal columns it covers
+; (prompt_total_len). The redraw that follows every keystroke only replays
+; prompt_buf, so typing costs no getcwd, no .git lookup and no marks.
+; Everything shown from outside the shell (user, host, directory, branch)
+; goes through pb_text, which replaces control bytes so a hostile name cannot
+; talk to the terminal.
+; ============================================================================
+%define PB_CAP 6000
+section .bss
+    prompt_buf          resb 6144
+    prompt_len          resd 1
+    osc7_buf            resb 12800  ; "file://host/path" with every byte escaped
+section .data
+    prompt_exit_pre_plain  db " [", 0
+    prompt_exit_post_plain db "]", 0
+    pb_git_color        db 27, "[33m"
+    pb_git_color_len    equ $ - pb_git_color
+    pb_git_open         db " (", 0
+    pb_git_close        db ")", 0
+    wrap_nudge          db " ", 13      ; forces the wrap of a full last column
+section .text
+
+; pb_reset - start an empty prompt
+pb_reset:
+    mov dword [prompt_len], 0
+    mov dword [prompt_total_len], 0
+    ret
+
+; pb_color - append rdi/esi (an escape sequence, zero columns) unless colors
+; are off
+pb_color:
+    cmp byte [color_enabled], 0
+    je .pbc_ret
+    mov eax, [prompt_len]
+    mov ecx, eax
+    add ecx, esi
+    cmp ecx, PB_CAP
+    ja .pbc_ret
+    lea rdx, [prompt_buf]
+    add rdx, rax
+    mov ecx, esi
+.pbc_loop:
+    test ecx, ecx
+    jz .pbc_done
+    mov al, [rdi]
+    mov [rdx], al
+    inc rdi
+    inc rdx
+    dec ecx
+    jmp .pbc_loop
+.pbc_done:
+    add [prompt_len], esi
+.pbc_ret:
+    ret
+
+; pb_text - append the NUL-terminated string at rdi as visible text.
+; Control bytes become '?'. Adds the columns it covers to prompt_total_len.
+pb_text:
+    push rbx
+    mov eax, [prompt_len]
+    mov ebx, eax                    ; where this piece starts
+    lea rdx, [prompt_buf]
+    add rdx, rax
+.pbt_loop:
+    movzx ecx, byte [rdi]
+    test cl, cl
+    jz .pbt_done
+    cmp eax, PB_CAP
+    jae .pbt_done
+    cmp cl, 0x20
+    jb .pbt_bad
+    cmp cl, 0x7F
+    jne .pbt_put
+.pbt_bad:
+    mov cl, '?'
+.pbt_put:
+    mov [rdx], cl
+    inc rdx
+    inc rdi
+    inc eax
+    jmp .pbt_loop
+.pbt_done:
+    mov [prompt_len], eax
+    sub eax, ebx
+    jz .pbt_ret
+    lea rdi, [prompt_buf]
+    add rdi, rbx
+    mov esi, eax
+    call utf8_cols
+    add [prompt_total_len], eax
+.pbt_ret:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; utf8_cols - terminal columns taken by esi bytes of UTF-8 text at rdi:
+; one per code point, two for East Asian wide characters and emoji, none for
+; combining marks. A byte that is not valid UTF-8 counts as one.
+; Returns eax. Clobbers ecx, edx, esi, r8-r10.
+; ----------------------------------------------------------------------------
+section .data
+    align 4
+utf8_width_table:                   ; first, last, columns
+    dd 0x0300, 0x036F, 0
+    dd 0x0483, 0x0489, 0
+    dd 0x0591, 0x05BD, 0
+    dd 0x0610, 0x061A, 0
+    dd 0x064B, 0x065F, 0
+    dd 0x1AB0, 0x1AFF, 0
+    dd 0x1DC0, 0x1DFF, 0
+    dd 0x200B, 0x200F, 0
+    dd 0x20D0, 0x20FF, 0
+    dd 0xFE00, 0xFE0F, 0
+    dd 0xFE20, 0xFE2F, 0
+    dd 0xE0100, 0xE01EF, 0
+    dd 0x1100, 0x115F, 2
+    dd 0x2E80, 0x303E, 2
+    dd 0x3041, 0x33FF, 2
+    dd 0x3400, 0x4DBF, 2
+    dd 0x4E00, 0x9FFF, 2
+    dd 0xA000, 0xA4CF, 2
+    dd 0xAC00, 0xD7A3, 2
+    dd 0xF900, 0xFAFF, 2
+    dd 0xFE30, 0xFE4F, 2
+    dd 0xFF00, 0xFF60, 2
+    dd 0xFFE0, 0xFFE6, 2
+    dd 0x1F300, 0x1F64F, 2
+    dd 0x1F680, 0x1F6FF, 2
+    dd 0x1F900, 0x1F9FF, 2
+    dd 0x20000, 0x3FFFD, 2
+    dd 0, 0, 0
+section .text
+utf8_cols:
+    xor eax, eax                    ; columns
+    xor ecx, ecx                    ; byte index
+.uc_loop:
+    cmp ecx, esi
+    jae .uc_ret
+    movzx edx, byte [rdi + rcx]
+    inc ecx
+    cmp dl, 0xC2
+    jb .uc_one                      ; ASCII, or a stray continuation byte
+    mov r9d, 1
+    cmp dl, 0xE0
+    jb .uc_lead
+    mov r9d, 2
+    cmp dl, 0xF0
+    jb .uc_lead
+    mov r9d, 3
+    cmp dl, 0xF5
+    jae .uc_one
+    and edx, 0x07
+    jmp .uc_cont
+.uc_lead:
+    cmp r9d, 1
+    jne .uc_lead3
+    and edx, 0x1F
+    jmp .uc_cont
+.uc_lead3:
+    and edx, 0x0F
+.uc_cont:
+    test r9d, r9d
+    jz .uc_have
+    cmp ecx, esi
+    jae .uc_have                    ; cut off: judge what we have
+    movzx r8d, byte [rdi + rcx]
+    mov r10d, r8d
+    and r10d, 0xC0
+    cmp r10d, 0x80
+    jne .uc_have
+    shl edx, 6
+    and r8d, 0x3F
+    or edx, r8d
+    inc ecx
+    dec r9d
+    jmp .uc_cont
+.uc_have:
+    cmp edx, 0x300
+    jb .uc_one
+    lea r8, [utf8_width_table]
+.uc_tab:
+    mov r9d, [r8]
+    test r9d, r9d
+    jz .uc_one                      ; not in the table: one column
+    cmp edx, r9d
+    jb .uc_next
+    cmp edx, [r8 + 4]
+    ja .uc_next
+    add eax, [r8 + 8]
+    jmp .uc_loop
+.uc_next:
+    add r8, 12
+    jmp .uc_tab
+.uc_one:
+    inc eax
+    jmp .uc_loop
+.uc_ret:
+    ret
+
+; cur_cols - eax = terminal width in columns (huge when unknown, so nothing
+; is ever taken for a wrapped row)
+cur_cols:
+    movzx eax, word [term_cols]
+    test eax, eax
+    jnz .cc_ret
+    mov eax, 0x7FFFFFFF
+.cc_ret:
+    ret
+
+; osc7_put - append the NUL-terminated string at rsi to the OSC 7 URI at rdi,
+; percent-encoding every byte outside [A-Za-z0-9/._~-]. Advances rdi.
+osc7_put:
+.op_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .op_ret
+    inc rsi
+    cmp al, '/'
+    je .op_raw
+    cmp al, '.'
+    je .op_raw
+    cmp al, '_'
+    je .op_raw
+    cmp al, '~'
+    je .op_raw
+    cmp al, '-'
+    je .op_raw
+    cmp al, '0'
+    jb .op_esc
+    cmp al, '9'
+    jbe .op_raw
+    cmp al, 'A'
+    jb .op_esc
+    cmp al, 'Z'
+    jbe .op_raw
+    cmp al, 'a'
+    jb .op_esc
+    cmp al, 'z'
+    ja .op_esc
+.op_raw:
+    mov [rdi], al
+    inc rdi
+    jmp .op_loop
+.op_esc:
+    mov byte [rdi], '%'
+    mov ecx, eax
+    shr ecx, 4
+    add cl, '0'
+    cmp cl, '9'
+    jbe .op_hi
+    add cl, 7
+.op_hi:
+    mov [rdi + 1], cl
+    and eax, 15
+    add al, '0'
+    cmp al, '9'
+    jbe .op_lo
+    add al, 7
+.op_lo:
+    mov [rdi + 2], al
+    add rdi, 3
+    jmp .op_loop
+.op_ret:
+    ret
+
 ; ============================================================================
 ; emit_osc7_cwd - emit ESC]7;file://host/path BEL so modern terminals
 ; (Ghostty, WezTerm, iTerm2, kitty, Warp, VS Code) track the shell's cwd.
+; Host and path are percent-encoded; the path is the one build_prompt_line
+; left in path_buf.
 ; ============================================================================
 emit_osc7_cwd:
     push rbp
     mov rbp, rsp
     sub rsp, 16
 
-    lea rdi, [osc7_prefix]
-    mov esi, osc7_prefix_len
+    cmp byte [path_buf], '/'
+    jne .osc7_done                  ; getcwd failed: nothing to report
+
+    lea rdi, [osc7_buf]
+    lea rsi, [osc7_prefix]
+.osc7_pre:
+    mov al, [rsi]
+    test al, al
+    jz .osc7_host
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .osc7_pre
+.osc7_host:
+    lea rsi, [cached_hostname]
+    call osc7_put
+    lea rsi, [path_buf]
+    call osc7_put
+    mov byte [rdi], 7               ; BEL
+    inc rdi
+    lea rsi, [osc7_buf]
+    sub rdi, rsi
+    mov esi, edi
+    lea rdi, [osc7_buf]
     call print_string_len
 
-    lea rdi, [cached_hostname]
-    call print_cstring
-
-    lea rdi, [path_buf]
-    mov esi, MAX_PATH_BUF
-    mov eax, SYS_GETCWD
-    syscall
-    test rax, rax
-    jle .osc7_done
-
-    lea rdi, [path_buf]
-    call print_cstring
-
 .osc7_done:
-    lea rdi, [osc7_bel]
-    call print_cstring
-
     leave
     ret
 
+; str_copy_cap - copy at most edx bytes of the string at rsi to rdi, then NUL
+str_copy_cap:
+.scc_loop:
+    test edx, edx
+    jz .scc_end
+    mov al, [rsi]
+    test al, al
+    jz .scc_end
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    dec edx
+    jmp .scc_loop
+.scc_end:
+    mov byte [rdi], 0
+    ret
+
+; ============================================================================
 ; init_prompt_cache - Cache username and hostname at startup
+; Both are cut to 63 bytes so a huge $USER cannot spill into its neighbours.
 ; ============================================================================
 init_prompt_cache:
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 16
+    sub rsp, 8
 
     ; --- Cache username from $USER ---
     lea rdi, [str_user]
@@ -9651,13 +11814,15 @@ init_prompt_cache:
 
     lea rdi, [cached_username]
     mov rsi, rax
-    call str_copy
+    mov edx, 63
+    call str_copy_cap
     jmp .ipc_hostname
 
 .ipc_default_user:
     lea rdi, [cached_username]
     lea rsi, [str_unknown_user]
-    call str_copy
+    mov edx, 63
+    call str_copy_cap
 
 .ipc_hostname:
     lea rdi, [uname_buf]
@@ -9668,35 +11833,25 @@ init_prompt_cache:
 
     lea rdi, [cached_hostname]
     lea rsi, [uname_buf + 65]
-    call str_copy
-    jmp .ipc_init_jobs
+    mov edx, 63
+    call str_copy_cap
+    jmp .ipc_done
 
 .ipc_default_host:
     lea rdi, [cached_hostname]
     lea rsi, [str_unknown_host]
-    call str_copy
+    mov edx, 63
+    call str_copy_cap
 
-.ipc_init_jobs:
-    mov dword [job_count], 0
-    mov dword [current_theme], 0    ; default theme
-
-    lea rdi, [job_pids]
-    xor eax, eax
-    mov ecx, JOB_MAX
-.ipc_clear_jobs:
-    mov qword [rdi], 0
-    add rdi, 8
-    dec ecx
-    jnz .ipc_clear_jobs
-
-    add rsp, 16
+.ipc_done:
+    add rsp, 8
     pop rbx
     pop rbp
     ret
 
 
 ; ============================================================================
-; print_prompt - Print themed prompt (user@host:path$)
+; print_prompt - Print the themed prompt (user@host:path$) for a new command
 ; ============================================================================
 print_prompt:
     push rbp
@@ -9705,21 +11860,17 @@ print_prompt:
     push r12
     sub rsp, 16
 
-    movzx r12d, byte [prompt_redraw] ; 1 = redraw while typing
-    mov byte [prompt_redraw], 0
+    call pb_reset
 
     ; Inside an unfinished if/while/for block: short "> " prompt
     cmp byte [ash_cont], 0
     je .pp_primary
     lea rdi, [ash_ps2]
-    call print_cstring
-    mov dword [prompt_total_len], 2
+    call pb_text
+    xor edi, edi                    ; no OSC 133 B for the continuation prompt
+    call prompt_show
     jmp .pp_ret
 .pp_primary:
-    ; Redraw while typing: skip the lines printed above the prompt
-    test r12d, r12d
-    jnz .pp_no_exit
-
     ; "took 2.31s, peak 45.2 MB" after slow commands
     call print_cmd_stats
 
@@ -9728,128 +11879,165 @@ print_prompt:
     test eax, eax
     jz .pp_no_exit
     lea rdi, [exit_prompt_pre]
+    lea rsi, [prompt_exit_pre_plain]
+    cmp byte [color_enabled], 0
+    cmove rdi, rsi
     call print_cstring
     mov eax, [last_exit_status]
     call print_number
     lea rdi, [exit_prompt_post]
+    lea rsi, [prompt_exit_post_plain]
+    cmp byte [color_enabled], 0
+    cmove rdi, rsi
     call print_cstring
     call print_newline
 .pp_no_exit:
 
-    ; OSC 133 A — mark the start of a new prompt region
+    call build_prompt_line
+
+    cmp byte [osc_enabled], 0
+    je .pp_no_marks
+    ; OSC 133 A - mark the start of a new prompt region
     lea rdi, [osc133_a]
     call print_cstring
-
-    ; OSC 7 — emit cwd for terminal integration
+    ; OSC 7 - emit cwd for terminal integration
     call emit_osc7_cwd
+.pp_no_marks:
+    mov edi, 1
+    call prompt_show
+.pp_ret:
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
+    ret
 
-    mov eax, [current_theme]
-    mov r12d, eax
+; prompt_show - print prompt_buf, then (edi != 0) the OSC 133 B mark, and
+; note which row the cursor is on. A prompt that ends exactly at the right
+; margin leaves a pending wrap; resolve it so later cursor moves are exact.
+prompt_show:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
 
-    cmp r12d, 2
-    je .pp_classic
-
-    ; --- Print user@host portion ---
-    mov eax, r12d
-    imul eax, THEME_ENTRY_SIZE
-    lea rbx, [theme_table + rax]
-
-    mov rdi, [rbx]
-    mov esi, [rbx + 8]
+    mov ebx, edi
+    lea rdi, [prompt_buf]
+    mov esi, [prompt_len]
     call print_string_len
 
-    lea rdi, [cached_username]
-    call print_cstring
-
-    lea rdi, [str_at]
-    call print_cstring
-
-    lea rdi, [cached_hostname]
-    call print_cstring
-
-    mov rdi, [rbx + 32]
-    mov esi, [rbx + 40]
-    call print_string_len
-
-    lea rdi, [str_colon]
-    call print_cstring
-
-    ; --- Print path portion ---
-    mov rdi, [rbx + 16]
-    mov esi, [rbx + 24]
-    call print_string_len
-
-    lea rdi, [path_buf]
-    mov esi, MAX_PATH_BUF
-    mov eax, SYS_GETCWD
-    syscall
-
-    lea rdi, [path_buf]
-    call print_cstring
-
-    mov rdi, [rbx + 32]
-    mov esi, [rbx + 40]
-    call print_string_len
-
-    mov rdi, [rbx + 48]
-    mov esi, [rbx + 56]
-    call print_string_len
-
-    ; Calculate prompt_total_len
-    lea rdi, [cached_username]
-    call str_len
-    mov ebx, eax
-
-    lea rdi, [cached_hostname]
-    call str_len
-    add ebx, eax
-    add ebx, 2                      ; "@" + ":"
-
-    lea rdi, [path_buf]
-    call str_len
-    add ebx, eax
-    add ebx, 2                      ; "$ " (symbol always 2 chars)
-
-    mov [prompt_total_len], ebx
-    jmp .pp_done
-
-.pp_classic:
-    mov eax, r12d
-    imul eax, THEME_ENTRY_SIZE
-    lea rbx, [theme_table + rax]
-
-    mov rdi, [rbx + 16]
-    mov esi, [rbx + 24]
-    call print_string_len
-
-    lea rdi, [path_buf]
-    mov esi, MAX_PATH_BUF
-    mov eax, SYS_GETCWD
-    syscall
-
-    lea rdi, [path_buf]
-    call print_cstring
-
-    mov rdi, [rbx + 32]
-    mov esi, [rbx + 40]
-    call print_string_len
-
-    mov rdi, [rbx + 48]
-    mov esi, [rbx + 56]
-    call print_string_len
-
-    lea rdi, [path_buf]
-    call str_len
-    add eax, 2
-    mov [prompt_total_len], eax
-
-.pp_done:
-    call print_git_branch_if_any
-
-    ; OSC 133 B — prompt rendering finished, command entry begins
+    test ebx, ebx
+    jz .ps_cursor
+    cmp byte [osc_enabled], 0
+    je .ps_cursor
+    ; OSC 133 B - prompt rendering finished, command entry begins
     lea rdi, [osc133_b]
     call print_cstring
-.pp_ret:
+.ps_cursor:
+    call cur_cols
+    mov ecx, eax
+    mov eax, [prompt_total_len]
+    xor edx, edx
+    div ecx
+    mov [cursor_row], eax
+    test edx, edx
+    jnz .ps_ret
+    test eax, eax
+    jz .ps_ret
+    lea rdi, [wrap_nudge]
+    mov esi, 2
+    call print_string_len
+.ps_ret:
+    add rsp, 8
+    pop rbx
+    pop rbp
+    ret
+
+; print_prompt_line - replay the prompt of the current line (for redraws)
+print_prompt_line:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    lea rdi, [prompt_buf]
+    mov esi, [prompt_len]
+    call print_string_len
+    leave
+    ret
+
+; ----------------------------------------------------------------------------
+; build_prompt_line - render the prompt into prompt_buf for the current theme
+; Leaves the working directory in path_buf (OSC 7 uses it).
+; ----------------------------------------------------------------------------
+build_prompt_line:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 16
+
+    mov r12d, [current_theme]
+    mov eax, r12d
+    imul eax, THEME_ENTRY_SIZE
+    lea rbx, [theme_table + rax]
+
+    lea rdi, [path_buf]
+    mov esi, MAX_PATH_BUF
+    mov eax, SYS_GETCWD
+    syscall
+    test rax, rax
+    jg .bpl_have_cwd
+    mov word [path_buf], 0x003F     ; "?" when the directory is gone
+.bpl_have_cwd:
+
+    cmp r12d, 2
+    je .bpl_path
+
+    ; --- user@host: ---
+    mov rdi, [rbx]
+    mov esi, [rbx + 8]
+    call pb_color
+    lea rdi, [cached_username]
+    call pb_text
+    lea rdi, [str_at]
+    call pb_text
+    lea rdi, [cached_hostname]
+    call pb_text
+    mov rdi, [rbx + 32]
+    mov esi, [rbx + 40]
+    call pb_color
+    lea rdi, [str_colon]
+    call pb_text
+
+.bpl_path:
+    mov rdi, [rbx + 16]
+    mov esi, [rbx + 24]
+    call pb_color
+    lea rdi, [path_buf]
+    call pb_text
+    mov rdi, [rbx + 32]
+    mov esi, [rbx + 40]
+    call pb_color
+
+    ; --- " (branch)" in a repository ---
+    call read_git_branch
+    cmp byte [git_branch], 0
+    je .bpl_symbol
+    lea rdi, [pb_git_color]
+    mov esi, pb_git_color_len
+    call pb_color
+    lea rdi, [pb_git_open]
+    call pb_text
+    lea rdi, [git_branch]
+    call pb_text
+    lea rdi, [pb_git_close]
+    call pb_text
+    lea rdi, [ansi_default]
+    mov esi, ansi_default_len
+    call pb_color
+
+.bpl_symbol:
+    mov rdi, [rbx + 48]
+    call pb_text
 
     add rsp, 16
     pop r12
@@ -9858,9 +12046,10 @@ print_prompt:
     ret
 
 ; ============================================================================
-; read_git_branch - walk up from cwd looking for .git/HEAD; on success,
-; write branch name (or short SHA) into git_branch + NUL. On failure,
-; git_branch[0] = 0.
+; read_git_branch - walk up from cwd to the first directory that has a .git,
+; read its HEAD and put the branch name (or short SHA) in git_branch + NUL.
+; A ".git" file ("gitdir: PATH", as in worktrees and submodules) is followed.
+; On failure git_branch[0] = 0.
 ; ============================================================================
 read_git_branch:
     push rbp
@@ -9891,16 +12080,20 @@ read_git_branch:
     lea rsi, [str_git_head]
     call str_copy
 
-    ; Open the candidate file
+    ; Open the candidate file (O_RDONLY | O_CLOEXEC)
     lea rdi, [git_scratch_path]
-    mov esi, O_RDONLY
+    mov esi, 0x80000
     xor edx, edx
     mov eax, SYS_OPEN
     syscall
     test rax, rax
     jns .rgb_opened
+    cmp rax, -20                    ; ENOTDIR: ".git" is a file here
+    je .rgb_gitfile
+    cmp rax, -2                     ; ENOENT: not in this directory
+    jne .rgb_done                   ; anything else (EACCES...): give up
 
-    ; Not here — truncate git_scratch_path at last '/' and retry
+    ; Not here - truncate git_scratch_path at last '/' and retry
     mov byte [git_scratch_path + r12], 0
     mov r13d, r12d
     test r13d, r13d
@@ -9921,6 +12114,81 @@ read_git_branch:
     mov r12d, r13d
     jmp .rgb_try_here
 
+.rgb_gitfile:
+    ; "<dir>/.git" is a plain file: read "gitdir: PATH" from it
+    mov byte [git_scratch_path + r12 + 5], 0
+    lea rdi, [git_scratch_path]
+    mov esi, 0x80000
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .rgb_done
+    mov ebx, eax
+    mov edi, ebx
+    lea rsi, [git_head_buf]
+    mov edx, 500
+    mov eax, SYS_READ
+    syscall
+    mov r14d, eax
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    test r14d, r14d
+    jle .rgb_done
+    mov byte [git_head_buf + r14], 0
+    lea rdi, [git_head_buf]
+    lea rsi, [str_gitdir_prefix]
+    call str_startswith
+    test eax, eax
+    jz .rgb_done
+
+    ; The path ends at the line break. Relative paths start at <dir>.
+    lea rsi, [git_head_buf + 8]
+    xor ecx, ecx
+.rgb_gd_len:
+    movzx eax, byte [rsi + rcx]
+    test al, al
+    jz .rgb_gd_end
+    cmp al, 10
+    je .rgb_gd_end
+    cmp al, 13
+    je .rgb_gd_end
+    inc ecx
+    jmp .rgb_gd_len
+.rgb_gd_end:
+    test ecx, ecx
+    jz .rgb_done
+    lea rdi, [git_scratch_path]
+    cmp byte [rsi], '/'
+    je .rgb_gd_copy
+    lea eax, [rcx + r12 + 8]        ; <dir> + "/" + path + "/HEAD" must fit
+    cmp eax, 4090
+    ja .rgb_done
+    add rdi, r12                    ; <dir> + "/" + relative path
+    mov byte [rdi], '/'
+    inc rdi
+.rgb_gd_copy:
+    xor edx, edx
+.rgb_gd_cp:
+    cmp edx, ecx
+    jae .rgb_gd_done
+    mov al, [rsi + rdx]
+    mov [rdi + rdx], al
+    inc edx
+    jmp .rgb_gd_cp
+.rgb_gd_done:
+    add rdi, rcx
+    lea rsi, [str_head_name]
+    call str_copy
+    lea rdi, [git_scratch_path]
+    mov esi, 0x80000
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .rgb_done
+
 .rgb_opened:
     mov ebx, eax                        ; fd
     mov edi, ebx
@@ -9937,15 +12205,41 @@ read_git_branch:
     jle .rgb_done
     mov byte [git_head_buf + r14], 0
 
-    ; If starts with "ref: refs/heads/", copy branch name; else copy
-    ; first 8 chars of SHA for a detached HEAD.
+    ; "ref: refs/heads/NAME" shows NAME; any other ref shows its last path
+    ; component; a bare SHA (detached HEAD) shows its first 8 characters.
     lea rsi, [str_ref_prefix]
     lea rdi, [git_head_buf]
     call str_startswith
     test eax, eax
-    jz .rgb_detached
-
+    jz .rgb_other_ref
     lea rsi, [git_head_buf + 16]       ; skip prefix
+    jmp .rgb_copy_ref
+
+.rgb_other_ref:
+    lea rdi, [git_head_buf]
+    lea rsi, [str_ref_any]
+    call str_startswith
+    test eax, eax
+    jz .rgb_detached
+    lea rsi, [git_head_buf + 5]
+    mov rdx, rsi                        ; start of the last component
+.rgb_last:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .rgb_last_done
+    cmp al, 10
+    je .rgb_last_done
+    cmp al, 13
+    je .rgb_last_done
+    inc rsi
+    cmp al, '/'
+    jne .rgb_last
+    mov rdx, rsi
+    jmp .rgb_last
+.rgb_last_done:
+    mov rsi, rdx
+
+.rgb_copy_ref:
     lea rdi, [git_branch]
     xor ecx, ecx
 .rgb_copy_branch:
@@ -9993,6 +12287,12 @@ read_git_branch:
     pop rbp
     ret
 
+section .data
+    str_gitdir_prefix   db "gitdir: ", 0
+    str_head_name       db "/HEAD", 0
+    str_ref_any         db "ref: ", 0
+section .text
+
 ; str_startswith(rdi=haystack, rsi=prefix) -> eax=1 if haystack starts with prefix
 str_startswith:
     xor eax, eax
@@ -10011,35 +12311,6 @@ str_startswith:
     ret
 .ssw_no:
     xor eax, eax
-    ret
-
-; ============================================================================
-; print_git_branch_if_any - emit " (branch)" in yellow if cwd is in a repo
-; ============================================================================
-print_git_branch_if_any:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 16
-
-    call read_git_branch
-    cmp byte [git_branch], 0
-    je .pgb_done
-
-    lea rdi, [git_prompt_pre]
-    call print_cstring
-    lea rdi, [git_branch]
-    call print_cstring
-    lea rdi, [git_prompt_post]
-    call print_cstring
-
-    ; " (" + branch + ")" is on screen too: keep the cursor math right
-    lea rdi, [git_branch]
-    call str_len
-    add eax, 3
-    add [prompt_total_len], eax
-
-.pgb_done:
-    leave
     ret
 
 ; ============================================================================
@@ -10157,7 +12428,7 @@ handler_theme:
     jz .hth_set_classic
 
     lea rdi, [theme_unknown_msg]
-    call print_cstring
+    call report_error_cstr
     jmp .hth_done
 
 .hth_set_default:
@@ -10204,6 +12475,304 @@ handler_theme:
 
 
 ; ============================================================================
+; Jobs. job_pids[slot] is the pid whose exit status counts (the last stage of
+; a pipeline), job_pgids[slot] the job's process group (0 when it shares the
+; shell's group), job_state[slot] JOB_RUNNING or JOB_STOPPED and job_cmds the
+; command text. Jobs are numbered by their position among the used slots.
+; ============================================================================
+section .bss
+    job_pgids           resq JOB_MAX
+    job_state           resb JOB_MAX
+section .data
+    jobs_stopped_msg    db " Stopped  ", 0
+section .text
+
+; job_slots_free() -> eax = number of free slots, after dropping finished jobs
+job_slots_free:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    call reap_finished_jobs
+    xor eax, eax
+    xor ecx, ecx
+.jsf_loop:
+    cmp ecx, JOB_MAX
+    jge .jsf_done
+    cmp qword [job_pids + rcx*8], 0
+    jne .jsf_next
+    inc eax
+.jsf_next:
+    inc ecx
+    jmp .jsf_loop
+.jsf_done:
+    leave
+    ret
+
+; job_add(edi = pid, esi = process group or 0, edx = JOB_*, rcx = command text
+; or 0 for input_buf) -> eax = slot or -1
+job_add:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    mov r12d, edi
+    mov r13d, esi
+    mov r14d, edx
+    mov r15, rcx
+    call reap_finished_jobs
+    xor ebx, ebx
+.ja_find:
+    cmp ebx, JOB_MAX
+    jge .ja_full
+    cmp qword [job_pids + rbx*8], 0
+    je .ja_found
+    inc ebx
+    jmp .ja_find
+.ja_found:
+    mov eax, r12d
+    mov [job_pids + rbx*8], rax
+    mov eax, r13d
+    mov [job_pgids + rbx*8], rax
+    mov eax, r14d
+    mov [job_state + rbx], al
+
+    mov eax, ebx
+    imul eax, JOB_CMD_SIZE
+    lea rdi, [job_cmds + rax]
+    lea rsi, [input_buf]
+    test r15, r15
+    cmovnz rsi, r15
+    xor edx, edx
+.ja_copy:
+    cmp edx, JOB_CMD_SIZE - 1
+    jge .ja_copied
+    movzx eax, byte [rsi + rdx]
+    test al, al
+    jz .ja_copied
+    mov [rdi + rdx], al
+    inc edx
+    jmp .ja_copy
+.ja_copied:
+    mov byte [rdi + rdx], 0
+    inc dword [job_count]
+    mov eax, ebx
+    jmp .ja_ret
+.ja_full:
+    mov eax, -1
+.ja_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; job_free(edi = slot) - forget a job
+job_free:
+    cmp qword [job_pids + rdi*8], 0
+    je .jf_ret
+    mov qword [job_pids + rdi*8], 0
+    mov qword [job_pgids + rdi*8], 0
+    mov byte [job_state + rdi], 0
+    dec dword [job_count]
+.jf_ret:
+    ret
+
+; job_ordinal(edi = slot) -> eax = its number as 'jobs' shows it (1-based)
+job_ordinal:
+    xor eax, eax
+    xor ecx, ecx
+.jo_loop:
+    cmp qword [job_pids + rcx*8], 0
+    je .jo_next
+    inc eax
+.jo_next:
+    cmp ecx, edi
+    jae .jo_done
+    inc ecx
+    cmp ecx, JOB_MAX
+    jl .jo_loop
+.jo_done:
+    ret
+
+; job_find(edi = job number) -> eax = slot, or -1 when there is no such job
+job_find:
+    xor eax, eax                    ; eax = number of used slots seen
+    xor ecx, ecx
+.jfind_loop:
+    cmp ecx, JOB_MAX
+    jge .jfind_none
+    cmp qword [job_pids + rcx*8], 0
+    je .jfind_next
+    inc eax
+    cmp eax, edi
+    je .jfind_found
+.jfind_next:
+    inc ecx
+    jmp .jfind_loop
+.jfind_found:
+    mov eax, ecx
+    ret
+.jfind_none:
+    mov eax, -1
+    ret
+
+; job_parse_number(rdi = text) -> eax = job number (1-255), 0 if not one
+job_parse_number:
+    xor eax, eax
+    xor ecx, ecx                    ; digits seen
+.jpn_loop:
+    movzx edx, byte [rdi]
+    test dl, dl
+    jz .jpn_end
+    cmp dl, ' '
+    je .jpn_end
+    sub edx, '0'
+    cmp edx, 9
+    ja .jpn_bad
+    imul eax, eax, 10
+    add eax, edx
+    cmp eax, 255
+    ja .jpn_bad
+    inc ecx
+    inc rdi
+    jmp .jpn_loop
+.jpn_end:
+    test ecx, ecx
+    jz .jpn_bad
+    ret
+.jpn_bad:
+    xor eax, eax
+    ret
+
+; job_print_line(edi = slot) - "  [1] PID 1234 Running  command"
+job_print_line:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    mov ebx, edi
+    call job_ordinal
+    mov r12d, eax
+    lea rdi, [jobs_bracket_open]
+    call print_cstring
+    mov eax, r12d
+    call print_number
+    lea rdi, [jobs_bracket_close]
+    call print_cstring
+    lea rdi, [jobs_pid_label]
+    call print_cstring
+    mov rax, [job_pids + rbx*8]
+    mov eax, eax
+    call print_number
+    lea rdi, [jobs_running_msg]
+    cmp byte [job_state + rbx], JOB_STOPPED
+    jne .jpl_state
+    lea rdi, [jobs_stopped_msg]
+.jpl_state:
+    call print_cstring
+    mov eax, ebx
+    imul eax, JOB_CMD_SIZE
+    lea rdi, [job_cmds + rax]
+    call print_cstring
+    call print_newline
+
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; job_notify_stopped(edi = slot) - tell the user a foreground job was stopped.
+; Goes to the terminal even when the command's stdout was redirected.
+job_notify_stopped:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    mov r12d, edi
+    movzx ebx, byte [redir_stdout_active]
+    mov byte [redir_stdout_active], 0
+    call print_newline
+    mov edi, r12d
+    call job_print_line
+    mov [redir_stdout_active], bl
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; job_poll(edi = slot) -> eax = 1 if the job is gone (its slot is freed),
+; 0 if it still exists. Also notes whether it is running or stopped.
+job_poll:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 16                     ; [rsp] = wait status
+
+    mov ebx, edi
+    mov r12, [job_pids + rbx*8]
+.jp_again:
+    mov edi, r12d
+    mov edx, WNOHANG
+    mov r8, [job_pgids + rbx*8]
+    test r8, r8
+    jz .jp_do
+    mov edi, r8d
+    neg edi                         ; any process of the job's group
+    mov edx, WNOHANG | WUNTRACED | WCONTINUED
+.jp_do:
+    mov dword [rsp], 0
+    mov rsi, rsp
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -EINTR
+    je .jp_again
+    test rax, rax
+    jz .jp_alive
+    js .jp_gone                     ; nothing of the job is left
+    cmp qword [job_pgids + rbx*8], 0
+    je .jp_gone                     ; a single process of the shell's group ended
+    mov eax, [rsp]
+    mov ecx, eax
+    and ecx, 0xFF
+    cmp ecx, 0x7F
+    jne .jp_not_stopped
+    mov byte [job_state + rbx], JOB_STOPPED
+    jmp .jp_again
+.jp_not_stopped:
+    cmp eax, 0xFFFF                 ; continued
+    jne .jp_again                   ; one stage ended; look for the others
+    mov byte [job_state + rbx], JOB_RUNNING
+    jmp .jp_again
+.jp_alive:
+    xor eax, eax
+    jmp .jp_ret
+.jp_gone:
+    mov edi, ebx
+    call job_free
+    mov eax, 1
+.jp_ret:
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
 ; handler_jobs - List active background jobs
 ; ============================================================================
 handler_jobs:
@@ -10211,83 +12780,26 @@ handler_jobs:
     mov rbp, rsp
     push rbx
     push r12
-    push r13
-    push r14
-    sub rsp, 32
+    sub rsp, 16
 
     call reap_finished_jobs
 
-    mov eax, [job_count]
-    test eax, eax
-    jz .hj_none
+    cmp dword [job_count], 0
+    jle .hj_none
 
     lea rdi, [jobs_header_msg]
     call print_cstring
 
-    xor r12d, r12d
-    xor r13d, r13d
-
+    xor ebx, ebx
 .hj_loop:
-    cmp r12d, JOB_MAX
+    cmp ebx, JOB_MAX
     jge .hj_done
-
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    test rax, rax
-    jz .hj_next
-
-    inc r13d
-    mov r14, rax
-
-    lea rdi, [jobs_bracket_open]
-    call print_cstring
-
-    mov eax, r13d
-    call print_number
-
-    lea rdi, [jobs_bracket_close]
-    call print_cstring
-
-    lea rdi, [jobs_pid_label]
-    call print_cstring
-
-    mov rax, r14
-    mov eax, eax
-    call print_number
-
-    ; Check if still running with waitpid WNOHANG
-    mov edi, r14d
-    lea rsi, [pid_buf]
-    mov edx, WNOHANG
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
-
-    test rax, rax
-    jz .hj_still_running
-
-    ; Job finished - mark slot as empty
-    lea rbx, [job_pids]
-    mov qword [rbx + r12*8], 0
-    dec dword [job_count]
-
-    lea rdi, [jobs_done_msg]
-    call print_cstring
-    jmp .hj_print_cmd
-
-.hj_still_running:
-    lea rdi, [jobs_running_msg]
-    call print_cstring
-
-.hj_print_cmd:
-    mov eax, r12d
-    imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
-    call print_cstring
-    call print_newline
-
+    cmp qword [job_pids + rbx*8], 0
+    je .hj_next
+    mov edi, ebx
+    call job_print_line
 .hj_next:
-    inc r12d
+    inc ebx
     jmp .hj_loop
 
 .hj_none:
@@ -10295,9 +12807,7 @@ handler_jobs:
     call print_cstring
 
 .hj_done:
-    add rsp, 32
-    pop r14
-    pop r13
+    add rsp, 16
     pop r12
     pop rbx
     pop rbp
@@ -10319,25 +12829,10 @@ reap_finished_jobs:
 .rfj_loop:
     cmp r12d, JOB_MAX
     jge .rfj_done
-
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    test rax, rax
-    jz .rfj_next
-
-    mov edi, eax
-    lea rsi, [pid_buf]
-    mov edx, WNOHANG
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
-
-    test rax, rax
-    jz .rfj_next
-    lea rbx, [job_pids]
-    mov qword [rbx + r12*8], 0
-    dec dword [job_count]
-
+    cmp qword [job_pids + r12*8], 0
+    je .rfj_next
+    mov edi, r12d
+    call job_poll
 .rfj_next:
     inc r12d
     jmp .rfj_loop
@@ -10351,7 +12846,7 @@ reap_finished_jobs:
 
 
 ; ============================================================================
-; handler_fg - Bring background job to foreground
+; handler_fg - Bring a job to the foreground (resuming it if it was stopped)
 ; rdi = argument string ("1", "2", etc.) or NULL
 ; ============================================================================
 handler_fg:
@@ -10360,59 +12855,22 @@ handler_fg:
     push rbx
     push r12
     push r13
-    sub rsp, 16
+    push r14
+    push r15
+    sub rsp, 24                     ; [rsp] = wait status
 
     test rdi, rdi
     jz .hfg_noarg
     cmp byte [rdi], 0
     je .hfg_noarg
-
-    xor eax, eax
-    xor ecx, ecx
-
-.hfg_parse_num:
-    movzx edx, byte [rdi]
-    test dl, dl
-    jz .hfg_parsed
-    cmp dl, ' '
-    je .hfg_parsed
-    sub dl, '0'
-    cmp dl, 9
-    ja .hfg_invalid
-    imul ecx, ecx, 10
-    movzx edx, dl
-    add ecx, edx
-    inc rdi
-    jmp .hfg_parse_num
-
-.hfg_parsed:
-    test ecx, ecx
+    call job_parse_number
+    test eax, eax
     jz .hfg_invalid
-
-    xor r12d, r12d
-    xor r13d, r13d
-
-.hfg_find:
-    cmp r12d, JOB_MAX
-    jge .hfg_invalid
-
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    test rax, rax
-    jz .hfg_find_next
-
-    inc r13d
-    cmp r13d, ecx
-    je .hfg_found
-
-.hfg_find_next:
-    inc r12d
-    jmp .hfg_find
-
-.hfg_found:
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    mov ebx, eax
+    mov edi, eax
+    call job_find
+    test eax, eax
+    js .hfg_invalid
+    mov r12d, eax                   ; r12d = slot
 
     ; Print the command
     mov eax, r12d
@@ -10421,29 +12879,88 @@ handler_fg:
     call print_cstring
     call print_newline
 
-    call restore_terminal
+    mov rbx, [job_pids + r12*8]     ; rbx = pid that gives the status
+    mov r13, [job_pgids + r12*8]    ; r13 = its process group, 0 if shared
+    mov byte [job_state + r12], JOB_RUNNING
+    xor r14d, r14d                  ; r14d = exit status
 
-    ; Resume the job if stopped (SIGCONT). Harmless if already running.
+    call restore_terminal
+    test r13, r13
+    jz .hfg_plain
+
+    ; Hand the terminal to the job and wake it (harmless if it is running)
+    mov edi, r13d
+    call jc_give_tty
+    mov edi, r13d
+    neg edi
+    mov esi, SIGCONT
+    mov eax, SYS_KILL
+    syscall
+.hfg_wait:
+    mov dword [rsp], 0
+    mov edi, r13d
+    neg edi
+    mov rsi, rsp
+    mov edx, WUNTRACED
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -EINTR
+    je .hfg_wait
+    test rax, rax
+    jle .hfg_finished               ; ECHILD: every process of the job is gone
+    mov r15d, eax
+    mov eax, [rsp]
+    mov esi, 1
+    call jc_status
+    test edx, edx
+    jnz .hfg_stopped
+    cmp r15, rbx
+    jne .hfg_wait
+    mov r14d, eax
+    jmp .hfg_wait
+
+.hfg_stopped:
+    mov [last_exit_status], eax
+    mov byte [job_state + r12], JOB_STOPPED
+    call jc_reclaim
+    mov edi, r12d
+    call job_notify_stopped
+    call restore_terminal           ; the program may have left the terminal raw
+    jmp .hfg_raw
+
+.hfg_finished:
+    call jc_reclaim
+    mov edi, r12d
+    call job_free
+    mov [last_exit_status], r14d
+    jmp .hfg_raw
+
+.hfg_plain:
+    ; The job shares the shell's group: wake it and wait for that one process
     mov edi, ebx
     mov esi, SIGCONT
     mov eax, SYS_KILL
     syscall
-
-    ; Wait on the child
+.hfg_plain_wait:
+    mov dword [rsp], 0
     mov edi, ebx
-    lea rsi, [pid_buf]
+    mov rsi, rsp
     xor edx, edx
     xor r10d, r10d
     mov eax, SYS_WAIT4
     syscall
+    cmp rax, -EINTR
+    je .hfg_plain_wait
+    mov eax, [rsp]
+    xor esi, esi
+    call jc_status
+    mov [last_exit_status], eax
+    mov edi, r12d
+    call job_free
 
+.hfg_raw:
     call setup_raw_mode
-
-    ; Remove from job table
-    lea rdi, [job_pids]
-    mov qword [rdi + r12*8], 0
-    dec dword [job_count]
-
     jmp .hfg_done
 
 .hfg_noarg:
@@ -10454,9 +12971,12 @@ handler_fg:
 .hfg_invalid:
     lea rdi, [jobs_fg_invalid_msg]
     call print_cstring
+    mov dword [last_exit_status], 1
 
 .hfg_done:
-    add rsp, 16
+    add rsp, 24
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -10464,7 +12984,7 @@ handler_fg:
     ret
 
 ; ============================================================================
-; handler_bg - resume a stopped background job (SIGCONT), do NOT wait
+; handler_bg - resume a stopped job in the background, do NOT wait
 ; ============================================================================
 handler_bg:
     push rbp
@@ -10478,56 +12998,41 @@ handler_bg:
     jz .hbg_noarg
     cmp byte [rdi], 0
     je .hbg_noarg
-
-    ; Parse job number
-    xor ecx, ecx
-.hbg_parse:
-    movzx edx, byte [rdi]
-    test dl, dl
-    jz .hbg_parsed
-    cmp dl, ' '
-    je .hbg_parsed
-    sub dl, '0'
-    cmp dl, 9
-    ja .hbg_noarg
-    imul ecx, ecx, 10
-    movzx edx, dl
-    add ecx, edx
-    inc rdi
-    jmp .hbg_parse
-.hbg_parsed:
-    test ecx, ecx
+    call job_parse_number
+    test eax, eax
     jz .hbg_noarg
+    mov r13d, eax                   ; r13d = job number
+    mov edi, eax
+    call job_find
+    test eax, eax
+    js .hbg_nojob
+    mov r12d, eax                   ; r12d = slot
 
-    xor r12d, r12d
-    xor r13d, r13d
-.hbg_find:
-    cmp r12d, JOB_MAX
-    jge .hbg_noarg
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    test rax, rax
-    jz .hbg_next
-    inc r13d
-    cmp r13d, ecx
-    je .hbg_found
-.hbg_next:
-    inc r12d
-    jmp .hbg_find
-
-.hbg_found:
-    lea rbx, [job_pids]
-    mov rbx, [rbx + r12*8]
-    mov edi, ebx
+    mov rdi, [job_pids + r12*8]
+    mov r8, [job_pgids + r12*8]
+    test r8, r8
+    jz .hbg_signal
+    mov edi, r8d
+    neg edi                         ; the whole job
+.hbg_signal:
     mov esi, SIGCONT
     mov eax, SYS_KILL
     syscall
+    test rax, rax
+    jnz .hbg_nojob
+    mov byte [job_state + r12], JOB_RUNNING
 
     lea rdi, [bg_resumed_msg]
     call print_cstring
-    mov eax, ecx
+    mov eax, r13d
     call print_number
     call print_newline
+    jmp .hbg_done
+
+.hbg_nojob:
+    lea rdi, [jobs_fg_invalid_msg]
+    call print_cstring
+    mov dword [last_exit_status], 1
     jmp .hbg_done
 
 .hbg_noarg:
@@ -10696,9 +13201,9 @@ print_last_error:
 
     mov ebx, edi                    ; save errno
 
-    ; Print "Error: " prefix
+    ; "Error: " prefix (also marks the command as failed)
     lea rdi, [.ple_prefix]
-    call print_cstring
+    call report_error_cstr
 
     ; Look up errno in our small table
     cmp ebx, 2
@@ -10718,11 +13223,22 @@ print_last_error:
 
     ; Unknown errno -- print "errno <number>"
     lea rdi, [.ple_errno_str]
-    call print_cstring
+    call report_error_cstr
     mov eax, ebx
-    call print_number
-    call print_newline
-    jmp .ple_done
+    lea r8, [num_buf + 31]
+    mov byte [r8], 0
+    mov ecx, 10
+.ple_digits:
+    xor edx, edx
+    div ecx
+    add dl, '0'
+    dec r8
+    mov [r8], dl
+    test eax, eax
+    jnz .ple_digits
+    mov rdi, r8
+    call report_error_cstr
+    jmp .ple_newline
 
 .ple_enoent:
     lea rdi, [.ple_msg_enoent]
@@ -10746,10 +13262,12 @@ print_last_error:
     lea rdi, [.ple_msg_enotempty]
 
 .ple_print_msg:
-    call print_cstring
-    call print_newline
+    call report_error_cstr
+.ple_newline:
+    lea rdi, [newline]
+    mov esi, 1
+    call report_error_len
 
-.ple_done:
     add rsp, 24
     pop rbx
     pop rbp

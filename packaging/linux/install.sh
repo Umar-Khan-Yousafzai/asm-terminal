@@ -13,6 +13,8 @@
 #
 # Default: per-user install into $HOME/.local, no sudo required.
 # System-wide: run as root (sudo) to install into /usr/local.
+# `asm` is only created or replaced when it is absent or already ASM Terminal;
+# another program with that name (pwntools) is left alone.
 # ---------------------------------------------------------------------------
 set -eu
 
@@ -27,11 +29,11 @@ ui()   { [ -z "${ASM_NOGUI:-}" ] && have zenity; }
 
 info() {
     if ui; then zenity --info --no-wrap --title="ASM Terminal" --text="$1" 2>/dev/null || true
-    else        printf '[info] %s\n' "$1"; fi
+    else        printf '[info] %b\n' "$1"; fi
 }
 err() {
     if ui; then zenity --error --no-wrap --title="ASM Terminal" --text="$1" 2>/dev/null || true
-    else        printf '[error] %s\n' "$1" >&2; fi
+    else        printf '[error] %b\n' "$1" >&2; fi
     exit 1
 }
 
@@ -83,6 +85,16 @@ fi
 mkdirp()  { $SUDO mkdir -p "$1"; }
 copy()    { $SUDO install -m "$1" "$2" "$3"; }
 
+# Is $1 (a path) free to take over: absent, a link to asm-terminal, or an
+# older ASM Terminal copy? Anything else is some other program named asm.
+asm_is_ours() {
+    if [ -L "$1" ]; then
+        case "$(readlink "$1")" in asm-terminal|*/asm-terminal) return 0 ;; *) return 1 ;; esac
+    fi
+    [ ! -e "$1" ] && return 0
+    [ -f "$1" ] && grep -aq 'ASM Terminal v' "$1"
+}
+
 # -----------------------------------------------------------------------------
 # Install files
 # -----------------------------------------------------------------------------
@@ -91,12 +103,23 @@ mkdirp "$APPDIR"
 mkdirp "$ICONDIR"
 
 copy 0755 "$SRC_BIN"     "$BINDIR/asm-terminal"
-$SUDO ln -sf asm-terminal "$BINDIR/asm"
+ASM_NOTE=""
+if asm_is_ours "$BINDIR/asm"; then
+    $SUDO ln -sf asm-terminal "$BINDIR/asm"
+else
+    ASM_NOTE="\n\nNote: $BINDIR/asm is another program and was left alone. Run 'asm-terminal'."
+fi
 copy 0755 "$SRC_LAUNCH"  "$BINDIR/asm-terminal-launch"
 # Absolute Exec path: the desktop session's PATH often lacks ~/.local/bin.
+# Written line by line so a prefix with spaces, '&' or '|' stays intact.
 TMP_DESKTOP="$(mktemp)"
-sed -e "s|^TryExec=.*|TryExec=$BINDIR/asm-terminal-launch|" \
-    -e "s|^Exec=.*|Exec=$BINDIR/asm-terminal-launch|" "$SRC_DESKTOP" > "$TMP_DESKTOP"
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+        TryExec=*) printf 'TryExec=%s\n' "$BINDIR/asm-terminal-launch" ;;
+        Exec=*)    printf 'Exec="%s"\n' "$BINDIR/asm-terminal-launch" ;;
+        *)         printf '%s\n' "$line" ;;
+    esac
+done < "$SRC_DESKTOP" > "$TMP_DESKTOP"
 copy 0644 "$TMP_DESKTOP" "$APPDIR/asm-terminal.desktop"
 rm -f "$TMP_DESKTOP"
 copy 0644 "$SRC_ICON"    "$ICONDIR/asm-terminal.svg"
@@ -114,4 +137,4 @@ copy 0644 "$HERE/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg" \
 if have update-desktop-database; then $SUDO update-desktop-database "$APPDIR" >/dev/null 2>&1 || true; fi
 if have gtk-update-icon-cache;   then $SUDO gtk-update-icon-cache "$SHAREDIR/icons/hicolor" >/dev/null 2>&1 || true; fi
 
-info "ASM Terminal installed.\n\nBinary:    $BINDIR/asm-terminal (also $BINDIR/asm)\nLauncher:  $BINDIR/asm-terminal-launch\nDesktop:   $APPDIR/asm-terminal.desktop\n\nSearch 'ASM' in your app menu or run 'asm-terminal' directly.\nIf the icon doesn't appear, log out and back in."
+info "ASM Terminal installed.\n\nBinary:    $BINDIR/asm-terminal (also $BINDIR/asm)\nLauncher:  $BINDIR/asm-terminal-launch\nDesktop:   $APPDIR/asm-terminal.desktop\n\nSearch 'ASM' in your app menu or run 'asm-terminal' directly.\nIf the icon doesn't appear, log out and back in.$ASM_NOTE"

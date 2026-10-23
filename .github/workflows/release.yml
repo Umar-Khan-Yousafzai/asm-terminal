@@ -14,9 +14,16 @@ on:
         description: 'Version tag to build (e.g. v2.1.0)'
         required: true
         default: 'v2.1.0'
+      replace_existing:
+        description: 'Replace the assets of a release that already exists'
+        type: boolean
+        required: false
+        default: false
 
+# Build jobs only read the repository. The publish job alone gets a write
+# token, and it runs nothing but shell and the release action.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -32,28 +39,54 @@ jobs:
       previous: ${{ steps.ver.outputs.previous }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Version and tag state
         id: ver
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REPLACE_EXISTING: ${{ github.event.inputs.replace_existing }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ github.event.inputs.version }}"
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            V="${GITHUB_REF_NAME}"
+          # Tag names and dispatch input are attacker-shaped text. They reach
+          # this script only through the environment, and nothing below uses
+          # V before it has matched a plain X.Y.Z.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            V="$INPUT_VERSION"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            V="$REF_NAME"
           else
             V="$(make -s version)"
           fi
           V="${V#v}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version is not X.Y.Z (got a value of ${#V} characters)."
+            exit 1
+          fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "branch" ] \
-             && git ls-remote --exit-code --tags origin "refs/tags/v$V" >/dev/null; then
-            echo "v$V is already released; nothing to do."
-            echo "release=false" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "branch" ]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/v$V" >/dev/null; then
+              echo "v$V is already released; nothing to do."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Releasing v$V."
+              echo "release=true" >> "$GITHUB_OUTPUT"
+            fi
           else
+            # A manual run or a pushed tag must not silently rewrite a release
+            # that users already have (assets and SHA256SUMS would change).
+            if gh release view "v$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+               && [ "$REPLACE_EXISTING" != "true" ]; then
+              echo "::error::Release v$V already exists. Re-run manually with replace_existing set to replace its assets."
+              exit 1
+            fi
             echo "Releasing v$V."
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
@@ -64,7 +97,9 @@ jobs:
 
       - name: Release notes exist in CHANGELOG.md
         if: steps.ver.outputs.release == 'true'
-        run: bash packaging/release-notes.sh "${{ steps.ver.outputs.version }}" > /dev/null
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: bash packaging/release-notes.sh "$VERSION" > /dev/null
 
   linux:
     name: Linux artifacts (tarball / deb / AppImage)
@@ -75,12 +110,15 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Derive version
         id: ver
+        env:
+          V: ${{ needs.check.outputs.version }}
         run: |
-          V="${{ needs.check.outputs.version }}"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "APP_VERSION=$V" >> "$GITHUB_ENV"
 
@@ -92,8 +130,8 @@ jobs:
       - name: Check tag matches version.inc
         run: |
           src="$(make -s version)"
-          if [ "$src" != "${{ steps.ver.outputs.version }}" ]; then
-            echo "::error::Tag version ${{ steps.ver.outputs.version }} does not match version.inc ($src). Bump version.inc first."
+          if [ "$src" != "$APP_VERSION" ]; then
+            echo "::error::Tag version $APP_VERSION does not match version.inc ($src). Bump version.inc first."
             exit 1
           fi
 
@@ -106,20 +144,16 @@ jobs:
           cp terminal dist/asm-terminal-linux-x86_64
 
       - name: Run smoke tests
-        run: |
-          if [ -f tests/run_tests.sh ]; then bash tests/run_tests.sh; fi
+        run: bash tests/run_tests.sh
 
       - name: Build tarball
-        run: |
-          VERSION=${{ steps.ver.outputs.version }} make dist
+        run: VERSION="$APP_VERSION" make dist
 
       - name: Build .deb
-        run: |
-          APP_VERSION=${{ steps.ver.outputs.version }} make deb
+        run: make deb
 
       - name: Build .rpm
-        run: |
-          APP_VERSION=${{ steps.ver.outputs.version }} make rpm
+        run: make rpm
 
       - name: Desktop files + install script (for install.sh one-liner)
         run: |
@@ -127,16 +161,26 @@ jobs:
           cp packaging/linux/install-release.sh dist/install.sh
 
       - name: Build AppImage
-        run: |
-          APP_VERSION=${{ steps.ver.outputs.version }} make appimage
+        run: make appimage
 
-      - name: List artifacts
+      # upload-artifact only complains when nothing at all matches, so check
+      # each file the updater and the install script download by name.
+      - name: Check every Linux asset exists
         run: |
-          ls -la dist/ || true
-          ls -la asm-terminal-*.AppImage || true
+          ls -la dist/ asm-terminal-*.AppImage
+          for f in \
+              "dist/asm-terminal-linux-x86_64" \
+              "dist/install.sh" \
+              "dist/asm-terminal-linux-desktop.tar.gz" \
+              "dist/asm-terminal-$APP_VERSION-linux-x86_64.tar.gz" \
+              "dist/asm-terminal_${APP_VERSION}_amd64.deb" \
+              "dist/asm-terminal-$APP_VERSION-1.x86_64.rpm" \
+              "asm-terminal-$APP_VERSION-x86_64.AppImage"; do
+            [ -s "$f" ] || { echo "::error::missing release asset $f"; exit 1; }
+          done
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-artifacts
           path: |
@@ -147,7 +191,7 @@ jobs:
             dist/asm-terminal-linux-desktop.tar.gz
             dist/install.sh
             asm-terminal-*.AppImage
-          if-no-files-found: warn
+          if-no-files-found: error
 
   windows:
     name: Windows artifacts (exe + NSIS setup.exe)
@@ -155,9 +199,13 @@ jobs:
     outputs:
       version: ${{ needs.linux.outputs.version }}
     needs: linux
+    env:
+      VERSION: ${{ needs.linux.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install NASM (chocolatey)
         shell: pwsh
@@ -220,20 +268,34 @@ jobs:
       - name: Stage Windows zip payload
         shell: pwsh
         run: |
-          $v    = "${{ needs.linux.outputs.version }}"
+          $v    = $env:VERSION
           $name = "asm-terminal-$v-windows-x86_64"
           $dst  = "dist\$name"
           New-Item -ItemType Directory -Path $dst -Force | Out-Null
           Copy-Item terminal.exe                                     "$dst\"
           Copy-Item packaging\windows\install.bat                    "$dst\"
           Copy-Item packaging\windows\install.ps1                    "$dst\"
+          # The scripts carry a version for Add/Remove Programs; stamp the
+          # release version in so it never shows a stale one.
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $stamps = @(
+              @{ File = "$dst\install.bat"; Pattern = '(?m)^(set "APP_VERSION=)[^"]*(")' },
+              @{ File = "$dst\install.ps1"; Pattern = "(?m)^(\`$AppVersion\s*=\s*')[^']*(')" }
+          )
+          foreach ($s in $stamps) {
+              $path = (Resolve-Path $s.File).Path
+              $text = [System.IO.File]::ReadAllText($path)
+              if ($text -notmatch $s.Pattern) { Write-Warning "no version line found in $($s.File)"; continue }
+              $text = [regex]::Replace($text, $s.Pattern, ('${1}' + $v + '${2}'))
+              [System.IO.File]::WriteAllText($path, $text, $utf8)
+          }
           Copy-Item packaging\windows\uninstall.bat                  "$dst\"
           if (Test-Path packaging\windows\asm-terminal.ico) {
               Copy-Item packaging\windows\asm-terminal.ico          "$dst\"
           }
           Copy-Item README.md                                        "$dst\"
           Copy-Item packaging\windows\README.md                      "$dst\INSTALL.md"
-          Copy-Item packaging\windows\SIGNING.md                     "$dst\SIGNING.md"
+          Copy-Item LICENSE                                          "$dst\"
           Compress-Archive -Path "$dst\*" -DestinationPath "dist\$name.zip" -Force
           Copy-Item terminal.exe "dist\asm-terminal-windows-x86_64.exe"
           Get-ChildItem dist
@@ -241,7 +303,7 @@ jobs:
       - name: Build NSIS setup.exe
         shell: pwsh
         run: |
-          $v = "${{ needs.linux.outputs.version }}"
+          $v = $env:VERSION
           # NSIS File directives look relative to the .nsi location.
           Copy-Item terminal.exe                 packaging\windows\terminal.exe -Force
           Push-Location packaging\windows
@@ -272,7 +334,7 @@ jobs:
           CODE_SIGN_PFX_PASSWORD: ${{ secrets.CODE_SIGN_PFX_PASSWORD }}
         run: |
           if (-not $env:CODE_SIGN_PFX_BASE64) {
-              Write-Host 'CODE_SIGN_PFX_BASE64 not set — shipping unsigned binaries.'
+              Write-Host 'CODE_SIGN_PFX_BASE64 not set, shipping unsigned binaries.'
               exit 0
           }
           $pfxPath = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
@@ -286,25 +348,46 @@ jobs:
           }
           Remove-Item $pfxPath -Force
 
+      - name: Check every Windows asset exists
+        shell: pwsh
+        run: |
+          foreach ($f in @(
+              "dist\asm-terminal-$env:VERSION-windows-x86_64.zip",
+              "dist\asm-terminal-$env:VERSION-windows-x86_64-setup.exe",
+              "dist\asm-terminal-windows-x86_64.exe")) {
+              if (-not (Test-Path $f) -or (Get-Item $f).Length -eq 0) { throw "missing release asset $f" }
+          }
+
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-artifacts
           path: |
             dist/asm-terminal-*-windows-x86_64.zip
             dist/asm-terminal-*-setup.exe
             dist/asm-terminal-windows-x86_64.exe
-          if-no-files-found: warn
+          if-no-files-found: error
 
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: [check, linux, windows]
+    # A manual run from a feature branch still builds and tests everything
+    # (a dry run) but never publishes: a release becomes "latest", which is
+    # what every installed terminal updates to.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      PREVIOUS: ${{ needs.check.outputs.previous }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: release-assets
 
@@ -312,6 +395,16 @@ jobs:
         run: |
           mkdir -p final
           find release-assets -type f -exec cp -v {} final/ \;
+          # Never publish a release that lacks something an installer fetches
+          for f in asm-terminal-linux-x86_64 install.sh asm-terminal-linux-desktop.tar.gz \
+                   "asm-terminal-$VERSION-linux-x86_64.tar.gz" \
+                   "asm-terminal_${VERSION}_amd64.deb" "asm-terminal-$VERSION-1.x86_64.rpm" \
+                   "asm-terminal-$VERSION-x86_64.AppImage" \
+                   "asm-terminal-$VERSION-windows-x86_64.zip" \
+                   "asm-terminal-$VERSION-windows-x86_64-setup.exe" \
+                   asm-terminal-windows-x86_64.exe; do
+            [ -s "final/$f" ] || { echo "::error::missing release asset $f"; exit 1; }
+          done
           # Checksums for every asset; 'update install' verifies against this
           (cd final && sha256sum * > SHA256SUMS && cat SHA256SUMS)
           ls -la final/
@@ -319,16 +412,15 @@ jobs:
       - name: Resolve release tag
         id: tag
         shell: bash
-        run: echo "tag=v${{ needs.check.outputs.version }}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Write release notes
         run: |
-          bash packaging/release-notes.sh "${{ needs.check.outputs.version }}" \
-              final/SHA256SUMS "${{ needs.check.outputs.previous }}" > release-notes.md
+          bash packaging/release-notes.sh "$VERSION" final/SHA256SUMS "$PREVIOUS" > release-notes.md
           cat release-notes.md
 
       - name: Create or update release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
@@ -338,4 +430,4 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
