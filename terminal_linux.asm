@@ -5516,6 +5516,10 @@ execute_external:
     mov esi, 1                      ; stdout
     mov eax, SYS_DUP2
     syscall
+    cmp edi, 1                      ; the original must not leak into the command
+    je .ee_child_check_in
+    mov eax, SYS_CLOSE
+    syscall
 
 .ee_child_check_in:
     cmp byte [redir_stdin_active], 0
@@ -5524,6 +5528,10 @@ execute_external:
     mov edi, [redir_stdin_fd]
     xor esi, esi                    ; stdin
     mov eax, SYS_DUP2
+    syscall
+    test edi, edi
+    jz .ee_child_exec
+    mov eax, SYS_CLOSE
     syscall
 
 .ee_child_exec:
