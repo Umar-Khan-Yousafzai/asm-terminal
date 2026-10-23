@@ -179,8 +179,6 @@ section .data
     ; /bin/sh helpers for $( ), backticks and globs in for-lists / values
     ash_shc_argv         dq sh_path, sh_dash_c, ash_sh_script, 0
     ash_sh_printf       db "printf '%s\n' ", 0
-    ash_sh_assign_pre   db "__ash_v=", 0
-    ash_sh_assign_post  db "; printf '%s' ", '"', "$__ash_v", '"', 0
 
     ash_e_syntax        db "ash: syntax error near '", 0
     ash_e_syntax_end    db "'", 10, 0
@@ -217,7 +215,7 @@ section .bss
     ash_ar_buf          resb 512
     ash_word_buf        resb 1024
     ash_test_buf        resb 1024
-    ash_sh_script       resb 1024
+    ash_sh_script       resb 1280
     ash_pending         resb ASH_PENDING_MAX
     ash_frames          resb ASH_FRAMES_MAX * ASH_FRAME_SIZE
     ash_funcs           resb ASH_FUNC_MAX * ASH_FUNC_SIZE
@@ -1591,15 +1589,26 @@ ash_for_setup:
     call str_len
     cmp eax, MAX_INPUT - 1
     jae .fs_toolong
+    ; Globs and $( ) are judged on the text as written: a variable's value
+    ; is data and never needs /bin/sh. When sh runs the list it expands the
+    ; command substitutions itself, everything else is expanded here first.
+    mov rdi, r12
+    call ash_needs_sh
+    mov [rsp], eax
     lea rdi, [input_buf]
     mov rsi, r12
     call str_copy
+    cmp dword [rsp], 0
+    jne .fs_expand_sh
     call expand_env_vars
-
-    lea rdi, [input_buf]
-    call ash_needs_sh
+    jmp .fs_expanded
+.fs_expand_sh:
+    call expand_env_vars_sh
+.fs_expanded:
     test eax, eax
-    jnz .fs_sh
+    jnz .fs_failed                  ; message printed
+    cmp dword [rsp], 0
+    jne .fs_sh
 
     ; Native split: one unquoted word per line
     lea r12, [input_buf]
@@ -1634,11 +1643,14 @@ ash_for_setup:
 
 .fs_sh:
     ; printf '%s\n' WORDS  -> one word per line from /bin/sh
+    lea rdi, [input_buf]
+    call ash_sh_decode              ; marked data bytes become plain text
+    mov r13, rax
     lea rdi, [ash_sh_script]
     lea rsi, [ash_sh_printf]
     call upd_stpcpy
     mov rdi, rax
-    lea rsi, [input_buf]
+    mov rsi, r13
     call upd_stpcpy
     lea rdi, [ash_shc_argv]
     xor esi, esi
@@ -1659,6 +1671,9 @@ ash_for_setup:
     mov byte [rdi + rcx], 0
 .fs_ok:
     xor eax, eax
+    jmp .fs_ret
+.fs_failed:
+    mov eax, 2
     jmp .fs_ret
 .fs_toolong:
     lea rdi, [ash_e_line]
@@ -1687,6 +1702,8 @@ ash_needs_sh:
     movzx eax, byte [rdi]
     test al, al
     jz .ns_no
+    cmp al, EV_MARK
+    je .ns_mark
     cmp al, '`'
     je .ns_yes
     cmp al, '$'
@@ -1720,6 +1737,11 @@ ash_needs_sh:
     mov ecx, eax
     jmp .ns_next
 .ns_bs:
+    cmp byte [rdi + 1], 0
+    je .ns_no
+    add rdi, 2
+    jmp .ns_loop
+.ns_mark:
     cmp byte [rdi + 1], 0
     je .ns_no
     add rdi, 2
@@ -1910,6 +1932,8 @@ ash_try_assign:
     je .ta_val_open
     cmp al, '"'
     je .ta_val_open
+    cmp al, '`'
+    je .ta_val_open
     cmp al, '('
     je .ta_val_lp
     cmp al, ')'
@@ -1969,40 +1993,28 @@ ash_try_assign:
     lea rdi, [input_buf]
     mov rsi, rbx
     call str_copy
-    call expand_env_vars
-
-    lea rdi, [input_buf]
-    call ash_needs_sh
+    call expand_env_vars            ; $( ) and `` run here and come back as data
     test eax, eax
-    jnz .ta_sh
+    jnz .ta_expand_failed           ; message printed, status set
 
     lea rdi, [input_buf]
     lea rsi, [ash_word_buf]
     xor edx, edx
     call ash_next_word
     lea rsi, [ash_word_buf]
-    jmp .ta_set
 
-.ta_sh:
-    ; __ash_v=VALUE; printf '%s' "$__ash_v"   (keeps $( ) and ` working)
-    lea rdi, [ash_sh_script]
-    lea rsi, [ash_sh_assign_pre]
-    call upd_stpcpy
-    mov rdi, rax
-    lea rsi, [input_buf]
-    call upd_stpcpy
-    mov rdi, rax
-    lea rsi, [ash_sh_assign_post]
-    call upd_stpcpy
-    lea rdi, [ash_shc_argv]
-    xor esi, esi
-    call upd_capture
-    lea rsi, [upd_buf]
-
-.ta_set:
     lea rdi, [ash_name_buf]
     call setenv_internal
-    mov dword [last_exit_status], 0
+    ; "x=$(cmd)" has the status of cmd, like sh
+    mov eax, [ev_subst_status]
+    test eax, eax
+    jns .ta_status
+    xor eax, eax
+.ta_status:
+    mov [last_exit_status], eax
+    mov eax, 1
+    jmp .ta_ret
+.ta_expand_failed:
     mov eax, 1
     jmp .ta_ret
 .ta_toolong:
@@ -2179,6 +2191,8 @@ ash_call_func:
     mov rsi, r12
     call str_copy
     call expand_env_vars
+    test eax, eax
+    jnz .cf_expand_failed_ret    ; message printed: do not call
     lea r12, [input_buf]
     lea r14, [ash_args_buf]
 .cf_split:
@@ -2258,6 +2272,7 @@ ash_call_func:
     mov esi, 1
     call ash_eval
 
+.cf_expand_failed_ret:
     ; Restore the caller's parameters (keep the status)
     mov r14d, [last_exit_status]
     xor r13d, r13d
@@ -2408,6 +2423,8 @@ ash_next_word:
     cmp al, 10
     je .nw_end
 .nw_noblank:
+    cmp al, EV_MARK
+    je .nw_mark
     cmp al, 0x27
     je .nw_sq
     cmp al, '"'
@@ -2418,6 +2435,14 @@ ash_next_word:
     mov [rsi], al
     inc rsi
     inc rdi
+    jmp .nw_loop
+.nw_mark:
+    movzx ecx, byte [rdi + 1]       ; "EV_MARK c" is the plain character c
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
     jmp .nw_loop
 .nw_bs:
     movzx ecx, byte [rdi + 1]
@@ -2434,6 +2459,16 @@ ash_next_word:
     movzx eax, byte [rdi]
     test al, al
     jz .nw_end
+    cmp al, EV_MARK
+    jne .nw_sq_plain
+    movzx ecx, byte [rdi + 1]
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
+    jmp .nw_sq_loop
+.nw_sq_plain:
     cmp al, 0x27
     je .nw_q_close
     mov [rsi], al
@@ -2446,6 +2481,16 @@ ash_next_word:
     movzx eax, byte [rdi]
     test al, al
     jz .nw_end
+    cmp al, EV_MARK
+    jne .nw_dq_plain
+    movzx ecx, byte [rdi + 1]
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
+    jmp .nw_dq_loop
+.nw_dq_plain:
     cmp al, '"'
     je .nw_q_close
     cmp al, '\'
