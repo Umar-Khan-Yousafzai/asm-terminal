@@ -220,9 +220,9 @@ section .bss
     ash_num_buf         resb 32
     ash_num_tmp         resb 32
     ash_ar_buf          resb 512
-    ash_word_buf        resb 1024
-    ash_test_buf        resb 1024
-    ash_sh_script       resb 1280
+    ash_word_buf        resb LINE_MAX
+    ash_test_buf        resb LINE_MAX + 64
+    ash_sh_script       resb 2 * LINE_MAX + 64
     ash_pending         resb ASH_PENDING_MAX
     ash_frames          resb ASH_FRAMES_MAX * ASH_FRAME_SIZE
     ash_funcs           resb ASH_FUNC_MAX * ASH_FUNC_SIZE
@@ -2322,7 +2322,7 @@ ash_for_setup:
 
     mov rdi, r12
     call str_len
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .fs_toolong
     ; Globs and $( ) are judged on the text as written: a variable's value
     ; is data and never needs /bin/sh. When sh runs the list it expands the
@@ -2588,7 +2588,7 @@ ash_run_cmd:
 
     mov rdi, rbx
     call str_len
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .rc_toolong
     lea rdi, [input_buf]
     mov rsi, rbx
@@ -2702,7 +2702,7 @@ ash_count_arg:
     je .ca_default
     mov rdi, r12
     call str_len
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .ca_bad
     lea rdi, [input_buf]
     mov rsi, r12
@@ -2929,7 +2929,7 @@ ash_try_assign:
     lea rbx, [rbx + r12 + 1]        ; value text
     mov rdi, rbx
     call str_len
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .ta_toolong
     lea rdi, [input_buf]
     mov rsi, rbx
@@ -3136,7 +3136,7 @@ ash_call_func:
     ; Expand and split the arguments
     mov rdi, r12
     call str_len
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .cf_toolong
     lea rdi, [input_buf]
     mov rsi, r12
