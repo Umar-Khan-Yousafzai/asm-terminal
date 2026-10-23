@@ -50,7 +50,7 @@ T.check('copy keeps the exec bit', os.path.exists(d + '/run2.sh') and stat.S_IMO
 # directories
 os.mkdir(d + '/dd')
 out, err, st = sh('copy a dd\necho st=$?\nexit\n', home=h, cwd=d)
-T.check('copy onto a folder reports an error', 'st=1' in out and out.count('\n') > 3 and ('folder' in out or 'Is a' in out or 'directory' in out.lower()), out)
+T.check('copy onto a folder reports an error', 'st=1' in out and ('folder' in err or 'Is a' in err or 'directory' in err.lower()), err)
 open(d + '/newfile', 'w').write('keepme\n')
 out, err, st = sh('copy dd newfile\necho st=$?\nexit\n', home=h, cwd=d)
 T.check('copy of a folder fails with status 1', 'st=1' in out, out)
@@ -63,7 +63,7 @@ out, err, st = sh('copy nonexist b\necho st=$?\nexit\n', home=h, cwd=d)
 T.check('copy missing source: clean message', '\0' not in out and 'st=1' in out and 'nonexist' not in out.replace('copy nonexist b', ''), repr(out))
 T.check('copy missing source: no stub', not os.path.exists(d + '/b'))
 out, err, st = sh('copy a /nonexistent_dir_x/b\necho st=$?\nexit\n', home=h, cwd=d)
-T.check('copy to a bad destination fails loudly', 'st=1' in out and 'Error' in out, out)
+T.check('copy to a bad destination fails loudly', 'st=1' in out and 'Error' in err, err)
 out, err, st = sh('copy a\necho st=$?\nexit\n', home=h, cwd=d)
 T.check('copy without destination: status 1', 'st=1' in out, out)
 
