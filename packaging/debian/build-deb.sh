@@ -5,10 +5,11 @@
 # Requires: dpkg-deb  (apt-get install dpkg-dev)
 # ---------------------------------------------------------------------------
 set -euo pipefail
+umask 022   # dpkg-deb refuses control directories that are not 0755
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-VERSION="${APP_VERSION:-2.0.0}"
+VERSION="${APP_VERSION:-$(sed -n 's/.*ASM_VERSION "\(.*\)".*/\1/p' "$REPO/version.inc")}"
 PKG="asm-terminal"
 STAGE="$HERE/_stage"
 DEB="$REPO/dist/${PKG}_${VERSION}_amd64.deb"
@@ -32,6 +33,20 @@ cp -r "$HERE/../linux/icons/hicolor/."                   "$STAGE/usr/share/icons
 
 if [ -f "$REPO/README.md" ]; then cp "$REPO/README.md" "$STAGE/usr/share/doc/$PKG/README.md"; fi
 
+# Debian copyright file (machine-readable format) from the repository LICENSE
+{
+    printf 'Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n'
+    printf 'Upstream-Name: asm-terminal\n'
+    printf 'Source: https://github.com/Umar-Khan-Yousafzai/asm-terminal\n\n'
+    printf 'Files: *\n'
+    printf 'Copyright: %s\n' "$(sed -n 's/^Copyright (c) //p' "$REPO/LICENSE")"
+    printf 'License: MIT\n\nLicense: MIT\n'
+    sed -e '1,4d' -e 's/^$/./' -e 's/^/ /' "$REPO/LICENSE"
+} > "$STAGE/usr/share/doc/$PKG/copyright"
+
+# Whatever the checkout's umask was, installed files must be world-readable
+chmod -R u+rwX,go+rX,go-w "$STAGE"
+
 INSTALLED_SIZE=$(du -sk "$STAGE" | awk '{print $1}')
 
 cat >"$STAGE/DEBIAN/control" <<EOF
@@ -45,9 +60,8 @@ Installed-Size: $INSTALLED_SIZE
 Homepage: https://github.com/Umar-Khan-Yousafzai/asm-terminal
 Description: x86-64 assembly shell (no libc, raw syscalls)
  ASM Terminal is a full-featured shell written entirely in x86-64 NASM
- assembly. 30+ built-in commands, history, tab completion, job control,
- themes, and Linux/Windows cross-platform support. Statically linked ELF64,
- ~73 KB.
+ assembly. Built-in commands, pipelines, scripting, history, tab completion,
+ job control and themes. A single statically linked ELF64 binary.
 EOF
 
 cat >"$STAGE/DEBIAN/postinst" <<'EOF'
