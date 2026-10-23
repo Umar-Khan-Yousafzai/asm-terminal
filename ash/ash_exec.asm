@@ -783,6 +783,8 @@ jc_status:
     jz .jst_signal
     cmp ecx, SIGINT
     jne .jst_signal
+    cmp byte [jc_state], 1          ; only a keyboard Ctrl+C aimed at the job
+    jne .jst_signal
     mov byte [ctrl_c_flag], 1
 .jst_signal:
     lea eax, [rcx + 128]
