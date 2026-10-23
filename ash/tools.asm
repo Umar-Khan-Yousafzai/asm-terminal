@@ -2593,9 +2593,18 @@ handler_trash:
 ; trace [-a] COMMAND
 ;   Runs COMMAND (through /bin/sh, children included) under ptrace and
 ;   prints, on stderr, each program it starts, file it opens, deletes,
-;   renames or creates, and each network connection it makes. Only calls
-;   that succeed are shown. Shared-library and /proc, /sys, /dev reads are
-;   hidden unless -a is given.
+;   renames, links or creates, and each network address it connects or
+;   sends to. Only calls that succeed are shown. Shared-library, /sys and
+;   routine /proc and /dev reads are hidden unless -a is given; the summary
+;   says how many were hidden.
+;
+;   The tracing is done by a helper process that is the parent of the
+;   command, so it waits only for the command's own processes and never
+;   touches the shell's background jobs. Names the command passes are
+;   printed with control bytes escaped, so they cannot forge lines or move
+;   the cursor. Only the x86-64 system call table is decoded: a command that
+;   uses the 32-bit or x32 entry points, or io_uring, is not fully visible,
+;   and trace prints a warning when it sees the former.
 ; ============================================================================
 
 %define TR_PTRACE_TRACEME       0
@@ -2608,9 +2617,12 @@ handler_trash:
 %define TR_SYS_VM_READV         310
 %define TR_SIGSTOP              19
 %define TR_SIGTRAP              5
-%define TR_SLOTS                32
+%define TR_SLOTS                128
 %define TR_SLOT_SIZE            1040        ; pid, kind, line[1032]
-%define TR_LINE_MAX             1000
+%define TR_PATH_BUDGET          480         ; output bytes for one name
+%define TR_PATH_MAX             4096
+%define TR_NAMES_MAX            4000
+%define TR_AUDIT_X86_64         0xC000003E
 
 ; event kinds (also the counters' index)
 %define TK_EXEC                 1
@@ -2621,12 +2633,14 @@ handler_trash:
 %define TK_MKDIR                6
 %define TK_NET                  7
 %define TK_LIST                 8
+%define TK_HIDDEN               9
 
 section .data
     tr_s_dash_a         db "-a", 0
     tr_s_trace          db "trace", 0
     tr_s_usage          db "Usage: trace [-a] COMMAND", 10, 0
     tr_s_noperm         db "trace: cannot trace (ptrace not permitted here)", 10, 0
+    tr_s_compat         db "trace: warning: the command uses 32-bit system calls, which are not shown", 10, 0
     tr_t_exec           db "  exec     ", 0
     tr_t_read           db "  read     ", 0
     tr_t_write          db "  write    ", 0
@@ -2634,27 +2648,42 @@ section .data
     tr_t_rename         db "  rename   ", 0
     tr_t_mkdir          db "  mkdir    ", 0
     tr_t_net            db "  connect  ", 0
+    tr_t_send           db "  send     ", 0
     tr_t_list           db "  list     ", 0
+    tr_t_link           db "  link     ", 0
+    tr_t_symlink        db "  symlink  ", 0
     tr_s_arrow          db " -> ", 0
     tr_s_unix           db "unix:", 0
-    tr_s_colon          db ":", 0
-    tr_s_v6             db "[ipv6]", 0
+    tr_s_empty          db "(empty path)", 0
+    tr_s_proc           db "/proc/", 0
+    tr_s_cwd            db "/cwd", 0
     tr_s_sum1           db "trace: ", 0
     tr_s_sum_prog       db " programs, ", 0
     tr_s_sum_read       db " files read, ", 0
     tr_s_sum_write      db " written, ", 0
     tr_s_sum_del        db " deleted, ", 0
     tr_s_sum_net        db " network connections", 10, 0
-    tr_s_nl             db 10, 0
-    ; reads hidden by default
-    tr_hide_list        dq tr_h1, tr_h2, tr_h3, tr_h4, tr_h5, tr_h6, tr_h7, 0
-    tr_h1               db "/lib", 0
-    tr_h2               db "/usr/lib", 0
-    tr_h3               db "/etc/ld.so", 0
-    tr_h4               db "/proc/", 0
-    tr_h5               db "/sys/", 0
-    tr_h6               db "/dev/", 0
-    tr_h7               db "/usr/share/locale", 0
+    tr_s_hid1           db "trace: ", 0
+    tr_s_hid2           db " reads of libraries and system files hidden (use -a to show them)", 10, 0
+    tr_hexd             db "0123456789ABCDEF"
+    ; Reads hidden by default. A name matches when it equals an entry or
+    ; lies below it (the match ends at a "/"), after "." and "//" are
+    ; folded. Names with ".." and names the command could have reached
+    ; through a descriptor are never hidden. /proc and /dev are listed by
+    ; what is routine, so /proc/<pid>/environ, /proc/<pid>/mem and the
+    ; disk devices always show.
+    tr_hide_strs:
+        db "/lib", 0, "/lib64", 0, "/usr/lib", 0, "/usr/lib64", 0, "/usr/lib32", 0
+        db "/etc/ld.so.cache", 0, "/etc/ld.so.conf", 0, "/etc/ld.so.conf.d", 0
+        db "/usr/share/locale", 0, "/sys", 0
+        db "/dev/null", 0, "/dev/zero", 0, "/dev/urandom", 0, "/dev/random", 0
+        db "/dev/tty", 0, "/dev/pts", 0
+        db "/proc/self/fd", 0, "/proc/self/stat", 0, "/proc/self/status", 0
+        db "/proc/self/cgroup", 0, "/proc/self/mountinfo", 0
+        db "/proc/meminfo", 0, "/proc/cpuinfo", 0, "/proc/stat", 0
+        db "/proc/filesystems", 0, "/proc/sys", 0, "/proc/loadavg", 0
+        db "/proc/uptime", 0, "/proc/version", 0
+        db 0
 
 section .bss
     alignb 8
@@ -2662,12 +2691,20 @@ section .bss
     tr_liov             resq 2
     tr_riov             resq 2
     tr_sockaddr         resb 112
+    tr_msghdr           resb 16
+    tr_how              resb 8
     tr_counts           resd 16
     tr_wstatus          resd 1
     tr_child            resd 1
     tr_child_status     resd 1
+    tr_dirfd            resd 1
     tr_all              resb 1
+    tr_compat           resb 1
+    tr_wrapper          resb 1          ; the /bin/sh wrapper's exec was seen
+    alignb 8
     tr_tmp              resb 512
+    tr_pathbuf          resb TR_PATH_MAX
+    tr_canon            resb TR_PATH_MAX
     tr_slots            resb TR_SLOTS * TR_SLOT_SIZE
 
 section .text
@@ -2714,21 +2751,78 @@ handler_trace:
     xor eax, eax
     mov ecx, TR_SLOTS * TR_SLOT_SIZE / 4
     rep stosd
+    mov byte [tr_compat], 0
+    mov byte [tr_wrapper], 0
     mov dword [tr_child_status], 1
 
     cmp byte [interactive_mode], 0
     je .tr_fork
     call restore_terminal
 .tr_fork:
+    ; A helper process does the tracing. It is the only parent of the
+    ; command, so wait4(-1) in it cannot see the shell's own children.
     mov eax, SYS_FORK
     syscall
     test rax, rax
-    js .tr_noperm
+    js .tr_fork_failed
+    jz .tr_helper
+    mov ebx, eax
+.tr_wait:
+    mov edi, ebx
+    lea rsi, [tr_wstatus]
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -EINTR
+    je .tr_wait
+    test rax, rax
+    js .tr_fork_failed
+    mov eax, [tr_wstatus]
+    mov edx, eax
+    and edx, 0x7F
+    jz .tr_exited
+    lea eax, [rdx + 128]
+    jmp .tr_status
+.tr_exited:
+    shr eax, 8
+    and eax, 0xFF
+.tr_status:
+    mov [last_exit_status], eax
+    jmp .tr_restore
+.tr_fork_failed:
+    mov dword [last_exit_status], 1
+.tr_restore:
+    cmp byte [interactive_mode], 0
+    je .tr_ret
+    call setup_raw_mode
+    jmp .tr_ret
+.tr_usage:
+    lea rdi, [tr_s_usage]
+    call print_cstring
+    mov dword [last_exit_status], 2
+.tr_ret:
+    mov byte [stats_valid], 0
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ---- helper: start the command under ptrace and follow it ----
+.tr_helper:
+    mov eax, SYS_FORK
+    syscall
+    test rax, rax
+    js .th_noperm
     jz .tr_child_proc
     mov [tr_child], eax
 
-    ; first stop (SIGSTOP the child sent itself)
-.tr_first:
+    ; first stop (SIGSTOP the command sent itself)
+.th_first:
     mov edi, [tr_child]
     lea rsi, [tr_wstatus]
     mov edx, TR_WALL
@@ -2736,13 +2830,13 @@ handler_trace:
     mov eax, SYS_WAIT4
     syscall
     cmp rax, -EINTR
-    je .tr_first
+    je .th_first
     test rax, rax
-    js .tr_done
+    js .th_done
     mov eax, [tr_wstatus]
     and eax, 0xFF
     cmp eax, 0x7F
-    jne .tr_child_gone              ; exited: ptrace refused
+    jne .th_noperm                  ; exited: ptrace refused
 
     mov eax, TR_SYS_PTRACE
     mov edi, TR_PTRACE_SETOPTIONS
@@ -2757,7 +2851,7 @@ handler_trace:
     xor r10d, r10d
     syscall
 
-.tr_loop:
+.th_loop:
     mov edi, -1
     lea rsi, [tr_wstatus]
     mov edx, TR_WALL
@@ -2765,67 +2859,71 @@ handler_trace:
     mov eax, SYS_WAIT4
     syscall
     cmp rax, -EINTR
-    je .tr_loop
+    je .th_loop
     test rax, rax
-    js .tr_done                     ; ECHILD: everything finished
+    js .th_done                     ; ECHILD: everything finished
     mov ebx, eax                    ; pid
     mov eax, [tr_wstatus]
     mov ecx, eax
     and ecx, 0xFF
     cmp ecx, 0x7F
-    je .tr_stopped
-    ; exited or killed
+    je .th_stopped
+    ; exited or killed: free the slot of a call that never returned
+    mov r13d, eax
+    mov edi, ebx
+    xor esi, esi
+    call tr_find_slot
+    test rax, rax
+    jz .th_gone
+    mov dword [rax], 0
+.th_gone:
+    mov eax, r13d
     cmp ebx, [tr_child]
-    jne .tr_loop
+    jne .th_loop
     mov ecx, eax
     and ecx, 0x7F
-    jz .tr_exit_code
+    jz .th_exit_code
     add ecx, 128
     mov [tr_child_status], ecx
-    jmp .tr_loop
-.tr_exit_code:
+    jmp .th_loop
+.th_exit_code:
     shr eax, 8
     and eax, 0xFF
     mov [tr_child_status], eax
-    jmp .tr_loop
+    jmp .th_loop
 
-.tr_stopped:
+.th_stopped:
     xor r13d, r13d                  ; signal to pass on
     mov ecx, eax
     shr ecx, 16
-    jnz .tr_resume                  ; fork/clone/exec event
+    jnz .th_resume                  ; fork/clone/exec event
     shr eax, 8
     and eax, 0xFF
     cmp eax, 0x85                   ; SIGTRAP | 0x80: syscall stop
-    jne .tr_signal
+    jne .th_signal
     mov edi, ebx
     call tr_syscall_stop
-    jmp .tr_resume
-.tr_signal:
+    jmp .th_resume
+.th_signal:
     cmp eax, TR_SIGSTOP
-    je .tr_resume
+    je .th_resume
     cmp eax, TR_SIGTRAP
-    je .tr_resume
+    je .th_resume
     mov r13d, eax
-.tr_resume:
+.th_resume:
     mov eax, TR_SYS_PTRACE
     mov edi, TR_PTRACE_SYSCALL
     mov esi, ebx
     xor edx, edx
     mov r10d, r13d
     syscall
-    jmp .tr_loop
+    jmp .th_loop
 
-.tr_child_gone:
-.tr_noperm:
+.th_noperm:
     lea rdi, [tr_s_noperm]
     call ash_write_err
     mov dword [tr_child_status], 1
-.tr_done:
-    cmp byte [interactive_mode], 0
-    je .tr_summary
-    call setup_raw_mode
-.tr_summary:
+.th_done:
     lea rdi, [tr_s_sum1]
     call ash_write_err
     mov eax, [tr_counts + TK_EXEC * 4]
@@ -2843,23 +2941,18 @@ handler_trace:
     mov eax, [tr_counts + TK_NET * 4]
     lea rsi, [tr_s_sum_net]
     call tr_write_count
-    mov eax, [tr_child_status]
-    mov [last_exit_status], eax
-    jmp .tr_ret
-.tr_usage:
-    lea rdi, [tr_s_usage]
-    call print_cstring
-    mov dword [last_exit_status], 2
-.tr_ret:
-    mov byte [stats_valid], 0
-    add rsp, 8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
-    ret
+    mov eax, [tr_counts + TK_HIDDEN * 4]
+    test eax, eax
+    jz .th_exit
+    lea rdi, [tr_s_hid1]
+    call ash_write_err
+    mov eax, [tr_counts + TK_HIDDEN * 4]
+    lea rsi, [tr_s_hid2]
+    call tr_write_count
+.th_exit:
+    mov edi, [tr_child_status]
+    mov eax, SYS_EXIT
+    syscall
 
 .tr_child_proc:
     mov eax, TR_SYS_PTRACE
@@ -2932,6 +3025,21 @@ tr_find_slot:
 .fs_ret:
     ret
 
+; tr_peek(edi = pid, rsi = remote address, rdx = dst, ecx = length) -> rax = bytes read
+tr_peek:
+    mov [tr_liov], rdx
+    mov [tr_liov + 8], rcx
+    mov [tr_riov], rsi
+    mov [tr_riov + 8], rcx
+    lea rsi, [tr_liov]
+    mov edx, 1
+    lea r10, [tr_riov]
+    mov r8d, 1
+    xor r9d, r9d
+    mov eax, TR_SYS_VM_READV
+    syscall
+    ret
+
 ; tr_read_str(edi = pid, rsi = remote address, rdx = dst, ecx = max)
 ; -> eax = length (dst NUL-terminated)
 tr_read_str:
@@ -2996,6 +3104,371 @@ tr_read_str:
     pop rbx
     ret
 
+; tr_put_str(rdi = dst, rsi = NUL ended text, edx = most bytes to write)
+; -> rax = end of what was written (no NUL)
+; Control bytes, DEL, backslash and anything that is not well formed UTF-8
+; are written as \xNN, and so are the C1 controls, so text from the
+; traced program cannot start a new line or drive the terminal.
+tr_put_str:
+    push rbx
+    mov eax, edx
+    lea rbx, [rdi + rax]            ; end of the room
+    sub rbx, 4                      ; every item below needs at most 4 bytes
+.pt_loop:
+    movzx eax, byte [rsi]
+    test eax, eax
+    jz .pt_done
+    cmp rdi, rbx
+    ja .pt_done
+    cmp eax, '\'
+    je .pt_hex
+    cmp eax, 0x20
+    jb .pt_hex
+    cmp eax, 0x7F
+    je .pt_hex
+    jb .pt_plain
+    ; a byte of 0x80 or more: accept only a whole, shortest-form sequence
+    mov r9d, 0x80                   ; lowest allowed second byte
+    mov r10d, 0xBF                  ; highest allowed second byte
+    cmp eax, 0xC2
+    jb .pt_hex
+    cmp eax, 0xDF
+    jbe .pt_len2
+    cmp eax, 0xEF
+    jbe .pt_len3
+    cmp eax, 0xF4
+    ja .pt_hex
+    mov r8d, 4
+    cmp eax, 0xF0
+    jne .pt_f4
+    mov r9d, 0x90
+.pt_f4:
+    cmp eax, 0xF4
+    jne .pt_check
+    mov r10d, 0x8F
+    jmp .pt_check
+.pt_len2:
+    mov r8d, 2
+    cmp eax, 0xC2
+    jne .pt_check
+    ; U+0080 to U+009F are C1 controls: reject them
+    movzx ecx, byte [rsi + 1]
+    cmp ecx, 0xA0
+    jb .pt_hex
+    jmp .pt_check
+.pt_len3:
+    mov r8d, 3
+    cmp eax, 0xE0
+    jne .pt_ed
+    mov r9d, 0xA0
+.pt_ed:
+    cmp eax, 0xED
+    jne .pt_check
+    mov r10d, 0x9F
+.pt_check:
+    movzx ecx, byte [rsi + 1]
+    cmp ecx, r9d
+    jb .pt_hex
+    cmp ecx, r10d
+    ja .pt_hex
+    cmp r8d, 3
+    jb .pt_copy
+    movzx ecx, byte [rsi + 2]
+    sub ecx, 0x80
+    cmp ecx, 0x3F
+    ja .pt_hex
+    cmp r8d, 4
+    jb .pt_copy
+    movzx ecx, byte [rsi + 3]
+    sub ecx, 0x80
+    cmp ecx, 0x3F
+    ja .pt_hex
+.pt_copy:
+    mov ecx, r8d
+.pt_copy_loop:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .pt_copy_loop
+    jmp .pt_loop
+.pt_plain:
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .pt_loop
+.pt_hex:
+    mov byte [rdi], '\'
+    mov byte [rdi + 1], 'x'
+    mov ecx, eax
+    shr ecx, 4
+    movzx ecx, byte [tr_hexd + rcx]
+    mov [rdi + 2], cl
+    and eax, 15
+    movzx ecx, byte [tr_hexd + rax]
+    mov [rdi + 3], cl
+    add rdi, 4
+    inc rsi
+    jmp .pt_loop
+.pt_done:
+    mov rax, rdi
+    pop rbx
+    ret
+
+; tr_canon_path(rdi = dst, rsi = path, edx = dirfd, ecx = pid) -> eax 1 / 0
+; Writes the absolute path with "//" and "." folded. Returns 0 when the name
+; cannot be judged: it contains "..", it is relative to a descriptor, or the
+; working folder is unknown. A relative name is taken from /proc/<pid>/cwd.
+tr_canon_path:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                    ; dst
+    mov r13, rsi                    ; path
+    mov r14, rdi                    ; write position
+    mov ebx, ecx
+    cmp byte [rsi], 0
+    je .cp_fail
+    cmp byte [rsi], '/'
+    je .cp_start
+    cmp edx, AT_FDCWD
+    jne .cp_fail
+    lea rdi, [tr_tmp]
+    lea rsi, [tr_s_proc]
+    call upd_stpcpy
+    mov rdi, rax
+    mov esi, ebx
+    call ash_fmt_int
+    mov rdi, rax
+    lea rsi, [tr_s_cwd]
+    call upd_stpcpy
+    lea rdi, [tr_tmp]
+    mov rsi, r12
+    mov edx, TR_NAMES_MAX - 8
+    mov eax, SYS_READLINK
+    syscall
+    test rax, rax
+    jle .cp_fail
+    cmp byte [r12], '/'
+    jne .cp_fail
+    lea r14, [r12 + rax]
+    cmp rax, 1
+    jne .cp_start
+    mov r14, r12                    ; the root: nothing before the first "/name"
+.cp_start:
+    lea rbx, [r12 + TR_NAMES_MAX]   ; end of the room
+.cp_slashes:
+    cmp byte [r13], '/'
+    jne .cp_name
+    inc r13
+    jmp .cp_slashes
+.cp_name:
+    mov al, [r13]
+    test al, al
+    jz .cp_end
+    cmp al, '.'
+    jne .cp_copy
+    mov cl, [r13 + 1]
+    test cl, cl
+    jz .cp_dot
+    cmp cl, '/'
+    je .cp_dot
+    cmp cl, '.'
+    jne .cp_copy
+    mov cl, [r13 + 2]
+    test cl, cl
+    jz .cp_fail                     ; ".." ends the name: judging it needs the links
+    cmp cl, '/'
+    je .cp_fail
+    jmp .cp_copy
+.cp_dot:
+    inc r13
+    jmp .cp_slashes
+.cp_copy:
+    cmp r14, rbx
+    jae .cp_fail
+    mov byte [r14], '/'
+    inc r14
+.cp_chars:
+    mov al, [r13]
+    test al, al
+    jz .cp_end
+    cmp al, '/'
+    je .cp_slashes
+    cmp r14, rbx
+    jae .cp_fail
+    mov [r14], al
+    inc r14
+    inc r13
+    jmp .cp_chars
+.cp_end:
+    cmp r14, r12
+    jne .cp_term
+    mov byte [r14], '/'
+    inc r14
+.cp_term:
+    mov byte [r14], 0
+    mov eax, 1
+    jmp .cp_ret
+.cp_fail:
+    xor eax, eax
+.cp_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tr_is_hidden(rsi = canonical path) -> eax 1 if tr_hide_strs covers it
+tr_is_hidden:
+    lea r8, [tr_hide_strs]
+.ih_next:
+    cmp byte [r8], 0
+    je .ih_no
+    mov rdi, rsi
+    mov r9, r8
+.ih_cmp:
+    mov al, [r9]
+    test al, al
+    jz .ih_whole
+    cmp al, [rdi]
+    jne .ih_skip
+    inc r9
+    inc rdi
+    jmp .ih_cmp
+.ih_whole:
+    mov al, [rdi]                   ; the entry must end at a name boundary
+    test al, al
+    jz .ih_yes
+    cmp al, '/'
+    je .ih_yes
+.ih_skip:
+    cmp byte [r8], 0
+    je .ih_adv
+    inc r8
+    jmp .ih_skip
+.ih_adv:
+    inc r8
+    jmp .ih_next
+.ih_yes:
+    mov eax, 1
+    ret
+.ih_no:
+    xor eax, eax
+    ret
+
+; tr_fmt_sockaddr(rdi = dst, esi = bytes in tr_sockaddr) -> rax = end, 0 if the
+; address family is not one trace prints. dst receives an IPv4 or IPv6
+; address with the port, or "unix:" and the socket name.
+tr_fmt_sockaddr:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13d, esi
+    cmp esi, 2
+    jb .fa_none
+    movzx eax, word [tr_sockaddr]
+    cmp eax, 2
+    je .fa_inet
+    cmp eax, 10
+    je .fa_inet6
+    cmp eax, 1
+    jne .fa_none
+    ; unix: the name ends at the length given, or at a NUL
+    mov byte [tr_sockaddr + r13], 0
+    lea rsi, [tr_s_unix]
+    mov rdi, r12
+    call upd_stpcpy
+    mov rdi, rax
+    lea rsi, [tr_sockaddr + 2]
+    cmp byte [rsi], 0
+    jne .fa_unix_put
+    cmp r13d, 3
+    jb .fa_unix_end                 ; unnamed
+    mov byte [rdi], '@'             ; abstract name
+    inc rdi
+    inc rsi
+.fa_unix_put:
+    mov edx, 120
+    call tr_put_str
+.fa_unix_end:
+    jmp .fa_ret
+.fa_inet:
+    cmp r13d, 8
+    jb .fa_none
+    mov rdi, r12
+    xor ebx, ebx
+.fa_ip:
+    movzx esi, byte [tr_sockaddr + 4 + rbx]
+    call ash_fmt_int
+    mov rdi, rax
+    inc ebx
+    cmp ebx, 4
+    je .fa_port
+    mov byte [rdi], '.'
+    inc rdi
+    jmp .fa_ip
+.fa_inet6:
+    cmp r13d, 24
+    jb .fa_none
+    mov rdi, r12
+    mov byte [rdi], '['
+    inc rdi
+    xor ebx, ebx                    ; group 0..7
+.fa_group:
+    movzx eax, byte [tr_sockaddr + 8 + rbx * 2]
+    shl eax, 8
+    movzx ecx, byte [tr_sockaddr + 9 + rbx * 2]
+    or eax, ecx
+    mov r9d, eax
+    mov ecx, 12
+    xor r10d, r10d                  ; a non-zero digit was written
+.fa_digit:
+    mov eax, r9d
+    shr eax, cl
+    and eax, 15
+    test r10d, r10d
+    jnz .fa_wr
+    test eax, eax
+    jnz .fa_wr
+    test ecx, ecx
+    jnz .fa_next_digit              ; leading zero
+.fa_wr:
+    mov r10d, 1
+    movzx eax, byte [tr_hexd + rax]
+    mov [rdi], al
+    inc rdi
+.fa_next_digit:
+    sub ecx, 4
+    jns .fa_digit
+    inc ebx
+    cmp ebx, 8
+    je .fa_close
+    mov byte [rdi], ':'
+    inc rdi
+    jmp .fa_group
+.fa_close:
+    mov byte [rdi], ']'
+    inc rdi
+.fa_port:
+    mov byte [rdi], ':'
+    inc rdi
+    movzx esi, word [tr_sockaddr + 2]
+    rol si, 8                       ; network byte order
+    movzx esi, si
+    call ash_fmt_int
+    jmp .fa_ret
+.fa_none:
+    xor eax, eax
+.fa_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; tr_syscall_stop(edi = pid): on entry, build a line for interesting calls;
 ; on exit, print it if the call succeeded.
 tr_syscall_stop:
@@ -3023,40 +3496,78 @@ tr_syscall_stop:
     jne .ss_ret
 
     ; ---- entry ----
+    ; Only the x86-64 table is decoded; the 32-bit entry and the x32 numbers
+    ; mean other calls with the same numbers, so say so once and move on.
+    cmp dword [tr_info + 4], TR_AUDIT_X86_64
+    jne .ss_compat
     mov rax, [tr_info + 24]         ; syscall number
+    cmp rax, 0x40000000
+    jae .ss_compat
+    mov dword [tr_dirfd], AT_FDCWD
     mov r13, [tr_info + 32]         ; args[0]
     mov r14, [tr_info + 40]         ; args[1]
-    cmp rax, 59                     ; execve
+    cmp eax, 59                     ; execve
     je .ss_exec
-    cmp rax, 322                    ; execveat
-    je .ss_exec2
-    cmp rax, 2                      ; open
+    cmp eax, 322                    ; execveat
+    je .ss_execat
+    cmp eax, 2                      ; open
     je .ss_open
-    cmp rax, 257                    ; openat
+    cmp eax, 257                    ; openat
     je .ss_openat
-    cmp rax, 85                     ; creat
+    cmp eax, 437                    ; openat2
+    je .ss_openat2
+    cmp eax, 85                     ; creat
     je .ss_creat
-    cmp rax, 87                     ; unlink
+    cmp eax, 87                     ; unlink
     je .ss_unlink
-    cmp rax, 263                    ; unlinkat
+    cmp eax, 84                     ; rmdir
+    je .ss_unlink
+    cmp eax, 263                    ; unlinkat
     je .ss_unlinkat
-    cmp rax, 84                     ; rmdir
-    je .ss_unlink
-    cmp rax, 83                     ; mkdir
+    cmp eax, 83                     ; mkdir
     je .ss_mkdir
-    cmp rax, 258                    ; mkdirat
+    cmp eax, 258                    ; mkdirat
     je .ss_mkdirat
-    cmp rax, 82                     ; rename
+    cmp eax, 82                     ; rename
     je .ss_rename
-    cmp rax, 264                    ; renameat
+    cmp eax, 264                    ; renameat
     je .ss_renameat
-    cmp rax, 316                    ; renameat2
+    cmp eax, 316                    ; renameat2
     je .ss_renameat
-    cmp rax, 42                     ; connect
+    cmp eax, 86                     ; link
+    je .ss_link
+    cmp eax, 265                    ; linkat
+    je .ss_linkat
+    cmp eax, 88                     ; symlink
+    je .ss_symlink
+    cmp eax, 266                    ; symlinkat
+    je .ss_symlinkat
+    cmp eax, 76                     ; truncate
+    je .ss_truncate
+    cmp eax, 133                    ; mknod
+    je .ss_mknod
+    cmp eax, 259                    ; mknodat
+    je .ss_mknodat
+    cmp eax, 42                     ; connect
     je .ss_connect
+    cmp eax, 44                     ; sendto
+    je .ss_sendto
+    cmp eax, 46                     ; sendmsg
+    je .ss_sendmsg
+    cmp eax, 307                    ; sendmmsg
+    je .ss_sendmsg
     jmp .ss_ret
 
-.ss_exec2:
+.ss_compat:
+    cmp byte [tr_compat], 0
+    jne .ss_ret
+    mov byte [tr_compat], 1
+    lea rdi, [tr_s_compat]
+    call ash_write_err
+    jmp .ss_ret
+
+.ss_execat:
+    mov [tr_dirfd], r13d
     mov r13, r14
 .ss_exec:
     mov ebx, TK_EXEC
@@ -3066,10 +3577,36 @@ tr_syscall_stop:
     mov ebx, TK_WRITE
     lea rsi, [tr_t_write]
     jmp .ss_path
+.ss_truncate:
+.ss_mknod:
+    mov ebx, TK_WRITE
+    lea rsi, [tr_t_write]
+    jmp .ss_path
+.ss_mknodat:
+    mov [tr_dirfd], r13d
+    mov r13, r14
+    mov ebx, TK_WRITE
+    lea rsi, [tr_t_write]
+    jmp .ss_path
 .ss_open:
     mov rcx, r14                    ; flags
     jmp .ss_open_kind
+.ss_openat2:
+    mov [tr_dirfd], r13d
+    mov r13, r14
+    ; the flags are the first field of struct open_how
+    mov edi, r12d
+    mov rsi, [tr_info + 48]
+    lea rdx, [tr_how]
+    mov ecx, 8
+    call tr_peek
+    xor ecx, ecx
+    cmp rax, 8
+    jne .ss_open_kind
+    mov rcx, [tr_how]
+    jmp .ss_open_kind
 .ss_openat:
+    mov [tr_dirfd], r13d
     mov rcx, [tr_info + 48]         ; flags
     mov r13, r14
 .ss_open_kind:
@@ -3086,23 +3623,50 @@ tr_syscall_stop:
     lea rsi, [tr_t_write]
     jmp .ss_path
 .ss_unlinkat:
+    mov [tr_dirfd], r13d
     mov r13, r14
 .ss_unlink:
     mov ebx, TK_DELETE
     lea rsi, [tr_t_delete]
     jmp .ss_path
 .ss_mkdirat:
+    mov [tr_dirfd], r13d
     mov r13, r14
 .ss_mkdir:
     mov ebx, TK_MKDIR
     lea rsi, [tr_t_mkdir]
     jmp .ss_path
+
+    ; two names: r13 = first, r14 = second
 .ss_renameat:
     mov r13, r14                    ; old = args[1], new = args[3]
     mov r14, [tr_info + 56]
+    mov ebx, TK_RENAME
+    lea rsi, [tr_t_rename]
+    jmp .ss_pair
 .ss_rename:
     mov ebx, TK_RENAME
     lea rsi, [tr_t_rename]
+    jmp .ss_pair
+.ss_linkat:
+    mov r13, r14                    ; old = args[1], new = args[3]
+    mov r14, [tr_info + 56]
+.ss_link:
+    mov ebx, TK_WRITE
+    lea rsi, [tr_t_link]
+    jmp .ss_pair
+.ss_symlinkat:
+    mov r14, [tr_info + 48]         ; link name = args[2]
+    jmp .ss_symlink_order
+.ss_symlink:
+    ; shown as "link name -> target", the way ls -l prints it
+.ss_symlink_order:
+    mov rax, r13
+    mov r13, r14
+    mov r14, rax
+    mov ebx, TK_WRITE
+    lea rsi, [tr_t_symlink]
+.ss_pair:
     call .ss_begin
     test rax, rax
     jz .ss_ret
@@ -3123,81 +3687,85 @@ tr_syscall_stop:
     mov rdi, rax
     call .ss_add_path
     cmp ebx, TK_READ
+    je .ss_hide
+    cmp ebx, TK_LIST
     jne .ss_ret
+.ss_hide:
     cmp byte [tr_all], 0
     jne .ss_ret
-    call .ss_hidden
+    lea rdi, [tr_canon]
+    lea rsi, [tr_pathbuf]
+    mov edx, [tr_dirfd]
+    mov ecx, r12d
+    call tr_canon_path
+    test eax, eax
+    jz .ss_ret
+    lea rsi, [tr_canon]
+    call tr_is_hidden
+    test eax, eax
+    jz .ss_ret
+    mov dword [r15 + 4], 0          ; keep the slot, print nothing
+    inc dword [tr_counts + TK_HIDDEN * 4]
     jmp .ss_ret
 
+    ; network: r13 = address, r14 = its length
 .ss_connect:
-    ; read the sockaddr
-    mov edi, r12d
-    lea rax, [tr_sockaddr]
-    mov [tr_liov], rax
-    mov qword [tr_liov + 8], 28
-    mov [tr_riov], r14
-    mov qword [tr_riov + 8], 28
-    lea rsi, [tr_liov]
-    mov edx, 1
-    lea r10, [tr_riov]
-    mov r8d, 1
-    xor r9d, r9d
-    mov eax, TR_SYS_VM_READV
-    syscall
-    test rax, rax
-    jle .ss_ret
-    mov ebx, TK_NET
+    mov r13, r14                    ; args[1]
+    mov r14, [tr_info + 48]         ; args[2]
     lea rsi, [tr_t_net]
+    jmp .ss_net
+.ss_sendto:
+    mov r13, [tr_info + 64]         ; args[4]
+    mov r14, [tr_info + 72]         ; args[5]
+    lea rsi, [tr_t_send]
+    jmp .ss_net
+.ss_sendmsg:
+    ; msghdr starts with msg_name (pointer) and msg_namelen; for sendmmsg the
+    ; first message is looked at
+    mov edi, r12d
+    mov rsi, r14
+    lea rdx, [tr_msghdr]
+    mov ecx, 16
+    call tr_peek
+    cmp rax, 16
+    jne .ss_ret
+    mov r13, [tr_msghdr]
+    mov r14d, [tr_msghdr + 8]
+    lea rsi, [tr_t_send]
+.ss_net:
+    test r13, r13
+    jz .ss_ret
+    cmp r14, 2
+    jb .ss_ret
+    cmp r14, 110
+    jbe .ss_net_len
+    mov r14d, 110
+.ss_net_len:
+    mov edi, r12d
+    push rsi
+    sub rsp, 8
+    mov rsi, r13
+    lea rdx, [tr_sockaddr]
+    mov ecx, r14d
+    call tr_peek
+    add rsp, 8
+    pop rsi
+    cmp rax, 2
+    jl .ss_ret
+    mov r14d, eax
+    mov ebx, TK_NET
     call .ss_begin
     test rax, rax
     jz .ss_ret
     mov rdi, rax
-    movzx eax, word [tr_sockaddr]
-    cmp eax, 2
-    je .ss_inet
-    cmp eax, 10
-    je .ss_inet6
-    cmp eax, 1
-    jne .ss_drop                    ; other families: skip
-    lea rsi, [tr_s_unix]
-    call upd_stpcpy
-    lea rsi, [tr_sockaddr + 2]
-    mov byte [tr_sockaddr + 27], 0
-    call upd_stpcpy
+    mov esi, r14d
+    call tr_fmt_sockaddr
+    test rax, rax
+    jz .ss_net_drop
+    mov byte [rax], 0
     jmp .ss_ret
-.ss_inet6:
-    lea rsi, [tr_s_v6]
-    call upd_stpcpy
-    jmp .ss_port
-.ss_inet:
-    mov rax, rdi                    ; write pointer
-    xor ecx, ecx
-.ss_ip:
-    push rcx
-    push rcx
-    movzx esi, byte [tr_sockaddr + 4 + rcx]
-    mov rdi, rax
-    call ash_fmt_int
-    pop rcx
-    pop rcx
-    cmp ecx, 3
-    je .ss_port
-    mov byte [rax], '.'
-    inc rax
-    inc ecx
-    jmp .ss_ip
-.ss_port:
-    mov rdi, rax
-    lea rsi, [tr_s_colon]
-    call upd_stpcpy
-    mov rdi, rax
-    movzx esi, word [tr_sockaddr + 2]
-    rol si, 8                       ; network byte order
-    movzx esi, si
-    call ash_fmt_int
-    jmp .ss_ret
-.ss_drop:
-    mov dword [r15], 0              ; forget the slot (r15 = slot)
+.ss_net_drop:
+    mov dword [r15], 0              ; not an address family we print: forget it
     jmp .ss_ret
 
     ; ---- exit ----
@@ -3218,6 +3786,16 @@ tr_syscall_stop:
     test rax, rax
     js .ss_ret
 .ss_ok:
+    ; the first program the command starts is the /bin/sh wrapper
+    cmp ecx, TK_EXEC
+    jne .ss_count
+    cmp byte [tr_wrapper], 0
+    jne .ss_count
+    cmp r12d, [tr_child]
+    jne .ss_count
+    mov byte [tr_wrapper], 1
+    jmp .ss_ret
+.ss_count:
     cmp ecx, TK_LIST
     je .ss_print
     lea rax, [tr_counts]
@@ -3256,48 +3834,27 @@ tr_syscall_stop:
 .sb_ret:
     ret
 
-; local: append the tracee string at r13 to rdi -> rax = end
+; local: append the tracee string at r13 to rdi (escaped) -> rax = end.
+; The raw name stays in tr_pathbuf for the hide check.
 .ss_add_path:
     push rdi
-    mov rdx, rdi
     mov edi, r12d
     mov rsi, r13
-    lea rcx, [r15 + 8]
-    add rcx, TR_LINE_MAX / 2
-    sub rcx, rdx                    ; room left (keeps the line bounded)
-    cmp ecx, 16
-    jge .ap_room
-    mov ecx, 16
-.ap_room:
+    lea rdx, [tr_pathbuf]
+    mov ecx, TR_PATH_MAX
     call tr_read_str
+    mov r8d, eax
     pop rdi
-    add rax, rdi
-    ret
-
-; local: drop the pending read if its path is on the hide list
-.ss_hidden:
-    lea r8, [tr_hide_list]
-.sh_next:
-    mov rsi, [r8]
-    test rsi, rsi
-    jz .sh_ret
-    lea rdi, [r15 + 8 + 11]         ; path after the tag
-.sh_cmp:
-    mov al, [rsi]
-    test al, al
-    jz .sh_hit
-    cmp al, [rdi]
-    jne .sh_miss
-    inc rsi
-    inc rdi
-    jmp .sh_cmp
-.sh_hit:
-    mov dword [r15 + 4], 0          ; keep the slot, print nothing
-    ret
-.sh_miss:
-    add r8, 8
-    jmp .sh_next
-.sh_ret:
+    lea rsi, [tr_pathbuf]
+    test r8d, r8d
+    jnz .ap_put
+    lea rsi, [tr_s_empty]
+.ap_put:
+    mov edx, TR_PATH_BUDGET
+    sub rsp, 8
+    call tr_put_str
+    add rsp, 8
+    mov byte [rax], 0
     ret
 
 ; ============================================================================
