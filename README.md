@@ -27,12 +27,13 @@ It is part serious tool, part love letter to the x86-64 ISA and the Linux kernel
 
 ### Shell
 - **ASH (Assembly Shell)** executor: pipelines, quotes, escapes, `$(...)` and backticks run natively, no `/bin/sh` process. Builtins (`history`, `set`, `alias`, ...) work in pipelines and in `$(...)`.
-- **ASH script engine**: `if`/`elif`/`else`, `while`, `until`, `for`, `break [N]`/`continue [N]`, functions (they accept pipes and redirections), `shift`, `test` / `[ ]` (with `-a`, `-o`, `!`, `( )`), `$?`, `$$`, `$((...))` (C-like operators with short-circuit `&&`/`||`, `?:`, hex and octal), `NAME=value`, multi-line blocks. Syntax ASH does not handle yet (`case`/`esac`, a loop piped into another command, here-docs) is handed to `/bin/sh`, which therefore has to be installed; such statements see shell functions, positional parameters and `$?` but cannot change your variables or directory. Not supported: `local`, `read`, `${x:-d}`, `${#x}`, `$((x=1))`.
+- **ASH script engine**: `if`/`elif`/`else`, `while`, `until`, `for`, `break [N]`/`continue [N]`, functions (they accept pipes and redirections), `shift`, `test` / `[ ]` (with `-a`, `-o`, `!`, `( )`), `$?`, `$$`, `$((...))` (C-like operators with short-circuit `&&`/`||`, `?:`, hex and octal), `NAME=value`, multi-line blocks. `case`/`esac`, `"$@"` and `. file` work natively. Syntax ASH does not handle yet (a loop or `case` that is piped or redirected, here-docs) is handed to `/bin/sh`, which therefore has to be installed; such statements see shell functions, positional parameters and `$?` but cannot change your variables or directory. Not supported: `local`, `read`, `${x:-d}`, `${#x}`, `$((x=1))`.
 - Compound commands: `cmd1 ; cmd2`, `cmd1 && cmd2`, `cmd1 || cmd2`
 - I/O redirection: `>`, `>>`, `<`, `N>`, `N>>`, `N<`, `>&N`, `&>`, applied in the order written (`2>&1 >f` and `>f 2>&1` differ). A redirect to a file that cannot be opened stops the command with status 1.
 - Piping: `cmd1 | cmd2`
 - Environment variable expansion: `$VAR` and `${VAR}`. Values are data: a variable, loop variable or file name that contains `$(...)`, backticks, `|`, `>` or quotes is never run or re-parsed. Names are case-sensitive.
-- Wildcard expansion (`*`, `?`) for external commands (via `/bin/sh`)
+- Wildcard expansion (`*`, `?`, `[...]`): done natively for builtins; external commands in pipelines, background jobs and `for` lists go through `/bin/sh`
+- Command lines up to 65535 bytes after expansion (the editor and history keep 511)
 - Job control: each foreground command and background job has its own process group; Ctrl+C reaches only the foreground job, Ctrl+Z stops it, `fg`/`bg` resume it.
 - Exit statuses: the exit code, 128+signal for a killed command, 126 for found but not runnable, 127 for not found. Builtins set `$?` too, so `&&`, `||` and `if` work after a failing `cd`, `mkdir` or `copy`. Builtin error messages go to stderr.
 
@@ -54,7 +55,7 @@ It is part serious tool, part love letter to the x86-64 ISA and the Linux kernel
 | Files | `ls [-la]` (sorted, symlinks shown, colors only on a terminal), `dir`, `cat`/`type`, `copy`, `move`/`rename`, `del`, `mkdir`, `rmdir`, `grep` |
 | Env | `set`, `export`, `unset`, `whoami` |
 | Display | `echo`, `cls`/`clear`, `color`, `title` |
-| System | `ver`, `about`, `update`, `date`, `time`, `uptime`, `free`, `calc`, `source`, `help`, `exit [N]`, `true`, `false`, `which`, `history`, `kill`, `test` / `[ ]` |
+| System | `ver`, `about`, `update`, `date`, `time`, `uptime`, `free`, `calc`, `source` (or `.`), `help`, `exit [N]`, `true`, `false`, `which`, `history`, `kill`, `test` / `[ ]` |
 | Tools | `bench`, `undo`, `trash`, `trace`, `sandbox` (see [Safety tools](#safety-tools)) |
 | Customization | `alias`, `unalias`, `theme` |
 | Jobs | `<cmd> &`, `jobs`, `fg`, `bg`, `kill [-s NAME] PID\|%JOB`, `kill -l`, Ctrl+Z |
@@ -223,7 +224,7 @@ asm-terminal/
 - `ash_eval` — ASH script engine (`ash/script.asm`): runs `;` `&&` `||`, `if`, `while`, `for` natively
 - Handlers: `handler_*(rdi=args)`
 
-### Memory layout (`.bss`, about 20 MB of address space, zero-filled and not stored in the file; only pages that are used cost memory)
+### Memory layout (`.bss`, about 22 MB of address space, zero-filled and not stored in the file; only pages that are used cost memory)
 The main regions:
 | Region | Size | Purpose |
 |---|---|---|

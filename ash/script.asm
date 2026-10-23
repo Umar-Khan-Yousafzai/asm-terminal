@@ -3,6 +3,7 @@
 ;
 ;   if / elif / else / fi       while / until ... do ... done
 ;   for NAME in WORDS; do ... done      break / continue
+;   case WORD in pat|pat) cmds ;; ... esac
 ;   { ... }   cmd1 && cmd2 || cmd3   ! cmd   NAME=value
 ;   test EXPR  /  [ EXPR ]       $?  $$  $((arithmetic))
 ;
@@ -19,8 +20,14 @@
 ;
 ; Functions: "name() { ...; }" stores the body text; calling name runs it
 ; with $1..$9, $# and $@ set (old values restored after), "return [N]" ends it.
+; Inside double quotes "$@" is rewritten (ash_load_line) into one word per
+; parameter before the usual expansion; ". file" is "source file".
 ;
-; Not native yet: case/esac, a loop piped or redirected
+; case WORD in pat|pat) cmds ;; ... esac is native: the CASE node holds the
+; word, each clause is a CPAT node (the patterns) followed by its commands
+; and a DSEMI node. Choosing the clause happens in ash_case_select.
+;
+; Not native yet: a loop or case piped or redirected
 ; ("done | sort", "cat f | while read l"). The tokenizer marks such a
 ; top-level statement and ash_link turns it into one N_SH node, which runs
 ; that statement's original text through /bin/sh.
@@ -60,6 +67,8 @@
 %define N_ESAC              15
 %define N_SH                16          ; statement handed to /bin/sh
 %define N_FUNC              17          ; "name()" - next node is "{"
+%define N_CPAT              18          ; "pat|pat)" of a case clause
+%define N_DSEMI             19          ; ";;" ending a case clause
 
 %define ASH_FUNC_MAX        64
 %define ASH_FUNC_SIZE       8192
@@ -220,9 +229,9 @@ section .bss
     ash_num_buf         resb 32
     ash_num_tmp         resb 32
     ash_ar_buf          resb 512
-    ash_word_buf        resb 1024
-    ash_test_buf        resb 1024
-    ash_sh_script       resb 1280
+    ash_word_buf        resb LINE_MAX
+    ash_test_buf        resb LINE_MAX + 64
+    ash_sh_script       resb 2 * LINE_MAX + 64
     ash_pending         resb ASH_PENDING_MAX
     ash_frames          resb ASH_FRAMES_MAX * ASH_FRAME_SIZE
     ash_funcs           resb ASH_FUNC_MAX * ASH_FUNC_SIZE
@@ -698,17 +707,25 @@ ash_tokenize:
     push r13
     push r14
     push r15
-    sub rsp, 24                     ; [rbp-48] need_cmd, [rbp-52] type,
+    sub rsp, 40                     ; [rbp-48] need_cmd, [rbp-52] type,
                                     ; [rbp-56] next conn, [rbp-60] next need
                                     ; [rbp-64] C_SH mark for the next node
+                                    ; [rbp-68] 1 = a case pattern comes next
+                                    ; [rbp-72] 1 = a ";;" was just taken off
+                                    ; [rbp-76] case statements open
     mov r12, rdi
     mov r13, rsi
     xor r14d, r14d
     xor r15d, r15d
     mov dword [rbp - 48], 0
     mov dword [rbp - 64], 0
+    mov dword [rbp - 68], 0
+    mov dword [rbp - 72], 0
+    mov dword [rbp - 76], 0
 
 .tk_item:
+    cmp dword [rbp - 72], 0
+    jne .tk_dsemi
     movzx eax, byte [r12]
     cmp al, ' '
     je .tk_item_skip
@@ -717,13 +734,19 @@ ash_tokenize:
     cmp al, 10
     je .tk_item_skip
     cmp al, ';'
-    je .tk_item_skip
+    je .tk_semi
     test al, al
     jz .tk_eof
     cmp al, '#'
     je .tk_comment
     mov rdi, r12
     call ash_kw_match
+    cmp dword [rbp - 68], 0         ; after "case x in" or ";;": a pattern,
+    je .tk_nopat                    ; unless the case ends here
+    mov dword [rbp - 68], 0
+    cmp eax, N_ESAC
+    jne .tk_pat
+.tk_nopat:
     test eax, eax
     jz .tk_cmd
     mov rcx, r12
@@ -731,12 +754,17 @@ ash_tokenize:
     cmp eax, N_FOR                  ; "for" becomes one node with its list
     je .tk_for
     cmp eax, N_CASE
-    jne .tk_kw_emit
-    mov dword [rbp - 64], C_SH
+    je .tk_case
 .tk_kw_emit:
     mov [rbp - 52], eax
     ASH_EMIT
     mov eax, [rbp - 52]
+    cmp eax, N_ESAC
+    jne .tk_not_esac
+    cmp dword [rbp - 76], 0
+    je .tk_not_esac
+    dec dword [rbp - 76]
+.tk_not_esac:
     cmp eax, N_FI
     je .tk_after_close
     cmp eax, N_DONE
@@ -749,6 +777,251 @@ ash_tokenize:
 .tk_item_skip:
     inc r12
     jmp .tk_item
+
+.tk_semi:
+    cmp byte [r12 + 1], ';'
+    jne .tk_item_skip
+    add r12, 2
+.tk_dsemi:
+    ; ";;" ends a case clause; a pattern or "esac" follows
+    mov dword [rbp - 72], 0
+    lea rcx, [ash_s_dsemi]
+    cmp dword [rbp - 76], 0
+    je .tk_dsemi_bad                ; ";;" outside a case
+    mov eax, N_DSEMI
+    mov dword [rbp - 68], 1
+    ASH_EMIT
+    jmp .tk_item
+
+.tk_dsemi_bad:
+    mov rdi, rcx
+    jmp .tk_err
+
+.tk_case:
+    ; "case WORD in": the node text is WORD, ended with a NUL
+    movzx eax, byte [r12]
+    cmp al, ' '
+    je .tk_cs_ws
+    cmp al, 9
+    jne .tk_cs_word
+.tk_cs_ws:
+    inc r12
+    jmp .tk_case
+.tk_cs_word:
+    test al, al
+    jz .tk_incomplete
+    cmp al, 10
+    je .tk_cs_bad
+    mov rbx, r12
+    xor ecx, ecx                    ; in '...'
+    xor r8d, r8d                    ; in "..."
+    xor r9d, r9d                    ; in `...`
+    xor r10d, r10d                  ; ( depth
+.tk_cw:
+    movzx eax, byte [r12]
+    test al, al
+    jz .tk_incomplete
+    test ecx, ecx
+    jnz .tk_cw_sq
+    cmp al, '\'
+    je .tk_cw_bs
+    test r8d, r8d
+    jnz .tk_cw_dq
+    cmp al, 0x27
+    je .tk_cw_open_sq
+    cmp al, '"'
+    je .tk_cw_open_dq
+    cmp al, '`'
+    je .tk_cw_bq
+    test r9d, r9d
+    jnz .tk_cw_adv
+    cmp al, '('
+    je .tk_cw_lp
+    cmp al, ')'
+    je .tk_cw_rp
+    test r10d, r10d
+    jnz .tk_cw_adv
+    cmp al, ' '
+    je .tk_cw_end
+    cmp al, 9
+    je .tk_cw_end
+    cmp al, 10
+    je .tk_cw_end
+    cmp al, ';'
+    je .tk_cw_end
+.tk_cw_adv:
+    inc r12
+    jmp .tk_cw
+.tk_cw_sq:
+    cmp al, 0x27
+    jne .tk_cw_adv
+    xor ecx, ecx
+    jmp .tk_cw_adv
+.tk_cw_dq:
+    cmp al, '"'
+    jne .tk_cw_adv
+    xor r8d, r8d
+    jmp .tk_cw_adv
+.tk_cw_bs:
+    cmp byte [r12 + 1], 0
+    je .tk_incomplete
+    add r12, 2
+    jmp .tk_cw
+.tk_cw_open_sq:
+    mov ecx, 1
+    jmp .tk_cw_adv
+.tk_cw_open_dq:
+    mov r8d, 1
+    jmp .tk_cw_adv
+.tk_cw_bq:
+    xor r9d, 1
+    jmp .tk_cw_adv
+.tk_cw_lp:
+    inc r10d
+    jmp .tk_cw_adv
+.tk_cw_rp:
+    test r10d, r10d
+    jz .tk_cw_adv
+    dec r10d
+    jmp .tk_cw_adv
+.tk_cw_end:
+    mov r11, r12                    ; the word ends here
+.tk_cw_in:                          ; blanks and newlines up to "in"
+    movzx eax, byte [r12]
+    cmp al, ' '
+    je .tk_cw_in_skip
+    cmp al, 9
+    je .tk_cw_in_skip
+    cmp al, 10
+    jne .tk_cw_in_chk
+.tk_cw_in_skip:
+    inc r12
+    jmp .tk_cw_in
+.tk_cw_in_chk:
+    test al, al
+    jz .tk_incomplete
+    cmp al, 'i'
+    jne .tk_cs_bad
+    cmp byte [r12 + 1], 'n'
+    jne .tk_cs_bad
+    movzx eax, byte [r12 + 2]
+    test al, al
+    jz .tk_cw_in_ok
+    cmp al, ' '
+    je .tk_cw_in_ok
+    cmp al, 9
+    je .tk_cw_in_ok
+    cmp al, 10
+    je .tk_cw_in_ok
+    cmp al, ';'
+    jne .tk_cs_bad
+.tk_cw_in_ok:
+    mov byte [r11], 0
+    add r12, 2
+    inc dword [rbp - 76]
+    mov rcx, rbx
+    mov eax, N_CASE
+    mov dword [rbp - 68], 1
+    ASH_EMIT
+    jmp .tk_item
+.tk_cs_bad:
+    mov rdi, r12
+    jmp .tk_err
+
+.tk_pat:
+    ; "pat|pat)" or "(pat|pat)": the node text is the pattern list
+    cmp byte [r12], '('
+    jne .tk_pat_start
+    inc r12
+.tk_pat_start:
+    movzx eax, byte [r12]
+    cmp al, ' '
+    je .tk_pat_ws
+    cmp al, 9
+    jne .tk_pat_go
+.tk_pat_ws:
+    inc r12
+    jmp .tk_pat_start
+.tk_pat_go:
+    mov rbx, r12
+    xor ecx, ecx                    ; in '...'
+    xor r8d, r8d                    ; in "..."
+    xor r9d, r9d                    ; ( depth, for $( ) in a pattern
+    xor r10d, r10d                  ; in `...`
+.tk_pat_sc:
+    movzx eax, byte [r12]
+    test al, al
+    jz .tk_incomplete
+    test ecx, ecx
+    jnz .tk_pat_sq
+    cmp al, '\'
+    je .tk_pat_bs
+    test r8d, r8d
+    jnz .tk_pat_dq
+    cmp al, 0x27
+    je .tk_pat_open_sq
+    cmp al, '"'
+    je .tk_pat_open_dq
+    cmp al, '`'
+    je .tk_pat_bq
+    test r10d, r10d
+    jnz .tk_pat_adv
+    cmp al, '('
+    je .tk_pat_lp
+    cmp al, ')'
+    je .tk_pat_rp
+    cmp al, 10
+    je .tk_pat_bad
+.tk_pat_adv:
+    inc r12
+    jmp .tk_pat_sc
+.tk_pat_sq:
+    cmp al, 0x27
+    jne .tk_pat_adv
+    xor ecx, ecx
+    jmp .tk_pat_adv
+.tk_pat_dq:
+    cmp al, '\'
+    je .tk_pat_bs
+    cmp al, '"'
+    jne .tk_pat_adv
+    xor r8d, r8d
+    jmp .tk_pat_adv
+.tk_pat_bs:
+    cmp byte [r12 + 1], 0
+    je .tk_incomplete
+    add r12, 2
+    jmp .tk_pat_sc
+.tk_pat_open_sq:
+    mov ecx, 1
+    jmp .tk_pat_adv
+.tk_pat_open_dq:
+    mov r8d, 1
+    jmp .tk_pat_adv
+.tk_pat_bq:
+    xor r10d, 1
+    jmp .tk_pat_adv
+.tk_pat_lp:
+    inc r9d
+    jmp .tk_pat_adv
+.tk_pat_rp:
+    test r9d, r9d
+    jz .tk_pat_end
+    dec r9d
+    jmp .tk_pat_adv
+.tk_pat_end:
+    cmp r12, rbx
+    je .tk_pat_bad                  ; ")" with no pattern before it
+    mov rdx, r12
+    mov byte [r12], 0
+    inc r12
+    mov dword [rbp - 52], N_CPAT
+    mov dword [rbp - 56], C_SEQ
+    mov dword [rbp - 60], 0
+    jmp .tk_trim
+.tk_pat_bad:
+    mov rdi, rbx
+    jmp .tk_err
 
 .tk_comment:
     movzx eax, byte [r12]
@@ -917,6 +1190,15 @@ ash_tokenize:
 .tk_sep_semi:
     mov rdx, r12
     mov byte [r12], 0
+    cmp al, ';'                     ; "cmd;;" ends the item and a case clause
+    jne .tk_semi_one
+    cmp byte [r12 + 1], ';'
+    jne .tk_semi_one
+    add r12, 2
+    mov dword [rbp - 72], 1
+    mov dword [rbp - 56], C_SEQ
+    jmp .tk_item_end
+.tk_semi_one:
     inc r12
     mov dword [rbp - 56], C_SEQ
     jmp .tk_item_end
@@ -1071,6 +1353,11 @@ ash_tokenize:
     mov dword [rbp - 48], 1
     jmp .tk_item
 .tk_ac_sep:
+    cmp al, ';'
+    jne .tk_ac_sep_go
+    cmp byte [r12 + 1], ';'
+    je .tk_item                     ; "fi;;": the ";;" ends a case clause
+.tk_ac_sep_go:
     inc r12
     jmp .tk_item
 .tk_ac_sh:
@@ -1082,6 +1369,8 @@ ash_tokenize:
 
 .tk_eof:
     cmp dword [rbp - 48], 0
+    jne .tk_incomplete
+    cmp dword [rbp - 68], 0         ; "case x in" with no clause or "esac" yet
     jne .tk_incomplete
     xor eax, eax
     mov edx, r14d
@@ -1098,7 +1387,7 @@ ash_tokenize:
     call ash_syntax_err
     mov eax, 2
 .tk_ret:
-    add rsp, 24
+    add rsp, 40
     pop r15
     pop r14
     pop r13
@@ -1112,6 +1401,8 @@ ash_tokenize:
 ;   IF.j1 = FI, THEN.j1 = next ELIF/ELSE/FI, ELIF/ELSE.j1 = FI
 ;   loop head.j1 = DONE, head.j2 = DO, DO.j1 = DONE, DO.j2 = DONE.j2 = head
 ;   LBRACE.j1 = RBRACE, CASE.j1 = ESAC
+;   CPAT.j1 = where to go when the patterns do not match (the node after the
+;   clause's ";;", or the ESAC), DSEMI.j1 = ESAC
 ; A top-level statement with a C_SH node becomes one N_SH node:
 ;   j1 = its last node, j2 = length of its original text
 ; ----------------------------------------------------------------------------
@@ -1184,6 +1475,10 @@ ash_link:
     je .lk_rbrace
     cmp eax, N_ESAC
     je .lk_esac
+    cmp eax, N_CPAT
+    je .lk_cpat
+    cmp eax, N_DSEMI
+    je .lk_dsemi
     cmp eax, N_FUNC
     je .lk_func
 .lk_next:
@@ -1319,10 +1614,50 @@ ash_link:
     mov eax, 1
     jmp .lk_ret
 
+.lk_cpat:
+    LK_TOP
+    cmp ecx, N_CASE                 ; the first clause, or one after ";;"
+    je .lk_cpat_ok
+    cmp ecx, N_DSEMI
+    jne .lk_err
+.lk_cpat_ok:
+    LK_SET_CUR
+    jmp .lk_next
+
+.lk_dsemi:
+    LK_TOP
+    cmp ecx, N_CPAT
+    jne .lk_err
+    imul eax, edx, ASH_NODE_SIZE
+    lea ecx, [r14d + 1]
+    mov [r12 + rax + ND_J1], ecx    ; patterns fail -> the node after ";;"
+    mov eax, [r9 + ND_J2]           ; chain of DSEMI nodes on the CASE
+    mov [rsi + ND_J2], eax
+    mov [r9 + ND_J2], r14d
+    LK_SET_CUR
+    jmp .lk_next
+
 .lk_esac:
     LK_TOP
     cmp ecx, N_CASE
+    je .lk_esac_ok
+    cmp ecx, N_DSEMI
+    je .lk_esac_ok
+    cmp ecx, N_CPAT
     jne .lk_err
+    imul eax, edx, ASH_NODE_SIZE    ; last clause without ";;"
+    mov [r12 + rax + ND_J1], r14d
+.lk_esac_ok:
+    mov ecx, [r9 + ND_J2]
+.lk_esac_chain:
+    cmp ecx, -1
+    je .lk_esac_done
+    imul eax, ecx, ASH_NODE_SIZE
+    lea r10, [r12 + rax]
+    mov ecx, [r10 + ND_J2]
+    mov [r10 + ND_J1], r14d
+    jmp .lk_esac_chain
+.lk_esac_done:
     mov [r9 + ND_J1], r14d
     dec ebx
     jmp .lk_next
@@ -1388,7 +1723,7 @@ ash_link:
     lea r8, [r12 + rax]             ; first node
     mov r10, [r8 + ND_TEXT]
     cmp dword [r8 + ND_TYPE], N_FOR
-    jne .lf_set
+    jne .lf_not_for
 .lf_for_back:                       ; FOR text starts after "for "
     movzx eax, byte [r10 - 1]
     cmp al, ' '
@@ -1400,6 +1735,21 @@ ash_link:
     jmp .lf_for_back
 .lf_for_kw:
     sub r10, 3
+    jmp .lf_set
+.lf_not_for:
+    cmp dword [r8 + ND_TYPE], N_CASE
+    jne .lf_set
+.lf_case_back:                      ; CASE text starts after "case "
+    movzx eax, byte [r10 - 1]
+    cmp al, ' '
+    je .lf_case_dec
+    cmp al, 9
+    jne .lf_case_kw
+.lf_case_dec:
+    dec r10
+    jmp .lf_case_back
+.lf_case_kw:
+    sub r10, 4
 .lf_set:
     mov [r8 + ND_TEXT], r10
     sub r9, r10
@@ -1469,8 +1819,14 @@ ash_exec_nodes:
     je .ex_next
     cmp eax, N_RBRACE
     je .ex_next
+    cmp eax, N_ESAC
+    je .ex_next
+    cmp eax, N_CPAT
+    je .ex_next
+    cmp eax, N_DSEMI                ; the clause is done: leave the case
+    je .ex_jump_j1
 
-    ; Block openers: IF WHILE UNTIL FOR LBRACE (may sit after && / ||)
+    ; Block openers: IF WHILE UNTIL FOR CASE LBRACE (may sit after && / ||)
     call .ex_skip_by_conn
     test eax, eax
     jnz .ex_jump_j1
@@ -1481,6 +1837,8 @@ ash_exec_nodes:
     je .ex_loop_push
     cmp eax, N_FOR
     je .ex_for
+    cmp eax, N_CASE
+    je .ex_case
 .ex_next:
     inc r14d
     jmp .ex_loop
@@ -1502,6 +1860,13 @@ ash_exec_nodes:
     cmp eax, 3
     je .ex_done                     ; return
     jmp .ex_next
+
+.ex_case:
+    mov rdi, r12
+    mov esi, r14d
+    call ash_case_select            ; eax = first command of the clause, or ESAC
+    mov r14d, eax
+    jmp .ex_loop
 
 .ex_sh:
     ; Run the statement's original text with /bin/sh
@@ -1772,6 +2137,675 @@ ash_exec_nodes:
     cmp dword [last_exit_status], 0
     setne al
 .esc_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; Case statements
+;
+; ash_case_select(rdi = nodes, esi = index of the CASE node)
+;   -> eax = node to run next: the first node after the CPAT of the clause
+;      whose pattern matches, or the ESAC when none does.
+; The word is expanded without word splitting and without pathname expansion;
+; every pattern list is expanded and then matched left to right. The status
+; is 0 when no clause matches and when the clause has no commands; otherwise
+; it is that of the last command. An expansion that fails (message printed)
+; skips the whole case.
+; ----------------------------------------------------------------------------
+section .bss
+    ash_case_subj       resb LINE_MAX + 16     ; the expanded word
+    ash_case_pat        resb LINE_MAX * 2 + 16 ; the alternatives of one clause
+section .data
+    ash_s_dsemi         db ";;", 0
+    ash_cls_alpha       db "alpha", 0
+    ash_cls_digit       db "digit", 0
+    ash_cls_alnum       db "alnum", 0
+    ash_cls_upper       db "upper", 0
+    ash_cls_lower       db "lower", 0
+    ash_cls_space       db "space", 0
+    ash_cls_punct       db "punct", 0
+    ash_cls_xdigit      db "xdigit", 0
+    ash_cls_blank       db "blank", 0
+    ash_cls_table       dq ash_cls_alpha, ash_cls_digit, ash_cls_alnum
+                        dq ash_cls_upper, ash_cls_lower, ash_cls_space
+                        dq ash_cls_punct, ash_cls_xdigit, ash_cls_blank, 0
+section .text
+
+ash_case_select:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    mov r12, rdi
+    mov r13d, esi
+    imul eax, esi, ASH_NODE_SIZE
+    lea rbx, [r12 + rax]            ; the CASE node
+
+    mov rdi, [rbx + ND_TEXT]
+    call str_len
+    cmp eax, LINE_MAX - 1
+    jae .cs_long
+    lea rdi, [input_buf]
+    mov rsi, [rbx + ND_TEXT]
+    call str_copy
+    mov byte [ev_keep_nl], 1        ; the word is not split
+    call expand_env_vars
+    mov byte [ev_keep_nl], 0
+    test eax, eax
+    jnz .cs_fail                    ; message printed, status set
+    lea rdi, [input_buf]
+    lea rsi, [ash_case_subj]
+    xor edx, edx
+    call ash_next_word
+
+    lea r14d, [r13 + 1]
+.cs_clause:
+    imul eax, r14d, ASH_NODE_SIZE
+    lea r15, [r12 + rax]
+    cmp dword [r15 + ND_TYPE], N_CPAT
+    jne .cs_none
+    mov rdi, [r15 + ND_TEXT]
+    call ash_case_try
+    test eax, eax
+    js .cs_fail
+    jnz .cs_hit
+    mov r14d, [r15 + ND_J1]
+    jmp .cs_clause
+.cs_hit:
+    lea eax, [r14 + 1]
+    imul ecx, eax, ASH_NODE_SIZE
+    mov ecx, [r12 + rcx + ND_TYPE]
+    cmp ecx, N_DSEMI
+    je .cs_empty
+    cmp ecx, N_ESAC
+    jne .cs_ret
+.cs_empty:
+    mov dword [last_exit_status], 0
+    jmp .cs_ret
+.cs_none:
+    mov dword [last_exit_status], 0
+    mov eax, r14d
+    jmp .cs_ret
+.cs_long:
+    lea rdi, [ash_e_line]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+.cs_fail:
+    mov eax, [rbx + ND_J1]
+.cs_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ash_case_try(rdi = pattern list text) -> eax = 1 matches the word,
+; 0 does not, -1 expansion failed (message printed)
+ash_case_try:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+
+    call ash_case_load
+    test eax, eax
+    jnz .ct_long
+    call expand_env_vars
+    test eax, eax
+    jnz .ct_fail
+    call ash_case_norm
+    mov r12, rax                    ; end of the alternatives
+    lea rbx, [ash_case_pat]
+.ct_alt:
+    cmp rbx, r12
+    jae .ct_no
+    lea rdi, [ash_case_subj]
+    mov rsi, rbx
+    call ash_glob
+    test eax, eax
+    jnz .ct_ret                     ; eax = 1
+.ct_skip:
+    cmp byte [rbx], 0
+    je .ct_next
+    inc rbx
+    jmp .ct_skip
+.ct_next:
+    inc rbx
+    jmp .ct_alt
+.ct_no:
+    xor eax, eax
+    jmp .ct_ret
+.ct_long:
+    lea rdi, [ash_e_line]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+.ct_fail:
+    mov eax, -1
+.ct_ret:
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ash_case_load(rdi = pattern list text) -> eax = 0 ok, 1 too long
+; Copies it into input_buf for expansion, dropping the unquoted blanks around
+; the | signs (a pattern is one word, so a blank there is never data; a blank
+; that a variable brings in later is kept).
+ash_case_load:
+    mov rsi, rdi
+    lea rdi, [input_buf]
+    lea r8, [input_buf + LINE_MAX - 2]
+    xor ecx, ecx                    ; 1 inside '...', 2 inside "..."
+    xor edx, edx                    ; open ( count
+    xor r9d, r9d                    ; inside `...`
+.cl_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .cl_done
+    cmp ecx, 1
+    je .cl_sq
+    cmp al, '\'
+    je .cl_pair
+    cmp al, EV_MARK
+    je .cl_pair
+    cmp ecx, 2
+    je .cl_dq
+    cmp al, 0x27
+    je .cl_open_sq
+    cmp al, '"'
+    je .cl_open_dq
+    cmp al, '`'
+    je .cl_bq
+    cmp al, '('
+    je .cl_lp
+    cmp al, ')'
+    je .cl_rp
+    cmp al, ' '
+    je .cl_blank
+    cmp al, 9
+    jne .cl_put
+.cl_blank:
+    mov r10d, edx                   ; inside $( ) or `` blanks are data
+    or r10d, r9d
+    jnz .cl_put
+    inc rsi
+    jmp .cl_loop
+.cl_sq:
+    cmp al, 0x27
+    jne .cl_put
+    xor ecx, ecx
+    jmp .cl_put
+.cl_dq:
+    cmp al, '"'
+    jne .cl_put
+    xor ecx, ecx
+    jmp .cl_put
+.cl_open_sq:
+    mov ecx, 1
+    jmp .cl_put
+.cl_open_dq:
+    mov ecx, 2
+    jmp .cl_put
+.cl_bq:
+    xor r9d, 1
+    jmp .cl_put
+.cl_lp:
+    inc edx
+    jmp .cl_put
+.cl_rp:
+    test edx, edx
+    jz .cl_put
+    dec edx
+.cl_put:
+    cmp rdi, r8
+    jae .cl_long
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .cl_loop
+.cl_pair:                           ; a backslash or marker and the byte after it
+    lea r10, [r8 - 1]
+    cmp rdi, r10
+    jae .cl_long
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    movzx eax, byte [rsi]
+    test al, al
+    jz .cl_loop
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .cl_loop
+.cl_done:
+    mov byte [rdi], 0
+    xor eax, eax
+    ret
+.cl_long:
+    mov eax, 1
+    ret
+
+; ash_case_norm - turn the expanded pattern list in input_buf into
+; NUL-separated alternatives in ash_case_pat for ash_glob: quotes are removed
+; and every quoted or substituted character that glob would read as syntax
+; (* ? [ \) gets a backslash. The value of an unquoted $var keeps * ? [ active,
+; as in sh. An unquoted | starts the next alternative.
+; Returns rax = just past the last alternative's NUL.
+ash_case_norm:
+    lea rsi, [input_buf]
+    lea rdi, [ash_case_pat]
+    xor ecx, ecx                    ; 1 inside '...', 2 inside "..."
+.cn_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .cn_end
+    inc rsi
+    cmp al, EV_MARK
+    je .cn_mark
+    cmp ecx, 1
+    je .cn_sq
+    cmp ecx, 2
+    je .cn_dq
+    cmp al, '\'
+    je .cn_bs
+    cmp al, 0x27
+    je .cn_open_sq
+    cmp al, '"'
+    je .cn_open_dq
+    cmp al, '|'
+    je .cn_alt
+.cn_put:                            ; unquoted: * ? [ keep their meaning
+    mov [rdi], al
+    inc rdi
+    jmp .cn_loop
+.cn_lit:                            ; al is a plain character
+    cmp al, '*'
+    je .cn_esc
+    cmp al, '?'
+    je .cn_esc
+    cmp al, '['
+    je .cn_esc
+    cmp al, '\'
+    jne .cn_put
+.cn_esc:
+    mov byte [rdi], '\'
+    inc rdi
+    jmp .cn_put
+.cn_mark:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .cn_end
+    inc rsi
+    test ecx, ecx                   ; an unquoted $var is a pattern, as in sh
+    jnz .cn_lit
+    cmp al, '*'
+    je .cn_put
+    cmp al, '?'
+    je .cn_put
+    cmp al, '['
+    je .cn_put
+    jmp .cn_lit
+.cn_sq:
+    cmp al, 0x27
+    jne .cn_lit
+    xor ecx, ecx
+    jmp .cn_loop
+.cn_dq:
+    cmp al, '"'
+    je .cn_dq_close
+    cmp al, '\'
+    jne .cn_lit
+    movzx edx, byte [rsi]           ; \" \\ \$ \` in "..." drop the backslash
+    cmp dl, '"'
+    je .cn_dq_esc
+    cmp dl, '\'
+    je .cn_dq_esc
+    cmp dl, '$'
+    je .cn_dq_esc
+    cmp dl, '`'
+    jne .cn_lit
+.cn_dq_esc:
+    mov eax, edx
+    inc rsi
+    jmp .cn_lit
+.cn_dq_close:
+    xor ecx, ecx
+    jmp .cn_loop
+.cn_bs:
+    movzx edx, byte [rsi]
+    test dl, dl
+    jz .cn_lit                      ; trailing backslash is itself
+    mov eax, edx
+    inc rsi
+    jmp .cn_lit
+.cn_open_sq:
+    mov ecx, 1
+    jmp .cn_loop
+.cn_open_dq:
+    mov ecx, 2
+    jmp .cn_loop
+.cn_alt:
+    mov byte [rdi], 0
+    inc rdi
+    jmp .cn_loop
+.cn_end:
+    mov byte [rdi], 0
+    inc rdi
+    mov rax, rdi
+    ret
+
+; ash_glob(rdi = text, rsi = pattern) -> eax = 1 when the whole text matches
+; Pattern: * (any run), ? (one byte), [set] / [!set] with ranges and
+; [:class:], \c (the byte c). Text is compared as bytes.
+ash_glob:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov r8, rdi                     ; text
+    mov r9, rsi                     ; pattern
+    xor r10d, r10d                  ; pattern after the last *
+    xor r11d, r11d                  ; text position that * has swallowed up to
+.g_loop:
+    movzx eax, byte [r9]
+    test al, al
+    jz .g_end
+    cmp al, '*'
+    je .g_star
+    movzx ecx, byte [r8]
+    test cl, cl
+    jz .g_back
+    cmp al, '?'
+    je .g_one
+    cmp al, '['
+    je .g_br
+    lea rdx, [r9 + 1]
+    cmp al, '\'
+    jne .g_cmp
+    movzx eax, byte [r9 + 1]
+    test al, al
+    jnz .g_esc
+    mov al, '\'                     ; trailing backslash is itself
+    jmp .g_cmp
+.g_esc:
+    lea rdx, [r9 + 2]
+.g_cmp:
+    cmp al, cl
+    jne .g_back
+    inc r8
+    mov r9, rdx
+    jmp .g_loop
+.g_one:
+    inc r8
+    inc r9
+    jmp .g_loop
+.g_star:
+    inc r9
+    mov r10, r9
+    mov r11, r8
+    jmp .g_loop
+.g_end:
+    cmp byte [r8], 0
+    je .g_yes
+.g_back:
+    test r10, r10
+    jz .g_no
+    cmp byte [r11], 0
+    je .g_no
+    inc r11
+    mov r8, r11
+    mov r9, r10
+    jmp .g_loop
+
+.g_br:
+    mov r14d, ecx                   ; the text byte
+    lea rsi, [r9 + 1]
+    cmp byte [rsi], '!'
+    je .g_br_neg
+    cmp byte [rsi], '^'
+    jne .g_br_start
+.g_br_neg:
+    inc rsi
+.g_br_start:
+    xor ebx, ebx                    ; 1 = a member matched
+    mov r12, rsi                    ; a ] right here is a member, not the end
+.g_br_item:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .g_br_lit                    ; no closing ]: [ is an ordinary byte
+    cmp al, ']'
+    jne .g_br_ch
+    cmp rsi, r12
+    je .g_br_plain
+    inc rsi
+    cmp byte [r9 + 1], '!'          ; a negated set matches when no member did
+    je .g_br_flip
+    cmp byte [r9 + 1], '^'
+    jne .g_br_done
+.g_br_flip:
+    xor ebx, 1
+.g_br_done:
+    test ebx, ebx
+    jz .g_back
+    inc r8
+    mov r9, rsi
+    jmp .g_loop
+.g_br_ch:
+    cmp al, '['
+    jne .g_br_plain
+    cmp byte [rsi + 1], ':'
+    jne .g_br_plain
+    lea rdx, [rsi + 2]              ; [:name:]
+.g_br_cls:
+    movzx eax, byte [rdx]
+    test al, al
+    jz .g_br_notcls
+    cmp al, ':'
+    jne .g_br_cls_adv
+    cmp byte [rdx + 1], ']'
+    je .g_br_cls_ok
+.g_br_cls_adv:
+    inc rdx
+    jmp .g_br_cls
+.g_br_notcls:
+    mov al, '['
+    jmp .g_br_plain
+.g_br_cls_ok:
+    lea r13, [rdx + 2]              ; past ":]"
+    lea rdi, [rsi + 2]
+    mov esi, r14d
+    call ash_class_match
+    test eax, eax
+    jz .g_br_cls_next
+    mov ebx, 1
+.g_br_cls_next:
+    mov rsi, r13
+    jmp .g_br_item
+.g_br_plain:
+    inc rsi
+    cmp al, '\'
+    jne .g_br_lo
+    movzx eax, byte [rsi]
+    test al, al
+    jz .g_br_lo
+    inc rsi
+.g_br_lo:
+    mov r13d, eax                   ; range end = start
+    cmp byte [rsi], '-'
+    jne .g_br_test
+    movzx edx, byte [rsi + 1]
+    test dl, dl
+    jz .g_br_test
+    cmp dl, ']'
+    je .g_br_test                   ; "a-]": a and the dash
+    add rsi, 2
+    cmp dl, '\'
+    jne .g_br_hi
+    movzx edx, byte [rsi]
+    test dl, dl
+    jnz .g_br_hesc
+    mov dl, '\'
+    jmp .g_br_hi
+.g_br_hesc:
+    inc rsi
+.g_br_hi:
+    mov r13d, edx
+.g_br_test:
+    cmp r14d, eax
+    jb .g_br_item
+    cmp r14d, r13d
+    ja .g_br_item
+    mov ebx, 1
+    jmp .g_br_item
+.g_br_lit:
+    mov ecx, r14d
+    mov al, '['
+    lea rdx, [r9 + 1]
+    jmp .g_cmp
+
+.g_yes:
+    mov eax, 1
+    jmp .g_ret
+.g_no:
+    xor eax, eax
+.g_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ash_class_match(rdi = class name ending at ':', esi = byte) -> eax = 1/0
+; An unknown class matches nothing.
+ash_class_match:
+    push r8
+    push r9
+    lea r8, [ash_cls_table]
+    xor edx, edx
+.cm_next:
+    mov r9, [r8 + rdx * 8]
+    test r9, r9
+    jz .cm_no
+    xor ecx, ecx
+.cm_cmp:
+    movzx eax, byte [r9 + rcx]
+    test al, al
+    jz .cm_end
+    cmp al, [rdi + rcx]
+    jne .cm_skip
+    inc ecx
+    jmp .cm_cmp
+.cm_end:
+    cmp byte [rdi + rcx], ':'
+    je .cm_found
+.cm_skip:
+    inc edx
+    jmp .cm_next
+.cm_found:
+    mov eax, esi
+    mov ecx, esi
+    or ecx, 0x20                    ; folded to lower case for letters
+    cmp edx, 0
+    je .cm_alpha
+    cmp edx, 1
+    je .cm_digit
+    cmp edx, 2
+    je .cm_alnum
+    cmp edx, 3
+    je .cm_upper
+    cmp edx, 4
+    je .cm_lower
+    cmp edx, 5
+    je .cm_space
+    cmp edx, 6
+    je .cm_punct
+    cmp edx, 7
+    je .cm_xdigit
+    cmp eax, ' '                    ; blank
+    je .cm_yes
+    cmp eax, 9
+    je .cm_yes
+    jmp .cm_no
+.cm_alpha:
+    cmp ecx, 'a'
+    jb .cm_no
+    cmp ecx, 'z'
+    ja .cm_no
+    jmp .cm_yes
+.cm_digit:
+    cmp eax, '0'
+    jb .cm_no
+    cmp eax, '9'
+    ja .cm_no
+    jmp .cm_yes
+.cm_alnum:
+    cmp eax, '0'
+    jb .cm_alpha
+    cmp eax, '9'
+    jbe .cm_yes
+    jmp .cm_alpha
+.cm_upper:
+    cmp eax, 'A'
+    jb .cm_no
+    cmp eax, 'Z'
+    ja .cm_no
+    jmp .cm_yes
+.cm_lower:
+    cmp eax, 'a'
+    jb .cm_no
+    cmp eax, 'z'
+    ja .cm_no
+    jmp .cm_yes
+.cm_space:
+    cmp eax, ' '
+    je .cm_yes
+    cmp eax, 9
+    jb .cm_no
+    cmp eax, 13
+    ja .cm_no
+    jmp .cm_yes
+.cm_punct:
+    cmp eax, 33
+    jb .cm_no
+    cmp eax, 126
+    ja .cm_no
+    cmp eax, '0'
+    jb .cm_yes
+    cmp eax, '9'
+    jbe .cm_no
+    cmp ecx, 'a'
+    jb .cm_yes
+    cmp ecx, 'z'
+    ja .cm_yes
+    jmp .cm_no
+.cm_xdigit:
+    cmp eax, '0'
+    jb .cm_no
+    cmp eax, '9'
+    jbe .cm_yes
+    cmp ecx, 'a'
+    jb .cm_no
+    cmp ecx, 'f'
+    ja .cm_no
+.cm_yes:
+    mov eax, 1
+    jmp .cm_ret
+.cm_no:
+    xor eax, eax
+.cm_ret:
+    pop r9
+    pop r8
     ret
 
 ; ----------------------------------------------------------------------------
@@ -2322,7 +3356,7 @@ ash_for_setup:
 
     mov rdi, r12
     call str_len
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .fs_toolong
     ; Globs and $( ) are judged on the text as written: a variable's value
     ; is data and never needs /bin/sh. When sh runs the list it expands the
@@ -2330,9 +3364,11 @@ ash_for_setup:
     mov rdi, r12
     call ash_needs_sh
     mov [rsp], eax
-    lea rdi, [input_buf]
-    mov rsi, r12
-    call str_copy
+    mov rdi, r12
+    xor esi, esi
+    call ash_load_line              ; "$@" becomes one word per parameter
+    test eax, eax
+    jnz .fs_failed
     cmp dword [rsp], 0
     jne .fs_expand_sh
     call expand_env_vars
@@ -2585,22 +3621,22 @@ ash_run_cmd:
     jmp .rc_ok
 
 .rc_dispatch:
-
+    ; ". file" is "source file": it runs in this shell, so cd and assignments stay
     mov rdi, rbx
-    call str_len
-    cmp eax, MAX_INPUT - 1
-    jae .rc_toolong
-    lea rdi, [input_buf]
-    mov rsi, rbx
-    call str_copy
+    lea rsi, [ash_s_dot]
+    call ash_word_is
+    mov rdi, rbx
+    xor esi, esi
+    test eax, eax
+    jz .rc_load
+    lea rdi, [rbx + 1]
+    lea rsi, [ash_s_source]
+.rc_load:
+    call ash_load_line
+    test eax, eax
+    jnz .rc_ok                      ; too long: message printed, status set
     call dispatch_command
 .rc_ok:
-    xor eax, eax
-    jmp .rc_ret
-.rc_toolong:
-    lea rdi, [ash_e_line]
-    call ash_write_err
-    mov dword [last_exit_status], 2
     xor eax, eax
     jmp .rc_ret
 .rc_break:
@@ -2685,6 +3721,192 @@ ash_run_cmd:
     pop rbp
     ret
 
+section .data
+    ash_s_dot           db ".", 0
+    ash_s_source        db "source", 0
+section .text
+
+; ----------------------------------------------------------------------------
+; ash_load_line(rdi = text, rsi = prefix string or 0) -> eax = 0 ok, 1 too long
+; Puts prefix + text into input_buf for dispatch_command and the other
+; expanders. Inside double quotes "$@" becomes one quoted word per positional
+; parameter ("$@" with no parameters becomes no word at all), the way sh does
+; it; expand_env_vars alone could only hand over one joined word. Parameter
+; text is data, so the bytes that could read as syntax get an EV_MARK in front,
+; exactly as expand_env_vars marks a substituted value. Everything else is
+; copied as it is; text in '...' and after a backslash is never looked at.
+; ----------------------------------------------------------------------------
+ash_load_line:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                      ; [rsp] parameter index
+
+    mov r13, rdi                    ; text
+    lea rdi, [input_buf]
+    lea r12, [input_buf + LINE_MAX - 2] ; the last byte that may be written
+    test rsi, rsi
+    jz .ll_start
+.ll_prefix:
+    mov al, [rsi]
+    test al, al
+    jz .ll_start
+    cmp rdi, r12
+    jae .ll_long
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .ll_prefix
+.ll_start:
+    mov rsi, r13
+    xor ebx, ebx                    ; inside "..."
+    xor r14d, r14d                  ; where the opening " of that string went
+    xor r13d, r13d                  ; inside '...'
+.ll_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .ll_end
+    test r13d, r13d
+    jnz .ll_sq
+    cmp al, '\'
+    je .ll_pair
+    cmp al, EV_MARK
+    je .ll_pair
+    cmp al, '"'
+    je .ll_dq
+    test ebx, ebx
+    jnz .ll_in_dq
+    cmp al, 0x27
+    jne .ll_put
+    mov r13d, 1
+    jmp .ll_put
+.ll_in_dq:
+    cmp al, '$'
+    jne .ll_put
+    cmp byte [rsi + 1], '@'
+    je .ll_at
+.ll_put:
+    cmp rdi, r12
+    jae .ll_long
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .ll_loop
+.ll_sq:
+    cmp al, 0x27
+    jne .ll_put
+    xor r13d, r13d
+    jmp .ll_put
+.ll_dq:
+    test ebx, ebx
+    jnz .ll_dq_close
+    mov ebx, 1
+    mov r14, rdi
+    jmp .ll_put
+.ll_dq_close:
+    xor ebx, ebx
+    jmp .ll_put
+.ll_pair:                           ; a backslash or marker and the byte after it
+    lea rax, [r12 - 1]
+    cmp rdi, rax
+    jae .ll_long
+    mov al, [rsi]
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    movzx eax, byte [rsi]
+    test al, al
+    jz .ll_loop
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .ll_loop
+
+.ll_at:
+    add rsi, 2
+    mov ecx, [ash_pos_argc]
+    test ecx, ecx
+    jnz .ll_words
+    lea rax, [rdi - 1]
+    cmp rax, r14                    ; the string is just "$@": no word at all
+    jne .ll_loop
+    cmp byte [rsi], '"'
+    jne .ll_loop
+    mov rdi, r14
+    inc rsi
+    xor ebx, ebx
+    jmp .ll_loop
+.ll_words:
+    mov r15, [ash_pos_argv]
+    mov dword [rsp], 0
+.ll_word:
+    mov eax, [rsp]
+    test eax, eax
+    jz .ll_arg
+    lea rax, [r12 - 3]              ; " " between two words
+    cmp rdi, rax
+    jae .ll_long
+    mov byte [rdi], '"'
+    mov byte [rdi + 1], ' '
+    mov byte [rdi + 2], '"'
+    add rdi, 3
+.ll_arg:
+    mov eax, [rsp]
+    mov rcx, [r15 + rax * 8]
+.ll_arg_ch:
+    movzx eax, byte [rcx]
+    test al, al
+    jz .ll_arg_end
+    cmp al, EV_MARK
+    je .ll_arg_mark
+    push rsi                        ; ev_is_special clobbers rsi
+    call ev_is_special
+    pop rsi
+    test edx, edx
+    jz .ll_arg_put
+.ll_arg_mark:
+    lea rdx, [r12 - 1]
+    cmp rdi, rdx
+    jae .ll_long
+    mov byte [rdi], EV_MARK
+    inc rdi
+.ll_arg_put:
+    cmp rdi, r12
+    jae .ll_long
+    mov [rdi], al
+    inc rdi
+    inc rcx
+    jmp .ll_arg_ch
+.ll_arg_end:
+    inc dword [rsp]
+    mov eax, [rsp]
+    cmp eax, [ash_pos_argc]
+    jb .ll_word
+    jmp .ll_loop
+
+.ll_end:
+    mov byte [rdi], 0
+    xor eax, eax
+    jmp .ll_ret
+.ll_long:
+    lea rdi, [ash_e_line]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+    mov eax, 1
+.ll_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
 ; ----------------------------------------------------------------------------
 ; ash_count_arg(rdi = text after the command word, esi = default)
 ;   -> eax = the number, edx = 1 ok / 0 when it is not a number >= 0
@@ -2702,7 +3924,7 @@ ash_count_arg:
     je .ca_default
     mov rdi, r12
     call str_len
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .ca_bad
     lea rdi, [input_buf]
     mov rsi, r12
@@ -2929,7 +4151,7 @@ ash_try_assign:
     lea rbx, [rbx + r12 + 1]        ; value text
     mov rdi, rbx
     call str_len
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .ta_toolong
     lea rdi, [input_buf]
     mov rsi, rbx
@@ -3135,12 +4357,10 @@ ash_call_func:
 
     ; Expand and split the arguments
     mov rdi, r12
-    call str_len
-    cmp eax, MAX_INPUT - 1
-    jae .cf_toolong
-    lea rdi, [input_buf]
-    mov rsi, r12
-    call str_copy
+    xor esi, esi
+    call ash_load_line              ; "$@" becomes one word per parameter
+    test eax, eax
+    jnz .cf_expand_failed           ; too long: message printed
     call expand_env_vars
     test eax, eax
     jnz .cf_expand_failed           ; message printed: do not call
@@ -3195,12 +4415,6 @@ ash_call_func:
     jmp .cf_restore
 
 .cf_expand_failed:
-    mov ebx, 1
-    jmp .cf_ret
-.cf_toolong:
-    lea rdi, [ash_e_line]
-    call ash_write_err
-    mov dword [last_exit_status], 2
     mov ebx, 1
     jmp .cf_ret
 .cf_nomem:
@@ -3590,7 +4804,12 @@ ash_syntax_err:
     cmp al, 10
     je .se_cp_end
     cmp al, ';'
-    je .se_cp_end
+    jne .se_cp_put
+    test ecx, ecx                   ; a leading ";;" is the token itself
+    jz .se_cp_put
+    cmp byte [rdi + rcx - 1], ';'
+    jne .se_cp_end
+.se_cp_put:
     mov [rdi + rcx], al
     inc ecx
     jmp .se_cp

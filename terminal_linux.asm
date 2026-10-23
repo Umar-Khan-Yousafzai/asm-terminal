@@ -113,7 +113,8 @@ default rel
 ; ============================================================================
 ; Shared constants (same as Windows version)
 ; ============================================================================
-%define MAX_INPUT           512
+%define MAX_INPUT           512     ; what the line editor and history can hold
+%define LINE_MAX            65536   ; a command line after expansion, from a script or a $( )
 %define MAX_PATH_BUF        4096    ; Linux paths can be much longer than Windows
 
 ; ---------------------------------------------------------------------------
@@ -866,7 +867,7 @@ section .bss
     key_char            resb 1      ; ASCII character from read_key
 
     ; Line editing buffers
-    input_buf           resb MAX_INPUT
+    input_buf           resb LINE_MAX
     line_buf            resb MAX_INPUT
     line_len            resd 1
     line_cursor         resd 1
@@ -946,7 +947,7 @@ section .bss
     tab_name_prefix_len resd 1      ; length of name prefix
 
     ; Environment expansion
-    env_expand_buf      resb 1024
+    env_expand_buf      resb LINE_MAX
     env_var_name        resb 256
     env_var_value       resb 1024
 
@@ -957,7 +958,7 @@ section .bss
     redir_stdin_active  resb 1
     redir_append        resb 1
     redir_filename      resb MAX_PATH_BUF
-    cleaned_cmd_buf     resb MAX_INPUT
+    cleaned_cmd_buf     resb LINE_MAX
 
     ; Alias table
     alias_table         resb ALIAS_COUNT * ALIAS_ENTRY_SIZE
@@ -1309,7 +1310,7 @@ init_io_modes:
 ; (main skips it).
 ; ============================================================================
 section .data
-    rlp_msg_long        db "ash: line too long (limit 511 bytes), ignored", 10
+    rlp_msg_long        db "ash: line too long (limit 65535 bytes), ignored", 10
     rlp_msg_long_len    equ $ - rlp_msg_long
 section .text
 read_line_plain:
@@ -1341,7 +1342,7 @@ read_line_plain:
     je .rlp_next
     test r13d, r13d
     jnz .rlp_next                    ; over the limit: keep dropping
-    cmp r12d, MAX_INPUT - 1
+    cmp r12d, LINE_MAX - 1
     jae .rlp_over
     mov [rbx + r12], dl
     inc r12d
@@ -3458,6 +3459,7 @@ section .data
     ev_e_brace          db "ash: unsupported ${...} expansion", 10, 0
     ev_e_redir          db "ash: syntax error in redirection", 10, 0
     ev_e_alias          db "ash: alias expansion too long", 10, 0
+    ev_e_arglong        db "ash: arguments too long for this command (limit 511 bytes)", 10, 0
     ev_msg_ash          db "ash: ", 0
     ev_msg_colon        db ": ", 0
     ev_msg_generic      db "cannot open file", 10, 0
@@ -3470,21 +3472,33 @@ section .data
                         dq handler_test, handler_bracket, handler_bench
                         dq handler_trace, handler_sandbox, handler_ls, 0
 
+    ; Builtins that keep every argument byte off fixed-size buffers: they
+    ; hand the text to a system call, bound their own copies, or work in
+    ; buffers of LINE_MAX. Any other builtin refuses arguments of MAX_INPUT
+    ; bytes or more (its work buffers are that small), with an error.
+    dc_long_handlers    dq handler_echo, handler_cd, handler_type, handler_mkdir
+                        dq handler_rmdir, handler_del, handler_del_safe
+                        dq handler_copy, handler_move, handler_copy_safe
+                        dq handler_move_safe, handler_ls, handler_grep
+                        dq handler_test, handler_bracket, handler_true
+                        dq handler_false, handler_pushd, handler_source
+                        dq handler_set, 0
+
 section .bss
     ev_mode             resb 1              ; 1 = leave $( ) and `` for /bin/sh
     ev_keep_nl          resb 1              ; 1 = an unquoted newline in a value stays data
     ev_overflow         resb 1              ; 1 = too long, 2 = error reported
     alignb 4
     ev_subst_status     resd 1              ; status of the last $( ), -1 none
-    ev_inner_buf        resb MAX_INPUT
-    ev_cap_buf          resb 4096
-    sh_line_buf         resb 1100
-    dc_args_buf         resb MAX_INPUT
+    ev_inner_buf        resb LINE_MAX
+    ev_cap_buf          resb LINE_MAX
+    sh_line_buf         resb 2 * LINE_MAX + 16 ; ash_sh_decode adds at most one byte per byte
+    dc_args_buf         resb LINE_MAX
     redir_ops           resb 8 * 16         ; kind, fd, target (see parse_redirection)
     redir_nops          resd 1
     redir_err_saved     resd 1              ; saved stderr fd + 1, 0 = none
-    redir_pool          resb 4096
-    dc_alias_line       resb MAX_INPUT
+    redir_pool          resb 4096 + LINE_MAX
+    dc_alias_line       resb LINE_MAX
     dc_in_alias         resb 1              ; depth of alias lists being run
 section .text
 
@@ -3493,7 +3507,7 @@ section .text
 %define EV_SYS_FCNTL        72
 %define EV_F_DUPFD_CLOEXEC  1030
 %define EV_O_CLOEXEC        0x80000
-%define EV_CAP_SIZE         4096
+%define EV_CAP_SIZE         LINE_MAX
 
 dispatch_command:
     push rbp
@@ -3704,6 +3718,31 @@ dc_run_handler:
     mov r12, rsi
     test r12, r12
     jz .rh_call
+    mov rdi, r12
+    call str_len
+    cmp eax, MAX_INPUT - 1
+    jb .rh_len_ok
+    mov rdi, rbx
+    call dc_long_ok
+    test eax, eax
+    jnz .rh_len_ok
+    lea rdi, [ev_e_arglong]
+    call ash_write_err
+    mov dword [last_exit_status], 1
+    jmp .rh_ret
+.rh_len_ok:
+    ; Globs in the arguments of the builtins that take file names
+    mov rdi, rbx
+    call dc_glob_ok
+    test eax, eax
+    jz .rh_noglob
+    mov rdi, r12
+    mov rsi, rbx
+    call dc_glob_args
+    test eax, eax
+    jnz .rh_ret                     ; dealt with: an error, or run once per name
+.rh_noglob:
+    mov rdi, rbx
     call dc_wants_raw
     test eax, eax
     jnz .rh_call
@@ -3715,6 +3754,7 @@ dc_run_handler:
 .rh_call:
     mov rdi, r12
     call rbx
+.rh_ret:
     pop r12
     pop rbx
     pop rbp
@@ -3760,6 +3800,24 @@ dc_bg_builtin:
     add rsp, 56
     pop rbx
     pop rbp
+    ret
+
+; dc_long_ok(rdi = handler) -> eax = 1 if it copes with arguments of any length
+dc_long_ok:
+    lea rsi, [dc_long_handlers]
+.lo_loop:
+    mov rax, [rsi]
+    test rax, rax
+    jz .lo_no
+    cmp rax, rdi
+    je .lo_yes
+    add rsi, 8
+    jmp .lo_loop
+.lo_yes:
+    mov eax, 1
+    ret
+.lo_no:
+    xor eax, eax
     ret
 
 ; dc_wants_raw(rdi = handler) -> eax = 1 if it parses its own arguments
@@ -3979,7 +4037,7 @@ dc_trailing_amp:
 ; ----------------------------------------------------------------------------
 ash_sh_decode:
     lea rsi, [sh_line_buf]
-    lea r8, [sh_line_buf + 1090]
+    lea r8, [sh_line_buf + 2 * LINE_MAX]
     xor ecx, ecx                    ; 0 plain, 1 '...', 2 "..."
 .sd_loop:
     movzx eax, byte [rdi]
@@ -4115,7 +4173,7 @@ expand_env_vars:
     mov dword [ev_subst_status], -1
     lea r12, [input_buf]           ; source pointer
     lea r13, [env_expand_buf]      ; destination pointer
-    lea r14, [env_expand_buf + MAX_INPUT - 1] ; result goes back to input_buf
+    lea r14, [env_expand_buf + LINE_MAX - 1] ; result goes back to input_buf
     mov r15d, 1                     ; at-word-start flag
     xor ebx, ebx                    ; inside "..."
 
@@ -4774,7 +4832,7 @@ ev_find_btick:
 ; \` \\ \$) copies the command text into ev_inner_buf.
 ev_copy_inner:
     lea rdi, [ev_inner_buf]
-    lea r8, [ev_inner_buf + MAX_INPUT - 1]
+    lea r8, [ev_inner_buf + LINE_MAX - 1]
 .ci_loop:
     cmp rsi, rdx
     jae .ci_done
@@ -5014,7 +5072,7 @@ check_alias:
     lea rdi, [input_buf + r13]
     call str_len
     add eax, r12d
-    cmp eax, MAX_INPUT - 1
+    cmp eax, LINE_MAX - 1
     jae .ca_too_long
 
     ; Build expanded command: alias_value + rest of input
@@ -5295,7 +5353,7 @@ parse_redirection:
     je .pr_bad
     cmp al, ';'
     je .pr_bad
-    lea rax, [redir_pool + 4096 - MAX_INPUT]
+    lea rax, [redir_pool + 4096]    ; the pool has LINE_MAX bytes of room behind this
     cmp r14, rax
     ja .pr_bad
     mov rdi, r12
@@ -6561,7 +6619,7 @@ change_dir:
     mov byte [has_prev_dir], 1
     lea rdi, [str_oldpwd]
     lea rsi, [file_path_buf]
-    call setenv_internal
+    call cd_set_var
 
 .cdr_pwd:
     lea rdi, [path_buf]
@@ -6572,7 +6630,7 @@ change_dir:
     jle .cdr_ok
     lea rdi, [str_pwd]
     lea rsi, [path_buf]
-    call setenv_internal
+    call cd_set_var
 
 .cdr_ok:
     xor eax, eax
@@ -6582,6 +6640,37 @@ change_dir:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; cd_set_var(rdi = name, rsi = value) - set PWD or OLDPWD after a directory
+; change that worked. A path too long for an environment slot cannot be kept;
+; the variable is removed then, so no stale value is left and no error hides
+; the fact that the change itself succeeded.
+cd_set_var:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov rdi, rsi
+    call str_len
+    mov r13d, eax
+    mov rdi, rbx
+    call str_len
+    lea eax, [rax + r13 + 2]
+    cmp eax, ENV_OVERLAY_SIZE
+    ja .cv_drop
+    mov rdi, rbx
+    mov rsi, r12
+    call setenv_internal
+    jmp .cv_ret
+.cv_drop:
+    mov rdi, rbx
+    call unsetenv_internal
+.cv_ret:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 section .data
@@ -10365,7 +10454,7 @@ print_ls_perms:
 %define SYS_READLINKAT      267
 %define LS_POOL_SIZE        262144
 %define LS_MAX_ENTRIES      16384
-%define LS_MAX_PATHS        32
+%define LS_MAX_PATHS        4096
 
 section .data
     ansi_cyan       db 27, "[36m", 0
@@ -13646,4 +13735,5 @@ align 1
 %include "ash/builtins.asm"
 %include "ash/script.asm"
 %include "ash/tools.asm"
+%include "ash/glob.asm"
 %include "ash/highlight.asm"

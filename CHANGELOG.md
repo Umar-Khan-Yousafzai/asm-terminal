@@ -4,6 +4,51 @@ All notable changes to ASM Terminal. Versions follow [Semantic Versioning](https
 MAJOR for breaking changes, MINOR for new features, PATCH for fixes.
 The version lives in one place: `version.inc`.
 
+## [2.4.0] - 2026-10-23
+
+The script engine and the builtins lose the limits that 2.3.0 listed: `"$@"`, `. file`, `case`,
+wildcards in builtins and long command lines now work.
+
+### Added
+- `case WORD in pat) ...;; esac` runs natively, so assignments, `cd` and functions made in a clause
+  persist. Patterns support `*`, `?`, `[...]`, `[:class:]`, `|` alternation, quoting and `$var`; it
+  works inside `if`, `while`, `for` and functions. A `case` that is piped, redirected or put in the
+  background is still handed to `/bin/sh`.
+- `. file` is a synonym for `source file`.
+- `"$@"` expands to one word per parameter (`"$*"` to one word), and to nothing when there are no
+  parameters, in commands, function calls and `for` lists.
+- Builtins that take file names (`echo`, `ls`, `cat`, `grep`, `cd`, `pushd`, `source`, `del`, `copy`,
+  `move`, `rename`, `mkdir`, `rmdir`) expand `*`, `?` and `[...]` like external commands. Results are
+  sorted; no match keeps the pattern; names with spaces or special characters stay one word.
+  `del`, `mkdir` and `rmdir` run once per match; `copy` and `move` take several sources and a target
+  folder.
+
+### Changed
+- A command line may be up to 65535 bytes after expansion (scripts, sourced files, long variables,
+  `$(...)` output). `cd ~` with a very long `HOME` works. The line editor and history entries stay
+  at 511 bytes.
+- Builtins with small work buffers (`title`, `color`, `calc`, `alias`, `bench`, `trace`, `sandbox`)
+  refuse arguments of 512 bytes or more with an error.
+- `;;` outside a `case` is a syntax error instead of being skipped.
+- `${x:-d}` and similar forms inside a `case` now report "unsupported ${...} expansion", like inside
+  an `if`; before, the whole `case` ran in `/bin/sh`.
+- `.bss` grew to about 22 MB of address space (line buffers and glob tables; only touched pages
+  cost memory).
+
+### Fixed
+- `cd` no longer prints "variable too long" when the directory does not fit in `PWD`.
+
+### Known limits
+- Loops with a redirected or piped `done`, and a piped or redirected `case`, still run in `/bin/sh`
+  and lose assignments and `cd`. `local`, `read`, here-docs, `${x:-d}` and `$((x=1))` are not
+  supported.
+- `"$@"` is not split inside `${...}`, `case WORD` or a `$(...)` nested in double quotes.
+  `$(case x in x) ...; esac)` needs parentheses around the patterns.
+- Globs in pipelines, background jobs and `for ... in` lists still go through `/bin/sh`; `grep` with
+  several matched files needs a `grep` on `PATH`.
+- Windows Unicode input and file names are not supported yet. Releases are not signed yet; see
+  `SIGNING.md`.
+
 ## [2.3.0] - 2026-10-23
 
 A full code review of the shell found about a hundred defects. This release fixes them: command
