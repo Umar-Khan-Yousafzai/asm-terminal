@@ -4,38 +4,78 @@
 ;   bench [-n N] COMMAND    run COMMAND N times (default 10, output hidden)
 ;                           and print mean / min / max time and peak memory
 ;   undo                    reverse the last del, move/rename or copy
+;   trash [empty]           list what del/move/copy keep, or empty it
 ;
 ; Undo: del moves the file into ~/.asm_trash instead of deleting it, and
-; move/copy first move a file they would overwrite there. A journal of the
-; last UNDO_MAX operations lives in memory for this session.
+; move/copy first move a file they would overwrite there. Every operation is
+; also appended to ~/.asm_trash/.journal, so undo still works after the shell
+; has been restarted. Trash file names are "<time>.<pid>.<seq>.<name>" and are
+; created without ever replacing an existing file. When the trash cannot be
+; used the command refuses unless -f is given. The trash keeps at most
+; TRASH_MAX_BYTES and TRASH_MAX_AGE seconds of history; older entries are
+; removed when a new one is added.
 ;
 ; Included from terminal_linux.asm, after ash/script.asm.
 ; ============================================================================
 
 %define BENCH_DEFAULT_RUNS  10
 %define BENCH_MAX_RUNS      100000
-%define TL_SYS_DUP          32
 %define TL_SYS_LSTAT        6
+%define TL_SYS_FCNTL        72
+%define TL_SYS_FLOCK        73
+%define TL_SYS_FTRUNCATE    77
+%define TL_SYS_SYMLINK      88
+%define TL_SYS_FCHMOD       91
+%define TL_SYS_TIME         201
+%define TL_SYS_UTIMENSAT    280
+%define TL_SYS_RENAMEAT2    316
+%define TL_F_DUPFD_CLOEXEC  1030
+%define TL_LOCK_EX          2
+%define TL_O_EXCL           0x80
+%define TL_RENAME_NOREPLACE 1
+%define TL_ENOENT           2
+%define TL_EEXIST           17
 %define TL_EXDEV            18
+%define TL_EISDIR           21
+%define TL_EINVAL           22
+%define TL_EFBIG            27
+%define TL_ENOSYS           38
+%define TL_ESAME            1000        ; not a kernel errno: src is dst
 %define TL_R_OK             4
 
-%define UNDO_MAX            16
-%define UNDO_PATH           400
-%define UNDO_SIZE           1216
-%define U_TYPE              0
-%define U_SAVED             4           ; 1 = a replaced file sits in trash
-%define U_A                 8           ; del: file   move: source  copy: -
-%define U_B                 (8 + UNDO_PATH)         ; move/copy: destination
-%define U_T                 (8 + 2 * UNDO_PATH)     ; trash copy
+%define UNDO_PATH           4096
+%define TL_PATH_MAX         4096
+%define TL_NAME_MAX         255
+%define TL_COPY_BUF         65536
+%define TRASH_MAX_BYTES     (512 * 1024 * 1024)
+%define TRASH_MAX_AGE       (30 * 86400)
+%define TL_JBUF_MAX         (256 * 1024)
+%define TL_DENTS            8192
+
+; one journal record: header, then A, B and the trash name, each NUL ended
+%define J_LEN               0           ; u32 length of the whole record
+%define J_TYPE              4           ; u32
+%define J_SAVED             8           ; u32 1 = a replaced file sits in trash, 2 = move/copy already undone
+%define J_WHEN              16          ; u64 time of the operation
+%define J_SIZE              24          ; u64 bytes the trash holds for it
+%define J_CMTIME            32          ; u64 copy: mtime of the new file
+%define J_CSIZE             40          ; u64 copy: size of the new file
+%define J_STR               48
 %define UT_DEL              1
 %define UT_MOVE             2
 %define UT_COPY             3
 
 section .data
     tl_s_dash_n         db "-n", 0
+    tl_s_dash_f         db "-f", 0
     tl_s_bench          db "bench", 0
     tl_s_undo           db "undo", 0
+    tl_s_trashcmd       db "trash", 0
+    tl_s_empty          db "empty", 0
     tl_s_trash          db "/.asm_trash", 0
+    tl_s_jname          db "/.journal", 0
+    tl_s_jtmp           db "/.journal.tmp", 0
+    tl_s_lockname       db "/.lock", 0
     tl_s_ns             db " ns", 0
     tl_s_us             db " us", 0
     tl_s_ms             db " ms", 0
@@ -44,6 +84,7 @@ section .data
     tl_s_bench_hdr      db "bench: ", 0
     tl_s_bench_runs1    db "  (", 0
     tl_s_bench_runs2    db " runs)", 10, 0
+    tl_s_bench_run1     db " run)", 10, 0
     tl_s_mean           db "  mean ", 0
     tl_s_min            db "   min ", 0
     tl_s_max            db "   max ", 0
@@ -54,6 +95,10 @@ section .data
     tl_s_nl             db 10, 0
     tl_s_bench_usage    db "Usage: bench [-n N] COMMAND", 10, 0
     tl_s_bench_stopped  db "bench: stopped (Ctrl+C)", 10, 0
+    tl_s_bench_range    db "bench: N must be between 1 and 100000", 10, 0
+    tl_s_bench_nonum    db "bench: -n needs a number", 10, 0
+    tl_s_bench_long     db "bench: the command is too long", 10, 0
+    tl_s_bench_nested   db "bench: cannot be nested", 10, 0
 
     tl_s_undo_none      db "undo: nothing to undo", 10, 0
     tl_s_undo_restored  db "undo: restored ", 0
@@ -62,8 +107,56 @@ section .data
     tl_s_undo_arrow     db " -> ", 0
     tl_s_undo_exists    db "undo: target already exists: ", 0
     tl_s_undo_failed    db "undo: could not restore ", 0
-    tl_s_undo_keep      db "undo: ", 0
-    tl_s_undo_keep2     db " was not restored", 10, 0
+    tl_s_undo_failmv    db "undo: could not move back ", 0
+    tl_s_undo_failrm    db "undo: could not remove copy ", 0
+    tl_s_undo_where     db "undo: the file is still in the trash: ", 0
+    tl_s_undo_changed   db "undo: the copy was changed after it was made; it is now in the trash: ", 0
+    tl_s_undo_gone      db "undo: the copy is already gone: ", 0
+    tl_s_undo_keepold   db "undo: could not put back the file the command replaced: ", 0
+    tl_s_undo_lp        db " (", 0
+    tl_s_undo_rp        db ")", 10, 0
+
+    tl_s_cp_same        db "copy: source and destination are the same file", 10, 0
+    tl_s_cp_dir         db "copy: the source is a folder", 10, 0
+    tl_s_exdev_dir      db "Error: a folder cannot be moved to another filesystem", 10, 0
+    tl_s_same_file      db "Error: source and destination are the same file", 10, 0
+
+    tl_s_cannot1        db ": cannot keep ", 0
+    tl_s_cannot2        db " in the trash (", 0
+    tl_s_cannot3        db "); nothing was changed.", 10, "Use '", 0
+    tl_s_cannot4        db " -f ...' to go ahead without undo.", 10, 0
+    tl_s_norecord1      db ": done, but the undo record could not be written (", 0
+    tl_s_norecord2      db ")", 10, 0
+    tl_s_name_del       db "del", 0
+    tl_s_name_copy      db "copy", 0
+    tl_s_name_move      db "move", 0
+    tl_s_name_undo      db "undo", 0
+
+    tl_r_nohome         db "HOME is not set to a full path", 0
+    tl_r_perm           db "permission denied", 0
+    tl_r_eperm          db "operation not permitted", 0
+    tl_r_noent          db "no such file or directory", 0
+    tl_r_exists         db "already exists", 0
+    tl_r_xdev           db "different filesystem", 0
+    tl_r_notdir         db "not a folder", 0
+    tl_r_isdir          db "is a folder", 0
+    tl_r_big            db "larger than the 512 MiB trash limit", 0
+    tl_r_nospace        db "no space left on device", 0
+    tl_r_ro             db "read-only file system", 0
+    tl_r_long           db "path too long", 0
+    tl_r_kind           db "this kind of file cannot be kept", 0
+
+    tl_s_trash_none     db "trash: empty", 10, 0
+    tl_s_trash_hdr1     db "trash: ", 0
+    tl_s_trash_hdr2     db " entries, ", 0
+    tl_s_trash_hdr3     db " kept in ", 0
+    tl_s_trash_usage    db "Usage: trash [empty]", 10, 0
+    tl_s_trash_emptied1 db "trash: emptied (", 0
+    tl_s_trash_emptied2 db " files removed)", 10, 0
+    tl_s_t_del          db "del   ", 0
+    tl_s_t_move         db "move  ", 0
+    tl_s_t_copy         db "copy  ", 0
+    tl_s_2sp            db "  ", 0
 
 section .bss
     alignb 8
@@ -73,15 +166,35 @@ section .bss
     tl_min              resq 1
     tl_max              resq 1
     tl_peak             resq 1
-    tl_saved_fd         resd 1
+    bench_active        resb 1
+    alignb 4
     tl_trash_seq        resd 1
-    undo_count          resd 1
-    tl_path_a           resb UNDO_PATH
-    tl_path_b           resb UNDO_PATH
-    tl_path_t           resb UNDO_PATH
+    tl_err              resd 1          ; errno of the last trash failure, 0 = no usable HOME
+    tl_lockfd           resd 1
+    tl_jlen             resd 1
+    tl_stage            resb 1          ; copy: 1 src open, 2 dst open, 3 read, 4 write
+    alignb 8
+    tl_held             resq 1          ; bytes the last stash put in the trash
+    tl_chk_mtime        resq 1
+    tl_chk_size         resq 1
+    tl_path_a           resb TL_PATH_MAX
+    tl_path_b           resb TL_PATH_MAX
+    tl_path_t           resb TL_PATH_MAX        ; full path of the trash file
+    tl_path_s           resb TL_PATH_MAX        ; scratch
+    tl_base             resb TL_PATH_MAX        ; $HOME/.asm_trash
+    tl_jpath            resb TL_PATH_MAX
+    tl_jpath2           resb TL_PATH_MAX
+    tl_lbuf             resb TL_PATH_MAX        ; readlink target
+    tl_tname            resb TL_NAME_MAX + 1    ; name of the trash file
+    tl_numbuf           resb 32
     tl_stat             resb 144
+    tl_stat2            resb 144
+    tl_stat3            resb 144
     tl_cmd_buf          resb MAX_INPUT
-    undo_journal        resb UNDO_MAX * UNDO_SIZE
+    bench_cmd_buf       resb MAX_INPUT
+    tl_dents            resb TL_DENTS
+    tl_copy_buf         resb TL_COPY_BUF
+    tl_jbuf             resb TL_JBUF_MAX
 
 section .text
 
@@ -96,10 +209,12 @@ handler_bench:
     push r13
     push r14
     push r15
-    sub rsp, 8
+    sub rsp, 24                     ; [rsp + 4 * fd]: copy of fd 0, 1 and 2
 
     test rdi, rdi
     jz .bn_usage
+    cmp byte [bench_active], 0
+    jne .bn_nested
     mov r12, rdi                    ; command text
     mov r13d, BENCH_DEFAULT_RUNS
 
@@ -110,16 +225,41 @@ handler_bench:
     jz .bn_cmd
     lea rdi, [r12 + 2]
     call ash_skip_blanks
-    mov rdi, rax
-    call bi_parse_uint              ; eax = N, rdi after the word
-    test edx, edx
-    jz .bn_usage
+    mov rsi, rax
+    xor eax, eax                    ; value; stays just above the limit once over it
+    xor ecx, ecx                    ; digits seen
+.bn_digit:
+    movzx edx, byte [rsi]
+    sub edx, '0'
+    cmp edx, 9
+    ja .bn_digits_end
+    imul rax, rax, 10
+    add rax, rdx
+    cmp rax, BENCH_MAX_RUNS
+    jbe .bn_digit_next
+    mov eax, BENCH_MAX_RUNS + 1
+.bn_digit_next:
+    inc ecx
+    inc rsi
+    jmp .bn_digit
+.bn_digits_end:
+    test ecx, ecx
+    jz .bn_nonum
+    movzx edx, byte [rsi]           ; the number must be a word of its own
+    test dl, dl
+    jz .bn_num_ok
+    cmp dl, ' '
+    je .bn_num_ok
+    cmp dl, 9
+    jne .bn_nonum
+.bn_num_ok:
     test eax, eax
-    jz .bn_usage
+    jz .bn_range
     cmp eax, BENCH_MAX_RUNS
-    ja .bn_usage
+    ja .bn_range
     mov r13d, eax
-    call ash_skip_blanks            ; rdi still after the number
+    mov rdi, rsi
+    call ash_skip_blanks
     mov r12, rax
 .bn_cmd:
     cmp byte [r12], 0
@@ -128,11 +268,12 @@ handler_bench:
     mov rdi, r12
     call str_len
     cmp eax, MAX_INPUT - 1
-    jae .bn_usage
-    lea rdi, [tl_cmd_buf]
+    jae .bn_toolong
+    lea rdi, [bench_cmd_buf]
     mov rsi, r12
     call str_copy
-    lea r12, [tl_cmd_buf]
+    lea r12, [bench_cmd_buf]
+    mov byte [bench_active], 1
 
     ; Header
     lea rdi, [tl_s_bench_hdr]
@@ -144,13 +285,18 @@ handler_bench:
     mov eax, r13d
     call print_number
     lea rdi, [tl_s_bench_runs2]
+    cmp r13d, 1
+    jne .bn_hdr_end
+    lea rdi, [tl_s_bench_run1]
+.bn_hdr_end:
     call print_cstring
 
-    ; Hide the command's output: stdout -> /dev/null for the runs
-    mov edi, 1
-    mov eax, TL_SYS_DUP
-    syscall
-    mov [tl_saved_fd], eax
+    ; Hide the command's output and keep it off the keyboard: stdin, stdout
+    ; and stderr point at /dev/null for the runs. The saved copies are close
+    ; on exec so the commands never see them.
+    mov dword [rsp], -1
+    mov dword [rsp + 4], -1
+    mov dword [rsp + 8], -1
     lea rdi, [upd_dev_null]
     mov esi, O_RDWR
     xor edx, edx
@@ -159,10 +305,26 @@ handler_bench:
     test rax, rax
     js .bn_runs
     mov ebx, eax
+    xor r14d, r14d
+.bn_hide:
+    mov edi, r14d
+    mov esi, TL_F_DUPFD_CLOEXEC
+    mov edx, 10
+    mov eax, TL_SYS_FCNTL
+    syscall
+    test rax, rax
+    js .bn_hide_next
+    mov [rsp + r14 * 4], eax
     mov edi, ebx
-    mov esi, 1
+    mov esi, r14d
     mov eax, SYS_DUP2
     syscall
+.bn_hide_next:
+    inc r14d
+    cmp r14d, 3
+    jb .bn_hide
+    cmp ebx, 2
+    jbe .bn_runs                    ; /dev/null took a standard fd: keep it
     mov edi, ebx
     mov eax, SYS_CLOSE
     syscall
@@ -219,15 +381,22 @@ handler_bench:
     jmp .bn_loop
 
 .bn_restore:
-    mov edi, [tl_saved_fd]
+    xor ebx, ebx
+.bn_unhide:
+    mov edi, [rsp + rbx * 4]
     test edi, edi
-    js .bn_report
-    mov esi, 1
+    js .bn_unhide_next
+    mov esi, ebx
     mov eax, SYS_DUP2
     syscall
-    mov edi, [tl_saved_fd]
+    mov edi, [rsp + rbx * 4]
     mov eax, SYS_CLOSE
     syscall
+.bn_unhide_next:
+    inc ebx
+    cmp ebx, 3
+    jb .bn_unhide
+    mov byte [bench_active], 0
 .bn_report:
     mov byte [stats_valid], 0       ; no "took" line for bench itself
     cmp r14d, r13d
@@ -273,12 +442,27 @@ handler_bench:
     setnz al
     mov [last_exit_status], eax
     jmp .bn_ret
+.bn_nested:
+    lea rdi, [tl_s_bench_nested]
+    jmp .bn_err
+.bn_range:
+    lea rdi, [tl_s_bench_range]
+    jmp .bn_err
+.bn_nonum:
+    lea rdi, [tl_s_bench_nonum]
+    jmp .bn_err
+.bn_toolong:
+    lea rdi, [tl_s_bench_long]
+.bn_err:
+    call ash_write_err
+    mov dword [last_exit_status], 2
+    jmp .bn_ret
 .bn_usage:
     lea rdi, [tl_s_bench_usage]
     call print_cstring
     mov dword [last_exit_status], 2
 .bn_ret:
-    add rsp, 8
+    add rsp, 24
     pop r15
     pop r14
     pop r13
@@ -374,7 +558,7 @@ tl_print_kb:
     ret
 
 ; ============================================================================
-; undo support
+; trash, journal and undo support
 ; ============================================================================
 
 ; tl_abspath(rdi = path, rsi = dst UNDO_PATH bytes) -> eax 1 ok / 0 too long
@@ -424,164 +608,1124 @@ tl_abspath:
     pop rbx
     ret
 
-; tl_trash_path(rdi = dst) -> eax 1 ok: "$HOME/.asm_trash/<pid>.<seq>"
-; Creates the trash folder (mode 0700) when missing.
-tl_trash_path:
+; tl_reason(edi = errno) -> rax = short description (0 means no usable HOME)
+tl_reason:
+    lea rax, [tl_r_nohome]
+    test edi, edi
+    jz .rs_ret
+    lea rax, [tl_r_eperm]
+    cmp edi, 1
+    je .rs_ret
+    lea rax, [tl_r_noent]
+    cmp edi, TL_ENOENT
+    je .rs_ret
+    lea rax, [tl_r_perm]
+    cmp edi, EACCES
+    je .rs_ret
+    lea rax, [tl_r_exists]
+    cmp edi, TL_EEXIST
+    je .rs_ret
+    lea rax, [tl_r_xdev]
+    cmp edi, TL_EXDEV
+    je .rs_ret
+    lea rax, [tl_r_notdir]
+    cmp edi, 20
+    je .rs_ret
+    lea rax, [tl_r_isdir]
+    cmp edi, TL_EISDIR
+    je .rs_ret
+    lea rax, [tl_r_big]
+    cmp edi, TL_EFBIG
+    je .rs_ret
+    lea rax, [tl_r_nospace]
+    cmp edi, 28
+    je .rs_ret
+    lea rax, [tl_r_ro]
+    cmp edi, 30
+    je .rs_ret
+    lea rax, [tl_r_long]
+    cmp edi, 36
+    je .rs_ret
+    lea rax, [tl_r_kind]
+    cmp edi, TL_ESAME
+    je .rs_ret
+    ; anything else: "error N"
     push rbx
-    push r12
+    mov esi, edi
+    lea rbx, [tl_numbuf]
+    mov dword [rbx], "erro"
+    mov word [rbx + 4], "r "
+    lea rdi, [rbx + 6]
+    call ash_fmt_int
+    mov rax, rbx
+    pop rbx
+.rs_ret:
+    ret
+
+; tl_perr(edi = errno) - "Error: ..." line on stdout, like the other builtins
+tl_perr:
+    cmp edi, TL_ESAME
+    je .pe_same
+    cmp edi, TL_EXDEV
+    je .pe_xdev
+    jmp print_last_error
+.pe_same:
     sub rsp, 8
-    mov r12, rdi
-    lea rdi, [str_home]
-    call getenv_internal
-    test rax, rax
-    jz .tp_fail
-    mov rdi, r12
-    mov rsi, rax
-    call upd_stpcpy
-    mov rdi, rax
-    lea rsi, [tl_s_trash]
-    call upd_stpcpy
-    mov rbx, rax
-    sub rax, r12
-    cmp rax, UNDO_PATH - 48
-    jae .tp_fail
-    mov rdi, r12
-    mov esi, 0o700
-    mov eax, SYS_MKDIR
-    syscall                         ; EEXIST is fine
-    mov byte [rbx], '/'
-    lea rdi, [rbx + 1]
-    push rdi
-    mov eax, 39                     ; getpid
-    syscall
-    pop rdi
-    mov rsi, rax
-    call ash_fmt_int
-    mov byte [rax], '.'
-    lea rdi, [rax + 1]
-    inc dword [tl_trash_seq]
-    mov esi, [tl_trash_seq]
-    call ash_fmt_int
-    mov eax, 1
-    jmp .tp_ret
-.tp_fail:
-    xor eax, eax
-.tp_ret:
+    lea rdi, [tl_s_same_file]
+    call print_cstring
     add rsp, 8
-    pop r12
-    pop rbx
+    ret
+.pe_xdev:
+    sub rsp, 8
+    lea rdi, [tl_s_exdev_dir]
+    call print_cstring
+    add rsp, 8
     ret
 
-; tl_is_file(rdi = path) -> eax 1 if it exists and is not a directory
-tl_is_file:
-    lea rsi, [tl_stat]
-    mov eax, TL_SYS_LSTAT
-    syscall
-    test rax, rax
-    jnz .if_no
-    mov eax, [tl_stat + STAT_ST_MODE]
-    and eax, ASH_S_IFMT
-    cmp eax, ASH_S_IFDIR
-    je .if_no
-    mov eax, 1
-    ret
-.if_no:
-    xor eax, eax
-    ret
-
-; tl_stash(rdi = abs path) -> eax 1 if moved into trash (path in tl_path_t)
-tl_stash:
-    push rbx
-    mov rbx, rdi
-    lea rdi, [tl_path_t]
-    call tl_trash_path
-    test eax, eax
-    jz .st_ret
-    mov rdi, rbx
-    lea rsi, [tl_path_t]
-    mov eax, SYS_RENAME
-    syscall
-    xor ecx, ecx
-    test rax, rax
-    sete cl
-    mov eax, ecx
-.st_ret:
-    pop rbx
-    ret
-
-; undo_record(edi = type, esi = saved) - copy tl_path_a/b/t into the journal
-undo_record:
+; tl_refuse(rdi = command name, rsi = file, edx = errno)
+; "<cmd>: cannot keep <file> in the trash (<why>); nothing was changed." on stderr
+tl_refuse:
     push rbx
     push r12
     push r13
-    mov r12d, edi
-    mov r13d, esi
-    mov eax, [undo_count]
-    cmp eax, UNDO_MAX
-    jb .ur_slot
-    ; full: drop the oldest entry
-    lea rdi, [undo_journal]
-    lea rsi, [undo_journal + UNDO_SIZE]
-    mov ecx, (UNDO_MAX - 1) * UNDO_SIZE
-    rep movsb
-    mov eax, UNDO_MAX - 1
-    mov [undo_count], eax
-.ur_slot:
-    imul eax, eax, UNDO_SIZE
-    lea rbx, [undo_journal]
-    add rbx, rax
-    inc dword [undo_count]
-    mov [rbx + U_TYPE], r12d
-    mov [rbx + U_SAVED], r13d
-    lea rdi, [rbx + U_A]
-    lea rsi, [tl_path_a]
-    mov ecx, UNDO_PATH * 3
-    rep movsb
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13d, edx
+    call ash_write_err              ; rdi still the command name
+    lea rdi, [tl_s_cannot1]
+    call ash_write_err
+    mov rdi, r12
+    call ash_write_err
+    lea rdi, [tl_s_cannot2]
+    call ash_write_err
+    mov edi, r13d
+    call tl_reason
+    mov rdi, rax
+    call ash_write_err
+    lea rdi, [tl_s_cannot3]
+    call ash_write_err
+    mov rdi, rbx
+    call ash_write_err
+    lea rdi, [tl_s_cannot4]
+    call ash_write_err
     pop r13
     pop r12
     pop rbx
     ret
 
-; ---------- del FILE (keeps a copy in the trash for undo) ----------
-handler_del_safe:
+; tl_trash_base() -> eax 1 ok / 0 failed (tl_err = errno, 0 = HOME unusable)
+; Builds "$HOME/.asm_trash" in tl_base and creates the folder (mode 0700).
+tl_trash_base:
+    push rbx
+    mov dword [tl_err], 0
+    lea rdi, [str_home]
+    call getenv_internal
+    test rax, rax
+    jz .tb_fail
+    cmp byte [rax], '/'
+    jne .tb_fail                    ; unset, empty or relative HOME
+    mov rbx, rax
+    mov rdi, rbx
+    call str_len
+    cmp eax, TL_PATH_MAX - 400      ; room for "/.asm_trash/" and a 255 byte name
+    jae .tb_long
+    lea rdi, [tl_base]
+    mov rsi, rbx
+    call upd_stpcpy
+    mov rdi, rax
+    lea rsi, [tl_s_trash]
+    call upd_stpcpy
+    lea rdi, [tl_base]
+    mov esi, 0o700
+    mov eax, SYS_MKDIR
+    syscall
+    test rax, rax
+    jns .tb_ok
+    cmp rax, -TL_EEXIST
+    je .tb_ok
+    neg eax
+    mov [tl_err], eax
+    jmp .tb_fail
+.tb_long:
+    mov dword [tl_err], 36
+    jmp .tb_fail
+.tb_ok:
+    mov eax, 1
+    pop rbx
+    ret
+.tb_fail:
+    xor eax, eax
+    pop rbx
+    ret
+
+; tl_copy_fds(edi = source fd, esi = destination fd) -> eax 0 / -errno
+; Sets tl_stage to 3 (read) or 4 (write) when it fails.
+tl_copy_fds:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
+    mov ebx, edi
+    mov r12d, esi
+.cf_read:
+    mov byte [tl_stage], 3
+    mov edi, ebx
+    lea rsi, [tl_copy_buf]
+    mov edx, TL_COPY_BUF
+    mov eax, SYS_READ
+    syscall
+    cmp rax, -EINTR
+    je .cf_read
+    test rax, rax
+    jz .cf_done
+    js .cf_ret
+    mov r13, rax                    ; bytes left to write
+    lea r14, [tl_copy_buf]
+    mov byte [tl_stage], 4
+.cf_write:
+    mov edi, r12d
+    mov rsi, r14
+    mov rdx, r13
+    mov eax, SYS_WRITE
+    syscall
+    cmp rax, -EINTR
+    je .cf_write
+    test rax, rax
+    jg .cf_wrote
+    jnz .cf_ret                     ; error
+    mov rax, -5                     ; wrote nothing: EIO, never loop forever
+    jmp .cf_ret
+.cf_wrote:
+    add r14, rax
+    sub r13, rax
+    jnz .cf_write
+    jmp .cf_read
+.cf_done:
+    xor eax, eax
+.cf_ret:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tl_copy_file(rdi = src, rsi = dst, edx = flags) -> eax 0 / errno
+; flags: bit 0 keep the exact mode and times, bit 1 fail when dst exists.
+; A folder is refused and dst is not truncated before it is known to be a
+; different file than src. tl_stage says where it failed (1 src, 2 dst,
+; 3 read, 4 write).
+tl_copy_file:
     push rbp
     mov rbp, rsp
     push rbx
     push r12
-    mov rbx, rdi
-    test rbx, rbx
-    jz .ds_plain
-    cmp byte [rbx], 0
-    je .ds_plain
-    mov rdi, rbx
-    call tl_is_file
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+    mov r12, rdi
+    mov r13, rsi
+    mov r14d, edx
+    mov byte [tl_stage], 1
+    mov rdi, r12
+    mov esi, O_RDONLY | O_CLOEXEC
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .cp_fail
+    mov ebx, eax                    ; source fd
+    mov edi, ebx
+    lea rsi, [tl_stat2]
+    mov eax, SYS_FSTAT
+    syscall
+    test rax, rax
+    js .cp_fail_src
+    mov eax, [tl_stat2 + STAT_ST_MODE]
+    and eax, ASH_S_IFMT
+    cmp eax, ASH_S_IFDIR
+    jne .cp_open_dst
+    mov rax, -TL_EISDIR
+    jmp .cp_fail_src
+.cp_open_dst:
+    mov byte [tl_stage], 2
+    mov rdi, r13
+    mov esi, O_WRONLY | O_CREAT | O_CLOEXEC
+    test r14d, 2
+    jz .cp_flags
+    or esi, TL_O_EXCL
+.cp_flags:
+    mov edx, [tl_stat2 + STAT_ST_MODE]
+    and edx, 0o777
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .cp_fail_src
+    mov r15d, eax                   ; destination fd
+    test r14d, 2
+    jnz .cp_copy                    ; created just now, cannot be the source
+    mov edi, r15d
+    lea rsi, [tl_stat3]
+    mov eax, SYS_FSTAT
+    syscall
+    test rax, rax
+    js .cp_fail_both
+    mov rax, [tl_stat3]             ; st_dev
+    cmp rax, [tl_stat2]
+    jne .cp_trunc
+    mov rax, [tl_stat3 + 8]         ; st_ino
+    cmp rax, [tl_stat2 + 8]
+    jne .cp_trunc
+    mov rax, -TL_ESAME
+    jmp .cp_fail_both
+.cp_trunc:
+    mov eax, [tl_stat3 + STAT_ST_MODE]
+    and eax, ASH_S_IFMT
+    cmp eax, ASH_S_IFREG
+    jne .cp_copy                    ; a device or pipe: nothing to truncate
+    mov edi, r15d
+    xor esi, esi
+    mov eax, TL_SYS_FTRUNCATE
+    syscall
+    mov byte [tl_stage], 2
+    test rax, rax
+    js .cp_fail_both
+.cp_copy:
+    mov edi, ebx
+    mov esi, r15d
+    call tl_copy_fds
     test eax, eax
-    jz .ds_plain                    ; missing or a folder: old behaviour
-    mov rdi, rbx
-    lea rsi, [tl_path_a]
-    call tl_abspath
-    test eax, eax
-    jz .ds_plain
-    lea rdi, [tl_path_a]
-    call tl_stash
-    test eax, eax
-    jz .ds_plain                    ; e.g. other filesystem: really delete
-    mov byte [tl_path_b], 0
-    mov edi, UT_DEL
-    mov esi, 1
-    call undo_record
-    mov dword [last_exit_status], 0
-    jmp .ds_ret
-.ds_plain:
-    mov rdi, rbx
-    call handler_del
-.ds_ret:
+    jnz .cp_fail_both
+    test r14d, 1
+    jz .cp_close
+    mov edi, r15d
+    mov esi, [tl_stat2 + STAT_ST_MODE]
+    and esi, 0o7777
+    mov eax, TL_SYS_FCHMOD
+    syscall
+    mov edi, r15d
+    xor esi, esi                    ; no path: the descriptor is the file
+    lea rdx, [tl_stat2 + 72]        ; st_atim, st_mtim
+    xor r10d, r10d
+    mov eax, TL_SYS_UTIMENSAT
+    syscall
+.cp_close:
+    mov edi, r15d
+    mov eax, SYS_CLOSE
+    syscall
+    mov r14, rax                    ; a late write error shows up here
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    xor eax, eax
+    test r14, r14
+    jns .cp_ret
+    mov byte [tl_stage], 4
+    mov eax, r14d
+    neg eax
+    jmp .cp_ret
+.cp_fail_both:
+    mov r14, rax
+    mov edi, r15d
+    mov eax, SYS_CLOSE
+    syscall
+    mov rax, r14
+.cp_fail_src:
+    mov r14, rax
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    mov rax, r14
+.cp_fail:
+    neg eax
+.cp_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     pop rbp
     ret
 
-; ---------- move/rename SRC DST (saves an overwritten DST) ----------
+; tl_xmove(rdi = src, rsi = dst, edx = 1 to fail when dst exists) -> eax 0 / errno
+; Move across filesystems: copy a file or link, then delete the original.
+; Anything else (folders, devices) is left alone and reported as EXDEV.
+tl_xmove:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, rsi
+    mov ebx, edx
+    mov rdi, r12
+    lea rsi, [tl_stat]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    test rax, rax
+    js .xm_neg
+    mov eax, [tl_stat + STAT_ST_MODE]
+    and eax, ASH_S_IFMT
+    cmp eax, ASH_S_IFLNK
+    je .xm_link
+    cmp eax, ASH_S_IFREG
+    jne .xm_exdev
+    mov rdi, r12
+    mov rsi, r13
+    mov edx, 1
+    test ebx, ebx
+    jz .xm_copy
+    or edx, 2
+.xm_copy:
+    call tl_copy_file
+    test eax, eax
+    jnz .xm_ret
+    jmp .xm_unlink
+.xm_link:
+    mov rdi, r12
+    lea rsi, [tl_lbuf]
+    mov edx, TL_PATH_MAX - 1
+    mov eax, SYS_READLINK
+    syscall
+    test rax, rax
+    js .xm_neg
+    mov byte [tl_lbuf + rax], 0
+    lea rdi, [tl_lbuf]
+    mov rsi, r13
+    mov eax, TL_SYS_SYMLINK
+    syscall
+    test rax, rax
+    js .xm_neg
+.xm_unlink:
+    mov rdi, r12
+    mov eax, SYS_UNLINK
+    syscall
+    test rax, rax
+    jns .xm_ok
+    mov ebx, eax
+    neg ebx                         ; keep the original and drop the half-made copy
+    mov rdi, r13
+    mov eax, SYS_UNLINK
+    syscall
+    mov eax, ebx
+    jmp .xm_ret
+.xm_ok:
+    xor eax, eax
+    jmp .xm_ret
+.xm_exdev:
+    mov eax, TL_EXDEV
+    jmp .xm_ret
+.xm_neg:
+    neg eax
+.xm_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tl_rename_x(rdi = src, rsi = dst) -> eax 0 / errno
+; rename(2), or a copy and delete when the two are on different filesystems.
+tl_rename_x:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    mov r12, rsi
+    mov eax, SYS_RENAME
+    syscall
+    test rax, rax
+    jns .rx_ok
+    cmp rax, -TL_EXDEV
+    je .rx_xdev
+    neg eax
+    jmp .rx_ret
+.rx_xdev:
+    mov rdi, rbx
+    mov rsi, r12
+    xor edx, edx
+    call tl_xmove
+    jmp .rx_ret
+.rx_ok:
+    xor eax, eax
+.rx_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tl_stash(rdi = absolute path) -> eax 1 if the file now sits in the trash
+; On success tl_tname holds the trash file name, tl_path_t its full path and
+; tl_held the bytes kept. On failure tl_err is the errno (0 = no usable HOME,
+; EFBIG = over the size limit). The name never replaces an existing file.
+tl_stash:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8                      ; [rsp] = write cursor
+    mov r12, rdi
+    mov rdi, r12
+    lea rsi, [tl_stat]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    test rax, rax
+    js .st_neg
+    mov eax, [tl_stat + STAT_ST_MODE]
+    and eax, ASH_S_IFMT
+    cmp eax, ASH_S_IFDIR
+    je .st_isdir
+    mov rax, [tl_stat + STAT_ST_SIZE]
+    mov [tl_held], rax
+    cmp rax, TRASH_MAX_BYTES
+    ja .st_big
+    call tl_trash_base
+    test eax, eax
+    jz .st_fail
+    ; the file's own name: what follows the last '/'
+    mov r13, r12
+    mov rsi, r12
+.st_base:
+    mov al, [rsi]
+    test al, al
+    jz .st_base_end
+    inc rsi
+    cmp al, '/'
+    jne .st_base
+    mov r13, rsi
+    jmp .st_base
+.st_base_end:
+    lea rdi, [tl_path_t]
+    lea rsi, [tl_base]
+    call upd_stpcpy
+    mov byte [rax], '/'
+    lea rbx, [rax + 1]              ; where the name starts
+    xor r14d, r14d                  ; attempts
+.st_try:
+    mov eax, TL_SYS_TIME
+    xor edi, edi
+    syscall
+    mov rsi, rax
+    mov rdi, rbx
+    call ash_fmt_int
+    mov byte [rax], '.'
+    inc rax
+    mov [rsp], rax
+    mov eax, ASH_SYS_GETPID
+    syscall
+    mov rsi, rax
+    mov rdi, [rsp]
+    call ash_fmt_int
+    mov byte [rax], '.'
+    inc rax
+    inc dword [tl_trash_seq]
+    mov esi, [tl_trash_seq]
+    mov rdi, rax
+    call ash_fmt_int
+    mov byte [rax], '.'
+    inc rax
+    lea rcx, [rbx + TL_NAME_MAX - 1]
+    mov rsi, r13
+.st_cp:
+    mov dl, [rsi]
+    test dl, dl
+    jz .st_cp_end
+    cmp rax, rcx
+    jae .st_cp_end
+    mov [rax], dl
+    inc rax
+    inc rsi
+    jmp .st_cp
+.st_cp_end:
+    mov byte [rax], 0
+    lea rdi, [tl_tname]
+    mov rsi, rbx
+    call upd_stpcpy
+    ; rename without replacing anything
+    mov rdi, AT_FDCWD
+    mov rsi, r12
+    mov rdx, AT_FDCWD
+    lea r10, [tl_path_t]
+    mov r8d, TL_RENAME_NOREPLACE
+    mov eax, TL_SYS_RENAMEAT2
+    syscall
+    test rax, rax
+    jz .st_ok
+    cmp rax, -TL_EEXIST
+    je .st_again
+    cmp rax, -TL_EINVAL
+    je .st_plain
+    cmp rax, -TL_ENOSYS
+    je .st_plain
+    cmp rax, -TL_EXDEV
+    je .st_xdev
+    jmp .st_neg
+.st_again:
+    inc r14d
+    cmp r14d, 64
+    jb .st_try
+    mov dword [tl_err], TL_EEXIST
+    jmp .st_fail
+.st_plain:
+    ; the filesystem has no RENAME_NOREPLACE: check the name is free first
+    lea rdi, [tl_path_t]
+    lea rsi, [tl_stat2]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    test rax, rax
+    jns .st_again                   ; taken: try the next number
+    mov rdi, r12
+    lea rsi, [tl_path_t]
+    mov eax, SYS_RENAME
+    syscall
+    test rax, rax
+    jz .st_ok
+    cmp rax, -TL_EXDEV
+    jne .st_neg
+.st_xdev:
+    mov rdi, r12
+    lea rsi, [tl_path_t]
+    mov edx, 1
+    call tl_xmove
+    test eax, eax
+    jz .st_ok
+    cmp eax, TL_EEXIST
+    je .st_again
+    cmp eax, TL_EXDEV
+    jne .st_err_eax
+    mov eax, TL_ESAME               ; a folder, device or pipe: not something to keep
+.st_err_eax:
+    mov [tl_err], eax
+    jmp .st_fail
+.st_ok:
+    mov eax, 1
+    jmp .st_ret
+.st_isdir:
+    mov dword [tl_err], TL_EISDIR
+    jmp .st_fail
+.st_big:
+    mov dword [tl_err], TL_EFBIG
+    jmp .st_fail
+.st_neg:
+    neg eax
+    mov [tl_err], eax
+.st_fail:
+    xor eax, eax
+.st_ret:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---------- journal ----------
+
+; tl_j_begin() -> eax 1 ok / 0 failed (tl_err)
+; Takes the trash lock (so two shells cannot lose each other's entries) and
+; loads ~/.asm_trash/.journal into tl_jbuf, keeping only whole records.
+tl_j_begin:
+    push rbx
+    push r12
+    sub rsp, 8
+    mov dword [tl_jlen], 0
+    mov dword [tl_lockfd], -1
+    call tl_trash_base
+    test eax, eax
+    jz .jb_ret
+    lea rdi, [tl_jpath]
+    lea rsi, [tl_base]
+    call upd_stpcpy
+    mov rdi, rax
+    lea rsi, [tl_s_lockname]
+    call upd_stpcpy
+    lea rdi, [tl_jpath]
+    mov esi, O_RDWR | O_CREAT | O_CLOEXEC
+    mov edx, 0o600
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .jb_load                     ; cannot lock: go on without
+    mov [tl_lockfd], eax
+.jb_flock:
+    mov edi, [tl_lockfd]
+    mov esi, TL_LOCK_EX
+    mov eax, TL_SYS_FLOCK
+    syscall
+    cmp rax, -EINTR
+    je .jb_flock
+.jb_load:
+    lea rdi, [tl_jpath]
+    lea rsi, [tl_base]
+    call upd_stpcpy
+    mov rdi, rax
+    lea rsi, [tl_s_jname]
+    call upd_stpcpy
+    lea rdi, [tl_jpath]
+    mov esi, O_RDONLY | O_CLOEXEC
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .jb_ok                       ; no journal yet
+    mov ebx, eax
+    xor r12d, r12d                  ; bytes read
+.jb_read:
+    mov edi, ebx
+    lea rsi, [tl_jbuf + r12]
+    mov edx, TL_JBUF_MAX
+    sub edx, r12d
+    jz .jb_read_end
+    mov eax, SYS_READ
+    syscall
+    cmp rax, -EINTR
+    je .jb_read
+    test rax, rax
+    jle .jb_read_end
+    add r12d, eax
+    jmp .jb_read
+.jb_read_end:
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    ; keep the leading run of well-formed records
+    xor ecx, ecx
+.jb_rec:
+    lea eax, [rcx + J_STR + 3]
+    cmp eax, r12d
+    ja .jb_valid_end
+    mov eax, [tl_jbuf + rcx + J_LEN]
+    cmp eax, J_STR + 3
+    jb .jb_valid_end
+    lea r8d, [rcx + rax]            ; end of this record
+    cmp r8d, r12d
+    ja .jb_valid_end
+    lea rsi, [tl_jbuf + rcx + J_STR]
+    lea r9, [tl_jbuf + r8]
+    mov r10d, 3                     ; three NUL ended strings
+.jb_str:
+    cmp rsi, r9
+    jae .jb_valid_end
+    cmp byte [rsi], 0
+    je .jb_nul
+    inc rsi
+    jmp .jb_str
+.jb_nul:
+    inc rsi
+    dec r10d
+    jnz .jb_str
+    cmp rsi, r9
+    jne .jb_valid_end
+    mov ecx, r8d
+    jmp .jb_rec
+.jb_valid_end:
+    mov [tl_jlen], ecx
+.jb_ok:
+    mov eax, 1
+.jb_ret:
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+
+; tl_j_end(edi = 1 to write the journal back) -> eax 0 / errno
+; Writes tl_jbuf to a temporary file and renames it over .journal, then
+; releases the lock.
+tl_j_end:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    xor r13d, r13d                  ; result
+    test r12d, r12d
+    jz .je_unlock
+    lea rdi, [tl_jpath]
+    lea rsi, [tl_base]
+    call upd_stpcpy
+    mov rdi, rax
+    lea rsi, [tl_s_jtmp]
+    call upd_stpcpy
+    lea rdi, [tl_jpath2]
+    lea rsi, [tl_base]
+    call upd_stpcpy
+    mov rdi, rax
+    lea rsi, [tl_s_jname]
+    call upd_stpcpy
+    lea rdi, [tl_jpath]
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+    mov edx, 0o600
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .je_open_err
+    mov ebx, eax
+    xor r12d, r12d                  ; bytes written
+.je_write:
+    mov edx, [tl_jlen]
+    sub edx, r12d
+    jz .je_written
+    mov edi, ebx
+    lea rsi, [tl_jbuf + r12]
+    mov eax, SYS_WRITE
+    syscall
+    cmp rax, -EINTR
+    je .je_write
+    test rax, rax
+    jle .je_write_err
+    add r12d, eax
+    jmp .je_write
+.je_written:
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    test rax, rax
+    js .je_close_err
+    lea rdi, [tl_jpath]
+    lea rsi, [tl_jpath2]
+    mov eax, SYS_RENAME
+    syscall
+    test rax, rax
+    jns .je_unlock
+    neg eax
+    mov r13d, eax
+    jmp .je_drop_tmp
+.je_write_err:
+    mov r13d, 5                     ; EIO, or the real error below
+    test rax, rax
+    jns .je_close_tmp
+    mov r13d, eax
+    neg r13d
+.je_close_tmp:
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    jmp .je_drop_tmp
+.je_close_err:
+    neg eax
+    mov r13d, eax
+    jmp .je_drop_tmp
+.je_open_err:
+    neg eax
+    mov r13d, eax
+    jmp .je_unlock
+.je_drop_tmp:
+    lea rdi, [tl_jpath]
+    mov eax, SYS_UNLINK
+    syscall
+.je_unlock:
+    mov edi, [tl_lockfd]
+    test edi, edi
+    js .je_ret
+    mov eax, SYS_CLOSE
+    syscall
+    mov dword [tl_lockfd], -1
+.je_ret:
+    mov eax, r13d
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tl_j_drop_first() -> rax = bytes of trash it was holding
+; Forgets the oldest record and deletes the trash file it points at.
+tl_j_drop_first:
+    push rbx
+    push r12
+    sub rsp, 8
+    mov ebx, [tl_jbuf + J_LEN]
+    mov r12, [tl_jbuf + J_SIZE]
+    lea rsi, [tl_jbuf + J_STR]
+.df_a:
+    cmp byte [rsi], 0               ; skip A
+    je .df_a_end
+    inc rsi
+    jmp .df_a
+.df_a_end:
+    inc rsi
+.df_b:
+    cmp byte [rsi], 0               ; skip B
+    je .df_b_end
+    inc rsi
+    jmp .df_b
+.df_b_end:
+    inc rsi                         ; rsi = trash name
+    cmp byte [rsi], 0
+    je .df_forget
+    push rsi
+    sub rsp, 8
+    lea rdi, [tl_path_s]
+    lea rsi, [tl_base]
+    call upd_stpcpy
+    mov byte [rax], '/'
+    lea rdi, [rax + 1]
+    mov rsi, [rsp + 8]
+    call upd_stpcpy
+    lea rdi, [tl_path_s]
+    mov eax, SYS_UNLINK
+    syscall
+    add rsp, 16
+.df_forget:
+    lea rdi, [tl_jbuf]
+    lea rsi, [tl_jbuf + rbx]
+    mov ecx, [tl_jlen]
+    sub ecx, ebx
+    cld
+    rep movsb
+    sub [tl_jlen], ebx
+    mov rax, r12
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+
+; tl_j_trim(edi = bytes the new record needs, rsi = bytes it will keep)
+; Drops records older than TRASH_MAX_AGE, then the oldest ones until the new
+; entry fits under TRASH_MAX_BYTES and in the journal buffer.
+tl_j_trim:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
+    mov r12d, edi
+    mov r13, rsi
+    mov eax, TL_SYS_TIME
+    xor edi, edi
+    syscall
+    sub rax, TRASH_MAX_AGE
+    mov rbx, rax                    ; cutoff
+    xor r14d, r14d                  ; total held (summed below)
+.tj_age:
+    cmp dword [tl_jlen], 0
+    je .tj_sum
+    cmp [tl_jbuf + J_WHEN], rbx
+    jge .tj_sum
+    call tl_j_drop_first
+    jmp .tj_age
+.tj_sum:
+    xor ecx, ecx
+    xor r14d, r14d
+.tj_sum_loop:
+    cmp ecx, [tl_jlen]
+    jae .tj_fit
+    add r14, [tl_jbuf + rcx + J_SIZE]
+    add ecx, [tl_jbuf + rcx + J_LEN]
+    jmp .tj_sum_loop
+.tj_fit:
+    cmp dword [tl_jlen], 0
+    je .tj_ret
+    lea rax, [r14 + r13]
+    cmp rax, TRASH_MAX_BYTES
+    ja .tj_drop
+    mov eax, [tl_jlen]
+    add eax, r12d
+    cmp eax, TL_JBUF_MAX
+    jbe .tj_ret
+.tj_drop:
+    call tl_j_drop_first
+    sub r14, rax
+    jmp .tj_fit
+.tj_ret:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; undo_record(edi = type, esi = saved) -> eax 1 recorded / 0 not recorded
+; Appends an entry for tl_path_a, tl_path_b and the last stash (tl_tname,
+; tl_held) to the journal. tl_err is the errno when it fails.
+undo_record:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edi
+    mov r13d, esi
+    test r13d, r13d
+    jnz .ur_have_name
+    mov byte [tl_tname], 0
+    mov qword [tl_held], 0
+.ur_have_name:
+    call tl_j_begin
+    test eax, eax
+    jz .ur_fail
+    lea rdi, [tl_path_a]
+    call str_len
+    mov ebx, eax
+    lea rdi, [tl_path_b]
+    call str_len
+    add ebx, eax
+    lea rdi, [tl_tname]
+    call str_len
+    add ebx, eax
+    add ebx, J_STR + 3              ; ebx = record length
+    mov edi, ebx
+    mov rsi, [tl_held]
+    call tl_j_trim
+    mov eax, [tl_jlen]
+    lea r14, [tl_jbuf + rax]
+    mov [r14 + J_LEN], ebx
+    mov [r14 + J_TYPE], r12d
+    mov [r14 + J_SAVED], r13d
+    mov dword [r14 + 12], 0
+    mov eax, TL_SYS_TIME
+    xor edi, edi
+    syscall
+    mov [r14 + J_WHEN], rax
+    mov rax, [tl_held]
+    mov [r14 + J_SIZE], rax
+    mov rax, [tl_chk_mtime]
+    mov [r14 + J_CMTIME], rax
+    mov rax, [tl_chk_size]
+    mov [r14 + J_CSIZE], rax
+    lea rdi, [r14 + J_STR]
+    lea rsi, [tl_path_a]
+    call upd_stpcpy
+    lea rdi, [rax + 1]
+    lea rsi, [tl_path_b]
+    call upd_stpcpy
+    lea rdi, [rax + 1]
+    lea rsi, [tl_tname]
+    call upd_stpcpy
+    add [tl_jlen], ebx
+    mov edi, 1
+    call tl_j_end
+    mov qword [tl_chk_mtime], 0
+    mov qword [tl_chk_size], 0
+    test eax, eax
+    jnz .ur_save_err
+    mov eax, 1
+    jmp .ur_ret
+.ur_save_err:
+    mov [tl_err], eax
+    jmp .ur_fail
+.ur_fail:
+    mov qword [tl_chk_mtime], 0
+    mov qword [tl_chk_size], 0
+    xor eax, eax
+.ur_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tl_warn_record(rdi = command name) - the work is done but not journaled
+tl_warn_record:
+    push rbx
+    mov rbx, rdi
+    call ash_write_err
+    lea rdi, [tl_s_norecord1]
+    call ash_write_err
+    mov edi, [tl_err]
+    call tl_reason
+    mov rdi, rax
+    call ash_write_err
+    lea rdi, [tl_s_norecord2]
+    call ash_write_err
+    pop rbx
+    ret
+
+; tl_parse_force(rdi = args or 0) -> rax = args after an optional "-f",
+; edx = 1 when -f was given
+tl_parse_force:
+    xor edx, edx
+    test rdi, rdi
+    jz .pf_ret0
+    push rbx
+    mov rbx, rdi
+    lea rsi, [tl_s_dash_f]
+    call ash_word_is
+    test eax, eax
+    jz .pf_none
+    lea rdi, [rbx + 2]
+    call ash_skip_blanks
+    mov edx, 1
+    pop rbx
+    ret
+.pf_none:
+    mov rax, rbx
+    xor edx, edx
+    pop rbx
+    ret
+.pf_ret0:
+    xor eax, eax
+    ret
+
+; ---------- del [-f] FILE (keeps a copy in the trash for undo) ----------
+handler_del_safe:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+    mov dword [last_exit_status], 0
+    call tl_parse_force
+    mov rbx, rax                    ; the file name (rest of the line)
+    mov r12d, edx                   ; -f given
+    test rbx, rbx
+    jz .ds_plain
+    cmp byte [rbx], 0
+    je .ds_plain
+    test r12d, r12d
+    jnz .ds_plain                   ; del -f: no trash, no undo
+    mov rdi, rbx
+    lea rsi, [tl_stat]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    test rax, rax
+    js .ds_plain                    ; missing: handler_del reports it
+    mov eax, [tl_stat + STAT_ST_MODE]
+    and eax, ASH_S_IFMT
+    cmp eax, ASH_S_IFDIR
+    je .ds_plain                    ; a folder: handler_del reports it
+    mov rdi, rbx
+    lea rsi, [tl_path_a]
+    call tl_abspath
+    test eax, eax
+    jnz .ds_stash
+    mov edx, 36
+    jmp .ds_refuse
+.ds_stash:
+    lea rdi, [tl_path_a]
+    call tl_stash
+    test eax, eax
+    jnz .ds_kept
+    mov edx, [tl_err]
+.ds_refuse:
+    lea rdi, [tl_s_name_del]
+    mov rsi, rbx
+    call tl_refuse
+    mov dword [last_exit_status], 1
+    jmp .ds_ret
+.ds_kept:
+    mov byte [tl_path_b], 0
+    mov edi, UT_DEL
+    mov esi, 1
+    call undo_record
+    test eax, eax
+    jnz .ds_ret
+    lea rdi, [tl_s_name_del]
+    call tl_warn_record
+    jmp .ds_ret
+.ds_plain:
+    mov rdi, rbx
+    call handler_del
+.ds_ret:
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ---------- move/rename [-f] SRC DST (saves an overwritten DST) ----------
 handler_move_safe:
     push rbp
     mov rbp, rsp
@@ -589,81 +1733,127 @@ handler_move_safe:
     push r12
     push r13
     push r14
-    test rdi, rdi
-    jz .ms_plain_arg
-    mov rbx, rdi
+    push r15
+    sub rsp, 8
+    mov dword [last_exit_status], 0
+    call tl_parse_force
+    mov r15d, edx                   ; -f given
+    test rax, rax
+    jz .ms_usage
+    mov rdi, rax
     call parse_two_args
     test rax, rax
-    jz .ms_plain_rejoin
-    mov r12, rax
-    mov r13, rdx
-    xor r14d, r14d                  ; saved?
+    jz .ms_usage
+    mov r12, rax                    ; source as typed
+    mov r13, rdx                    ; destination as typed
+    xor r14d, r14d                  ; 1 once a replaced file sits in the trash
     mov rdi, r12
     lea rsi, [tl_path_a]
     call tl_abspath
     test eax, eax
-    jz .ms_raw
+    jz .ms_long
     mov rdi, r13
     lea rsi, [tl_path_b]
     call tl_abspath
     test eax, eax
-    jz .ms_raw
-    mov rdi, r12
-    call tl_is_file
-    test eax, eax
-    jz .ms_raw                      ; source missing: let rename report it
+    jz .ms_long
+
+    lea rdi, [tl_path_a]
+    lea rsi, [tl_stat]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    test rax, rax
+    js .ms_errno
     lea rdi, [tl_path_b]
-    call tl_is_file
-    test eax, eax
-    jz .ms_rename
+    lea rsi, [tl_stat2]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    test rax, rax
+    js .ms_rename                   ; nothing at the destination yet
+    mov rax, [tl_stat2]
+    cmp rax, [tl_stat]
+    jne .ms_dst_there
+    mov rax, [tl_stat2 + 8]
+    cmp rax, [tl_stat + 8]
+    je .ms_ret                      ; the very same file: nothing to do
+.ms_dst_there:
+    mov eax, [tl_stat2 + STAT_ST_MODE]
+    and eax, ASH_S_IFMT
+    cmp eax, ASH_S_IFDIR
+    je .ms_rename                   ; let rename decide about folders
     lea rdi, [tl_path_b]
     call tl_stash
     mov r14d, eax
+    test eax, eax
+    jnz .ms_rename
+    test r15d, r15d
+    jnz .ms_rename                  ; -f: overwrite without a trash copy
+    mov edx, [tl_err]
+    lea rdi, [tl_s_name_move]
+    mov rsi, r13
+    call tl_refuse
+    mov dword [last_exit_status], 1
+    jmp .ms_ret
 .ms_rename:
     lea rdi, [tl_path_a]
     lea rsi, [tl_path_b]
-    mov eax, SYS_RENAME
-    syscall
-    test rax, rax
-    js .ms_failed
+    call tl_rename_x
+    test eax, eax
+    jnz .ms_failed
     mov edi, UT_MOVE
     mov esi, r14d
     call undo_record
-    mov dword [last_exit_status], 0
+    test eax, eax
+    jnz .ms_ret
+    lea rdi, [tl_s_name_move]
+    call tl_warn_record
     jmp .ms_ret
 .ms_failed:
-    neg eax
-    push rax
-    push rax
+    mov ebx, eax
     test r14d, r14d                 ; put the stashed file back
     jz .ms_failed_msg
     lea rdi, [tl_path_t]
     lea rsi, [tl_path_b]
-    mov eax, SYS_RENAME
-    syscall
+    call tl_rename_x
 .ms_failed_msg:
-    pop rdi
-    pop rax
-    call print_last_error
+    mov edi, ebx
+    call tl_perr
     mov dword [last_exit_status], 1
     jmp .ms_ret
-.ms_raw:
-    mov rdi, r12
-    mov rsi, r13
-    mov eax, SYS_RENAME
-    syscall
-    test rax, rax
-    jns .ms_ret
+.ms_errno:
     neg eax
     mov edi, eax
-    call print_last_error
+    call tl_perr
     mov dword [last_exit_status], 1
     jmp .ms_ret
-.ms_plain_rejoin:
-    mov rdi, rbx
-.ms_plain_arg:
-    call handler_move               ; prints the usage error
+.ms_long:
+    ; without absolute paths there is no undo: only with -f
+    test r15d, r15d
+    jnz .ms_plain
+    lea rdi, [tl_s_name_move]
+    mov rsi, r12
+    mov edx, 36
+    call tl_refuse
+    mov dword [last_exit_status], 1
+    jmp .ms_ret
+.ms_plain:
+    mov rdi, r12
+    mov rsi, r13
+    call tl_rename_x
+    test eax, eax
+    jz .ms_ret
+    mov edi, eax
+    call tl_perr
+    mov dword [last_exit_status], 1
+    jmp .ms_ret
+.ms_usage:
+    lea rdi, [err_args_msg]
+    mov esi, err_args_len
+    call print_string_len
+    mov dword [last_exit_status], 1
 .ms_ret:
+    add rsp, 8
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -671,7 +1861,61 @@ handler_move_safe:
     pop rbp
     ret
 
-; ---------- copy SRC DST (saves an overwritten DST) ----------
+; tl_copy_report(eax = errno from tl_copy_file) - message for a failed copy
+tl_copy_report:
+    sub rsp, 8
+    mov edi, eax
+    cmp edi, TL_ESAME
+    je .cr_same
+    cmp edi, TL_EISDIR
+    jne .cr_stage
+    cmp byte [tl_stage], 1
+    jne .cr_stage
+    lea rdi, [tl_s_cp_dir]
+    call print_cstring
+    jmp .cr_ret
+.cr_same:
+    lea rdi, [tl_s_cp_same]
+    call print_cstring
+    jmp .cr_ret
+.cr_stage:
+    cmp byte [tl_stage], 3
+    je .cr_read
+    cmp byte [tl_stage], 4
+    je .cr_write
+    call tl_perr
+    jmp .cr_ret
+.cr_read:
+    lea rdi, [err_copy_read_msg]
+    mov esi, err_copy_read_len
+    call print_string_len
+    jmp .cr_ret
+.cr_write:
+    lea rdi, [err_copy_write_msg]
+    mov esi, err_copy_write_len
+    call print_string_len
+.cr_ret:
+    add rsp, 8
+    ret
+
+; tl_copy_cmd(rdi = src, rsi = dst) -> eax 0 ok / 1 failed (message printed)
+tl_copy_cmd:
+    sub rsp, 8
+    xor edx, edx
+    call tl_copy_file
+    test eax, eax
+    jz .cc_ok
+    call tl_copy_report
+    mov dword [last_exit_status], 1
+    mov eax, 1
+    jmp .cc_ret
+.cc_ok:
+    xor eax, eax
+.cc_ret:
+    add rsp, 8
+    ret
+
+; ---------- copy [-f] SRC DST (saves an overwritten DST) ----------
 handler_copy_safe:
     push rbp
     mov rbp, rsp
@@ -679,73 +1923,169 @@ handler_copy_safe:
     push r12
     push r13
     push r14
-    test rdi, rdi
-    jz .cs_plain
-    mov rbx, rdi
+    push r15
+    sub rsp, 8
+    mov dword [last_exit_status], 0
+    call tl_parse_force
+    mov r15d, edx                   ; -f given
+    test rax, rax
+    jz .cs_usage
+    mov rdi, rax
     call parse_two_args
     test rax, rax
-    jz .cs_plain_args
-    mov r12, rax
-    mov r13, rdx
-    xor r14d, r14d
-    mov rdi, r12                    ; where parse_two_args put the NUL
-    call str_len
-    push rax
-    push rax
+    jz .cs_usage
+    mov r12, rax                    ; source as typed
+    mov r13, rdx                    ; destination as typed
+    mov r14d, 3                     ; 3 = no undo entry
+    mov rdi, r13
+    lea rsi, [tl_path_b]
+    call tl_abspath
+    test eax, eax
+    jnz .cs_have_abs
+    test r15d, r15d
+    jnz .cs_copy                    ; -f: copy without undo
+    lea rdi, [tl_s_name_copy]
+    mov rsi, r13
+    mov edx, 36
+    call tl_refuse
+    mov dword [last_exit_status], 1
+    jmp .cs_ret
+.cs_have_abs:
+    ; same file? stat follows links, like the copy itself
+    mov rdi, r12
+    lea rsi, [tl_stat]
+    mov eax, 4                      ; stat
+    syscall
+    test rax, rax
+    js .cs_copy                     ; the copy reports the missing source
+    mov rdi, r13
+    lea rsi, [tl_stat2]
+    mov eax, 4
+    syscall
+    test rax, rax
+    js .cs_new                      ; destination does not exist yet
+    mov rax, [tl_stat2]
+    cmp rax, [tl_stat]
+    jne .cs_exists
+    mov rax, [tl_stat2 + 8]
+    cmp rax, [tl_stat + 8]
+    jne .cs_exists
+    lea rdi, [tl_s_cp_same]
+    call print_cstring
+    mov dword [last_exit_status], 1
+    jmp .cs_ret
+.cs_new:
+    mov r14d, 2                     ; 2 = new file
+    jmp .cs_copy
+.cs_exists:
+    lea rdi, [tl_path_b]
+    lea rsi, [tl_stat2]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    test rax, rax
+    js .cs_copy
+    mov eax, [tl_stat2 + STAT_ST_MODE]
+    and eax, ASH_S_IFMT
+    cmp eax, ASH_S_IFDIR
+    je .cs_copy                     ; the copy reports "is a folder"
     mov rdi, r12
     mov esi, TL_R_OK
     mov eax, ASH_SYS_ACCESS
     syscall
     test rax, rax
-    jnz .cs_go                      ; unreadable source: copy reports it
-    mov rdi, r13
-    lea rsi, [tl_path_b]
-    call tl_abspath
-    test eax, eax
-    jz .cs_go
-    lea rdi, [tl_path_b]
-    call tl_is_file
-    mov r14d, 2                     ; 2 = new file
-    test eax, eax
-    jz .cs_go
+    jnz .cs_copy                    ; unreadable source: the copy reports it
     lea rdi, [tl_path_b]
     call tl_stash
-    mov r14d, eax                   ; 1 = old file saved, 0 = not saved
+    mov r14d, eax                   ; 1 = old file saved
     test eax, eax
-    jnz .cs_go
-    mov r14d, 3                     ; could not save: no undo entry
-.cs_go:
-    pop rax
-    pop rax
-    mov byte [r12 + rax], ' '       ; rejoin "SRC DST" for handler_copy
-    mov rdi, rbx
-    call handler_copy
+    jnz .cs_copy
+    test r15d, r15d
+    jnz .cs_force_ov
+    mov edx, [tl_err]
+    lea rdi, [tl_s_name_copy]
+    mov rsi, r13
+    call tl_refuse
+    mov dword [last_exit_status], 1
+    jmp .cs_ret
+.cs_force_ov:
+    mov r14d, 3
+.cs_copy:
+    mov rdi, r12
+    mov rsi, r13
+    call tl_copy_cmd
+    test eax, eax
+    jz .cs_ok
+    ; failed: put things back as they were
     cmp r14d, 1
-    je .cs_record
+    jne .cs_failed_new
+    mov rdi, r13
+    mov eax, SYS_UNLINK
+    syscall                         ; a half written copy
+    lea rdi, [tl_path_t]
+    lea rsi, [tl_path_b]
+    call tl_rename_x
+    jmp .cs_ret
+.cs_failed_new:
     cmp r14d, 2
     jne .cs_ret
-    xor r14d, r14d
-.cs_record:
-    ; only record when DST now exists
+    ; the destination was created by this copy: do not leave a stub behind
+    cmp byte [tl_stage], 2
+    jbe .cs_ret                     ; it was never created
     lea rdi, [tl_path_b]
-    call tl_is_file
-    test eax, eax
-    jz .cs_ret
+    mov eax, SYS_UNLINK
+    syscall
+    jmp .cs_ret
+.cs_ok:
+    cmp r14d, 3
+    je .cs_ret
+    lea rdi, [tl_path_b]
+    lea rsi, [tl_stat]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    test rax, rax
+    js .cs_ret
+    mov rax, [tl_stat + 88]         ; st_mtim.tv_sec
+    mov [tl_chk_mtime], rax
+    mov rax, [tl_stat + STAT_ST_SIZE]
+    mov [tl_chk_size], rax
+    xor esi, esi
+    cmp r14d, 1
+    sete sil                        ; saved = 1 only when a file was replaced
     mov byte [tl_path_a], 0
     mov edi, UT_COPY
-    mov esi, r14d
     call undo_record
+    test eax, eax
+    jnz .cs_ret
+    lea rdi, [tl_s_name_copy]
+    call tl_warn_record
     jmp .cs_ret
-.cs_plain_args:
-    mov rdi, rbx
-.cs_plain:
-    call handler_copy
+.cs_usage:
+    lea rdi, [err_args_msg]
+    mov esi, err_args_len
+    call print_string_len
+    mov dword [last_exit_status], 1
 .cs_ret:
+    add rsp, 8
+    pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; tl_trash_file(rdi = journal name) - tl_path_t = "$base/<name>"
+tl_trash_file:
+    push rbx
+    mov rbx, rdi
+    lea rdi, [tl_path_t]
+    lea rsi, [tl_base]
+    call upd_stpcpy
+    mov byte [rax], '/'
+    lea rdi, [rax + 1]
+    mov rsi, rbx
+    call upd_stpcpy
+    pop rbx
     ret
 
 ; ---------- undo ----------
@@ -754,125 +2094,496 @@ handler_undo:
     mov rbp, rsp
     push rbx
     push r12
-    mov eax, [undo_count]
-    test eax, eax
-    jz .un_none
-    dec eax
-    mov [undo_count], eax
-    imul eax, eax, UNDO_SIZE
-    lea rbx, [undo_journal]
-    add rbx, rax
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
     mov dword [last_exit_status], 0
-    mov eax, [rbx + U_TYPE]
+    call tl_j_begin
+    test eax, eax
+    jz .un_none_nolock
+    xor ebx, ebx                    ; offset of the newest record
+    xor ecx, ecx
+    mov edx, [tl_jlen]
+.un_last:
+    cmp ecx, edx
+    jae .un_found
+    mov ebx, ecx
+    add ecx, [tl_jbuf + rcx + J_LEN]
+    jmp .un_last
+.un_found:
+    test edx, edx
+    jz .un_none
+    lea r12, [tl_jbuf + rbx]        ; the record
+    lea r13, [r12 + J_STR]          ; A
+    mov rsi, r13
+.un_skip_a:
+    cmp byte [rsi], 0
+    je .un_a_end
+    inc rsi
+    jmp .un_skip_a
+.un_a_end:
+    inc rsi
+    mov r14, rsi                    ; B
+.un_skip_b:
+    cmp byte [rsi], 0
+    je .un_b_end
+    inc rsi
+    jmp .un_skip_b
+.un_b_end:
+    inc rsi
+    mov r15, rsi                    ; trash name
+    mov eax, [r12 + J_TYPE]
     cmp eax, UT_DEL
     je .un_del
     cmp eax, UT_MOVE
     je .un_move
+    cmp eax, UT_COPY
+    je .un_copy
+    jmp .un_pop                     ; unknown record type: drop it
 
-    ; copy: remove the new file, bring back the one it replaced
-    lea rdi, [rbx + U_B]
-    mov eax, SYS_UNLINK
-    syscall
-    lea rdi, [tl_s_undo_removed]
-    call print_cstring
-    lea rdi, [rbx + U_B]
-    call print_cstring
-    call print_newline
-    jmp .un_saved
-
-.un_move:
-    lea rdi, [rbx + U_A]
-    call tl_is_file
+.un_del:
+    mov rdi, r13
+    call tl_exists
     test eax, eax
     jnz .un_exists_a
-    lea rdi, [rbx + U_B]
-    lea rsi, [rbx + U_A]
-    mov eax, SYS_RENAME
-    syscall
-    test rax, rax
-    js .un_fail_b
+    mov rdi, r15
+    call tl_trash_file
+    lea rdi, [tl_path_t]
+    mov rsi, r13
+    call tl_rename_x
+    test eax, eax
+    jnz .un_fail_restore
+    lea rdi, [tl_s_undo_restored]
+    call print_cstring
+    mov rdi, r13
+    call print_cstring
+    call print_newline
+    jmp .un_pop
+
+.un_move:
+    cmp dword [r12 + J_SAVED], 2
+    je .un_saved                    ; already moved back, file still to restore
+    mov rdi, r13
+    call tl_exists
+    test eax, eax
+    jnz .un_exists_a
+    mov rdi, r14
+    mov rsi, r13
+    call tl_rename_x
+    test eax, eax
+    jnz .un_fail_move
     lea rdi, [tl_s_undo_moved]
     call print_cstring
-    lea rdi, [rbx + U_B]
+    mov rdi, r14
     call print_cstring
     lea rdi, [tl_s_undo_arrow]
     call print_cstring
-    lea rdi, [rbx + U_A]
+    mov rdi, r13
     call print_cstring
     call print_newline
     jmp .un_saved
 
-.un_del:
-    lea rdi, [rbx + U_A]
-    call tl_is_file
-    test eax, eax
-    jnz .un_exists_a
-    lea rdi, [rbx + U_T]
-    lea rsi, [rbx + U_A]
-    mov eax, SYS_RENAME
+.un_copy:
+    cmp dword [r12 + J_SAVED], 2
+    je .un_saved
+    mov rdi, r14
+    lea rsi, [tl_stat]
+    mov eax, TL_SYS_LSTAT
     syscall
     test rax, rax
-    js .un_fail_a
-    lea rdi, [tl_s_undo_restored]
+    js .un_copy_gone
+    ; still the file the copy made? then it is safe to delete
+    mov eax, [tl_stat + STAT_ST_MODE]
+    and eax, ASH_S_IFMT
+    cmp eax, ASH_S_IFREG
+    jne .un_copy_changed
+    mov rax, [tl_stat + STAT_ST_SIZE]
+    cmp rax, [r12 + J_CSIZE]
+    jne .un_copy_changed
+    mov rax, [tl_stat + 88]
+    cmp rax, [r12 + J_CMTIME]
+    jne .un_copy_changed
+    mov rdi, r14
+    mov eax, SYS_UNLINK
+    syscall
+    test rax, rax
+    js .un_fail_rm
+    lea rdi, [tl_s_undo_removed]
     call print_cstring
-    lea rdi, [rbx + U_A]
+    mov rdi, r14
     call print_cstring
     call print_newline
-    jmp .un_ret
+    jmp .un_saved
+.un_copy_changed:
+    ; edited since: keep its content in the trash instead of deleting it
+    mov rdi, r14
+    call tl_stash
+    test eax, eax
+    jz .un_fail_stash
+    lea rdi, [tl_s_undo_changed]
+    call print_cstring
+    lea rdi, [tl_path_t]
+    call print_cstring
+    call print_newline
+    jmp .un_saved
+.un_copy_gone:
+    lea rdi, [tl_s_undo_gone]
+    call print_cstring
+    mov rdi, r14
+    call print_cstring
+    call print_newline
+    jmp .un_saved
 
 .un_saved:
-    ; move/copy: put back the destination file they replaced
-    cmp dword [rbx + U_SAVED], 0
-    je .un_ret
-    lea rdi, [rbx + U_T]
-    lea rsi, [rbx + U_B]
-    mov eax, SYS_RENAME
-    syscall
-    test rax, rax
-    js .un_keep
+    ; move/copy: put back the file that sat at the destination before
+    cmp dword [r12 + J_SAVED], 0
+    je .un_pop
+    mov rdi, r14
+    call tl_exists
+    test eax, eax
+    jnz .un_keep_exists
+    mov rdi, r15
+    call tl_trash_file
+    lea rdi, [tl_path_t]
+    mov rsi, r14
+    call tl_rename_x
+    test eax, eax
+    jnz .un_keep_fail
     lea rdi, [tl_s_undo_restored]
     call print_cstring
-    lea rdi, [rbx + U_B]
+    mov rdi, r14
     call print_cstring
     call print_newline
-    jmp .un_ret
-.un_keep:
-    lea rdi, [tl_s_undo_keep]
+    jmp .un_pop
+
+.un_keep_exists:
+    mov eax, TL_EEXIST
+.un_keep_fail:
+    ; the move/copy itself is undone; remember that and keep the entry so a
+    ; later undo can retry putting the older file back
+    mov [rsp], eax
+    mov dword [r12 + J_SAVED], 2
+    lea rdi, [tl_s_undo_keepold]
     call print_cstring
-    lea rdi, [rbx + U_T]
+    mov rdi, r14
     call print_cstring
-    lea rdi, [tl_s_undo_keep2]
+    lea rdi, [tl_s_undo_lp]
     call print_cstring
+    mov edi, [rsp]
+    call tl_reason
+    mov rdi, rax
+    call print_cstring
+    lea rdi, [tl_s_undo_rp]
+    call print_cstring
+    mov rdi, r15
+    call tl_trash_file
+    lea rdi, [tl_s_undo_where]
+    call print_cstring
+    lea rdi, [tl_path_t]
+    call print_cstring
+    call print_newline
     mov dword [last_exit_status], 1
+    mov edi, 1                      ; the saved flag changed
+    call tl_j_end
     jmp .un_ret
 
 .un_exists_a:
     lea rdi, [tl_s_undo_exists]
     call print_cstring
-    lea rdi, [rbx + U_A]
+    mov rdi, r13
     call print_cstring
     call print_newline
-    inc dword [undo_count]          ; keep the entry
     mov dword [last_exit_status], 1
+    xor edi, edi
+    call tl_j_end
     jmp .un_ret
-.un_fail_a:
-    lea r12, [rbx + U_A]
-    jmp .un_fail
-.un_fail_b:
-    lea r12, [rbx + U_B]
-.un_fail:
+
+.un_fail_restore:
+    mov [rsp], eax
     lea rdi, [tl_s_undo_failed]
     call print_cstring
-    mov rdi, r12
+    mov rdi, r13
+    jmp .un_fail_msg
+.un_fail_move:
+    mov [rsp], eax
+    lea rdi, [tl_s_undo_failmv]
+    call print_cstring
+    mov rdi, r14
+    jmp .un_fail_msg
+.un_fail_stash:
+    mov eax, [tl_err]
+    jmp .un_fail_rm_have
+.un_fail_rm:
+    neg eax                         ; unlink gave -errno
+.un_fail_rm_have:
+    mov [rsp], eax
+    lea rdi, [tl_s_undo_failrm]
+    call print_cstring
+    mov rdi, r14
+.un_fail_msg:
+    call print_cstring
+    lea rdi, [tl_s_undo_lp]
+    call print_cstring
+    mov edi, [rsp]
+    call tl_reason
+    mov rdi, rax
+    call print_cstring
+    lea rdi, [tl_s_undo_rp]
+    call print_cstring
+    cmp dword [r12 + J_TYPE], UT_DEL
+    jne .un_fail_end
+    mov rdi, r15
+    call tl_trash_file
+    lea rdi, [tl_s_undo_where]
+    call print_cstring
+    lea rdi, [tl_path_t]
     call print_cstring
     call print_newline
+.un_fail_end:
     mov dword [last_exit_status], 1
+    xor edi, edi
+    call tl_j_end
     jmp .un_ret
+
+.un_pop:
+    mov [tl_jlen], ebx              ; forget the entry
+    mov edi, 1
+    call tl_j_end
+    test eax, eax
+    jz .un_ret
+    mov [tl_err], eax               ; done, but the journal still lists it
+    lea rdi, [tl_s_name_undo]
+    call tl_warn_record
+    jmp .un_ret
+
 .un_none:
+    xor edi, edi
+    call tl_j_end
+.un_none_nolock:
     lea rdi, [tl_s_undo_none]
     call print_cstring
     mov dword [last_exit_status], 1
 .un_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; tl_exists(rdi = path) -> eax 1 if anything (even a dangling link) is there
+tl_exists:
+    lea rsi, [tl_stat]
+    mov eax, TL_SYS_LSTAT
+    syscall
+    xor ecx, ecx
+    test rax, rax
+    sete cl
+    mov eax, ecx
+    ret
+
+; ---------- trash [empty] ----------
+handler_trash:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+    mov dword [last_exit_status], 0
+    xor r15d, r15d                  ; 1 = empty
+    test rdi, rdi
+    jz .tc_list
+    cmp byte [rdi], 0
+    je .tc_list
+    lea rsi, [tl_s_empty]
+    mov rbx, rdi
+    call ash_word_is
+    test eax, eax
+    jz .tc_usage
+    lea rdi, [rbx + 5]
+    call ash_skip_blanks
+    cmp byte [rax], 0
+    jne .tc_usage
+    mov r15d, 1
+.tc_list:
+    call tl_j_begin
+    test eax, eax
+    jz .tc_nothing
+    test r15d, r15d
+    jnz .tc_empty
+    cmp dword [tl_jlen], 0
+    je .tc_none_unlock
+    ; header: count and size
+    xor ecx, ecx
+    xor r12d, r12d                  ; entries
+    xor r13d, r13d                  ; bytes
+.tc_count:
+    cmp ecx, [tl_jlen]
+    jae .tc_head
+    inc r12d
+    add r13, [tl_jbuf + rcx + J_SIZE]
+    add ecx, [tl_jbuf + rcx + J_LEN]
+    jmp .tc_count
+.tc_head:
+    lea rdi, [tl_s_trash_hdr1]
+    call print_cstring
+    mov eax, r12d
+    call print_number
+    lea rdi, [tl_s_trash_hdr2]
+    call print_cstring
+    mov rax, r13
+    shr rax, 10
+    call tl_print_kb
+    lea rdi, [tl_s_trash_hdr3]
+    call print_cstring
+    lea rdi, [tl_base]
+    call print_cstring
+    call print_newline
+    xor ebx, ebx                    ; offset
+    xor r12d, r12d                  ; line number
+.tc_line:
+    cmp ebx, [tl_jlen]
+    jae .tc_done
+    inc r12d
+    lea r14, [tl_jbuf + rbx]
+    lea rdi, [tl_s_2sp]
+    call print_cstring
+    mov eax, r12d
+    call print_number
+    lea rdi, [tl_s_2sp]
+    call print_cstring
+    lea rdi, [tl_s_t_del]
+    cmp dword [r14 + J_TYPE], UT_DEL
+    je .tc_type
+    lea rdi, [tl_s_t_move]
+    cmp dword [r14 + J_TYPE], UT_MOVE
+    je .tc_type
+    lea rdi, [tl_s_t_copy]
+.tc_type:
+    call print_cstring
+    lea rsi, [r14 + J_STR]          ; A
+    mov rdi, rsi
+.tc_a_end:
+    cmp byte [rsi], 0
+    je .tc_a_done
+    inc rsi
+    jmp .tc_a_end
+.tc_a_done:
+    inc rsi                         ; rsi = B
+    cmp dword [r14 + J_TYPE], UT_COPY
+    je .tc_only_b
+    push rsi
+    sub rsp, 8
+    call print_cstring              ; A
+    add rsp, 8
+    pop rsi
+    cmp dword [r14 + J_TYPE], UT_DEL
+    je .tc_next
+    push rsi
+    sub rsp, 8
+    lea rdi, [tl_s_undo_arrow]
+    call print_cstring
+    add rsp, 8
+    pop rsi
+.tc_only_b:
+    mov rdi, rsi
+    call print_cstring
+.tc_next:
+    call print_newline
+    add ebx, [r14 + J_LEN]
+    jmp .tc_line
+.tc_done:
+    xor edi, edi
+    call tl_j_end
+    jmp .tc_ret
+
+.tc_none_unlock:
+    xor edi, edi
+    call tl_j_end
+.tc_nothing:
+    lea rdi, [tl_s_trash_none]
+    call print_cstring
+    jmp .tc_ret
+
+.tc_empty:
+    ; delete every file in the trash folder (also ones no record points at)
+    xor r12d, r12d                  ; files removed
+    lea rdi, [tl_base]
+    mov esi, O_RDONLY | O_DIRECTORY | O_CLOEXEC
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .tc_empty_done
+    mov ebx, eax
+.tc_getdents:
+    mov edi, ebx
+    lea rsi, [tl_dents]
+    mov edx, TL_DENTS
+    mov eax, SYS_GETDENTS64
+    syscall
+    test rax, rax
+    jle .tc_dents_end
+    mov r13, rax                    ; bytes in the buffer
+    xor r14d, r14d                  ; position
+.tc_entry:
+    cmp r14, r13
+    jae .tc_getdents
+    lea rsi, [tl_dents + r14]
+    movzx eax, word [rsi + DIRENT64_D_RECLEN]
+    add r14, rax
+    lea rsi, [rsi + DIRENT64_D_NAME]
+    cmp byte [rsi], '.'
+    je .tc_entry                    ; ".", ".." and our own .journal, .lock
+.tc_remove:
+    push rsi
+    sub rsp, 8
+    lea rdi, [tl_path_s]
+    lea rsi, [tl_base]
+    call upd_stpcpy
+    mov byte [rax], '/'
+    lea rdi, [rax + 1]
+    mov rsi, [rsp + 8]
+    call upd_stpcpy
+    lea rdi, [tl_path_s]
+    mov eax, SYS_UNLINK
+    syscall
+    add rsp, 16
+    test rax, rax
+    js .tc_entry
+    inc r12d
+    jmp .tc_entry
+.tc_dents_end:
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+.tc_empty_done:
+    mov dword [tl_jlen], 0
+    mov edi, 1
+    call tl_j_end
+    lea rdi, [tl_s_trash_emptied1]
+    call print_cstring
+    mov eax, r12d
+    call print_number
+    lea rdi, [tl_s_trash_emptied2]
+    call print_cstring
+    jmp .tc_ret
+
+.tc_usage:
+    lea rdi, [tl_s_trash_usage]
+    call print_cstring
+    mov dword [last_exit_status], 2
+.tc_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
     pop r12
     pop rbx
     pop rbp
@@ -882,9 +2593,18 @@ handler_undo:
 ; trace [-a] COMMAND
 ;   Runs COMMAND (through /bin/sh, children included) under ptrace and
 ;   prints, on stderr, each program it starts, file it opens, deletes,
-;   renames or creates, and each network connection it makes. Only calls
-;   that succeed are shown. Shared-library and /proc, /sys, /dev reads are
-;   hidden unless -a is given.
+;   renames, links or creates, and each network address it connects or
+;   sends to. Only calls that succeed are shown. Shared-library, /sys and
+;   routine /proc and /dev reads are hidden unless -a is given; the summary
+;   says how many were hidden.
+;
+;   The tracing is done by a helper process that is the parent of the
+;   command, so it waits only for the command's own processes and never
+;   touches the shell's background jobs. Names the command passes are
+;   printed with control bytes escaped, so they cannot forge lines or move
+;   the cursor. Only the x86-64 system call table is decoded: a command that
+;   uses the 32-bit or x32 entry points, or io_uring, is not fully visible,
+;   and trace prints a warning when it sees the former.
 ; ============================================================================
 
 %define TR_PTRACE_TRACEME       0
@@ -897,9 +2617,12 @@ handler_undo:
 %define TR_SYS_VM_READV         310
 %define TR_SIGSTOP              19
 %define TR_SIGTRAP              5
-%define TR_SLOTS                32
+%define TR_SLOTS                128
 %define TR_SLOT_SIZE            1040        ; pid, kind, line[1032]
-%define TR_LINE_MAX             1000
+%define TR_PATH_BUDGET          480         ; output bytes for one name
+%define TR_PATH_MAX             4096
+%define TR_NAMES_MAX            4000
+%define TR_AUDIT_X86_64         0xC000003E
 
 ; event kinds (also the counters' index)
 %define TK_EXEC                 1
@@ -910,12 +2633,14 @@ handler_undo:
 %define TK_MKDIR                6
 %define TK_NET                  7
 %define TK_LIST                 8
+%define TK_HIDDEN               9
 
 section .data
     tr_s_dash_a         db "-a", 0
     tr_s_trace          db "trace", 0
     tr_s_usage          db "Usage: trace [-a] COMMAND", 10, 0
     tr_s_noperm         db "trace: cannot trace (ptrace not permitted here)", 10, 0
+    tr_s_compat         db "trace: warning: the command uses 32-bit system calls, which are not shown", 10, 0
     tr_t_exec           db "  exec     ", 0
     tr_t_read           db "  read     ", 0
     tr_t_write          db "  write    ", 0
@@ -923,27 +2648,42 @@ section .data
     tr_t_rename         db "  rename   ", 0
     tr_t_mkdir          db "  mkdir    ", 0
     tr_t_net            db "  connect  ", 0
+    tr_t_send           db "  send     ", 0
     tr_t_list           db "  list     ", 0
+    tr_t_link           db "  link     ", 0
+    tr_t_symlink        db "  symlink  ", 0
     tr_s_arrow          db " -> ", 0
     tr_s_unix           db "unix:", 0
-    tr_s_colon          db ":", 0
-    tr_s_v6             db "[ipv6]", 0
+    tr_s_empty          db "(empty path)", 0
+    tr_s_proc           db "/proc/", 0
+    tr_s_cwd            db "/cwd", 0
     tr_s_sum1           db "trace: ", 0
     tr_s_sum_prog       db " programs, ", 0
     tr_s_sum_read       db " files read, ", 0
     tr_s_sum_write      db " written, ", 0
     tr_s_sum_del        db " deleted, ", 0
     tr_s_sum_net        db " network connections", 10, 0
-    tr_s_nl             db 10, 0
-    ; reads hidden by default
-    tr_hide_list        dq tr_h1, tr_h2, tr_h3, tr_h4, tr_h5, tr_h6, tr_h7, 0
-    tr_h1               db "/lib", 0
-    tr_h2               db "/usr/lib", 0
-    tr_h3               db "/etc/ld.so", 0
-    tr_h4               db "/proc/", 0
-    tr_h5               db "/sys/", 0
-    tr_h6               db "/dev/", 0
-    tr_h7               db "/usr/share/locale", 0
+    tr_s_hid1           db "trace: ", 0
+    tr_s_hid2           db " reads of libraries and system files hidden (use -a to show them)", 10, 0
+    tr_hexd             db "0123456789ABCDEF"
+    ; Reads hidden by default. A name matches when it equals an entry or
+    ; lies below it (the match ends at a "/"), after "." and "//" are
+    ; folded. Names with ".." and names the command could have reached
+    ; through a descriptor are never hidden. /proc and /dev are listed by
+    ; what is routine, so /proc/<pid>/environ, /proc/<pid>/mem and the
+    ; disk devices always show.
+    tr_hide_strs:
+        db "/lib", 0, "/lib64", 0, "/usr/lib", 0, "/usr/lib64", 0, "/usr/lib32", 0
+        db "/etc/ld.so.cache", 0, "/etc/ld.so.conf", 0, "/etc/ld.so.conf.d", 0
+        db "/usr/share/locale", 0, "/sys", 0
+        db "/dev/null", 0, "/dev/zero", 0, "/dev/urandom", 0, "/dev/random", 0
+        db "/dev/tty", 0, "/dev/pts", 0
+        db "/proc/self/fd", 0, "/proc/self/stat", 0, "/proc/self/status", 0
+        db "/proc/self/cgroup", 0, "/proc/self/mountinfo", 0
+        db "/proc/meminfo", 0, "/proc/cpuinfo", 0, "/proc/stat", 0
+        db "/proc/filesystems", 0, "/proc/sys", 0, "/proc/loadavg", 0
+        db "/proc/uptime", 0, "/proc/version", 0
+        db 0
 
 section .bss
     alignb 8
@@ -951,12 +2691,20 @@ section .bss
     tr_liov             resq 2
     tr_riov             resq 2
     tr_sockaddr         resb 112
+    tr_msghdr           resb 16
+    tr_how              resb 8
     tr_counts           resd 16
     tr_wstatus          resd 1
     tr_child            resd 1
     tr_child_status     resd 1
+    tr_dirfd            resd 1
     tr_all              resb 1
+    tr_compat           resb 1
+    tr_wrapper          resb 1          ; the /bin/sh wrapper's exec was seen
+    alignb 8
     tr_tmp              resb 512
+    tr_pathbuf          resb TR_PATH_MAX
+    tr_canon            resb TR_PATH_MAX
     tr_slots            resb TR_SLOTS * TR_SLOT_SIZE
 
 section .text
@@ -1003,21 +2751,78 @@ handler_trace:
     xor eax, eax
     mov ecx, TR_SLOTS * TR_SLOT_SIZE / 4
     rep stosd
+    mov byte [tr_compat], 0
+    mov byte [tr_wrapper], 0
     mov dword [tr_child_status], 1
 
     cmp byte [interactive_mode], 0
     je .tr_fork
     call restore_terminal
 .tr_fork:
+    ; A helper process does the tracing. It is the only parent of the
+    ; command, so wait4(-1) in it cannot see the shell's own children.
     mov eax, SYS_FORK
     syscall
     test rax, rax
-    js .tr_noperm
+    js .tr_fork_failed
+    jz .tr_helper
+    mov ebx, eax
+.tr_wait:
+    mov edi, ebx
+    lea rsi, [tr_wstatus]
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -EINTR
+    je .tr_wait
+    test rax, rax
+    js .tr_fork_failed
+    mov eax, [tr_wstatus]
+    mov edx, eax
+    and edx, 0x7F
+    jz .tr_exited
+    lea eax, [rdx + 128]
+    jmp .tr_status
+.tr_exited:
+    shr eax, 8
+    and eax, 0xFF
+.tr_status:
+    mov [last_exit_status], eax
+    jmp .tr_restore
+.tr_fork_failed:
+    mov dword [last_exit_status], 1
+.tr_restore:
+    cmp byte [interactive_mode], 0
+    je .tr_ret
+    call setup_raw_mode
+    jmp .tr_ret
+.tr_usage:
+    lea rdi, [tr_s_usage]
+    call print_cstring
+    mov dword [last_exit_status], 2
+.tr_ret:
+    mov byte [stats_valid], 0
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ---- helper: start the command under ptrace and follow it ----
+.tr_helper:
+    mov eax, SYS_FORK
+    syscall
+    test rax, rax
+    js .th_noperm
     jz .tr_child_proc
     mov [tr_child], eax
 
-    ; first stop (SIGSTOP the child sent itself)
-.tr_first:
+    ; first stop (SIGSTOP the command sent itself)
+.th_first:
     mov edi, [tr_child]
     lea rsi, [tr_wstatus]
     mov edx, TR_WALL
@@ -1025,13 +2830,13 @@ handler_trace:
     mov eax, SYS_WAIT4
     syscall
     cmp rax, -EINTR
-    je .tr_first
+    je .th_first
     test rax, rax
-    js .tr_done
+    js .th_done
     mov eax, [tr_wstatus]
     and eax, 0xFF
     cmp eax, 0x7F
-    jne .tr_child_gone              ; exited: ptrace refused
+    jne .th_noperm                  ; exited: ptrace refused
 
     mov eax, TR_SYS_PTRACE
     mov edi, TR_PTRACE_SETOPTIONS
@@ -1046,7 +2851,7 @@ handler_trace:
     xor r10d, r10d
     syscall
 
-.tr_loop:
+.th_loop:
     mov edi, -1
     lea rsi, [tr_wstatus]
     mov edx, TR_WALL
@@ -1054,67 +2859,71 @@ handler_trace:
     mov eax, SYS_WAIT4
     syscall
     cmp rax, -EINTR
-    je .tr_loop
+    je .th_loop
     test rax, rax
-    js .tr_done                     ; ECHILD: everything finished
+    js .th_done                     ; ECHILD: everything finished
     mov ebx, eax                    ; pid
     mov eax, [tr_wstatus]
     mov ecx, eax
     and ecx, 0xFF
     cmp ecx, 0x7F
-    je .tr_stopped
-    ; exited or killed
+    je .th_stopped
+    ; exited or killed: free the slot of a call that never returned
+    mov r13d, eax
+    mov edi, ebx
+    xor esi, esi
+    call tr_find_slot
+    test rax, rax
+    jz .th_gone
+    mov dword [rax], 0
+.th_gone:
+    mov eax, r13d
     cmp ebx, [tr_child]
-    jne .tr_loop
+    jne .th_loop
     mov ecx, eax
     and ecx, 0x7F
-    jz .tr_exit_code
+    jz .th_exit_code
     add ecx, 128
     mov [tr_child_status], ecx
-    jmp .tr_loop
-.tr_exit_code:
+    jmp .th_loop
+.th_exit_code:
     shr eax, 8
     and eax, 0xFF
     mov [tr_child_status], eax
-    jmp .tr_loop
+    jmp .th_loop
 
-.tr_stopped:
+.th_stopped:
     xor r13d, r13d                  ; signal to pass on
     mov ecx, eax
     shr ecx, 16
-    jnz .tr_resume                  ; fork/clone/exec event
+    jnz .th_resume                  ; fork/clone/exec event
     shr eax, 8
     and eax, 0xFF
     cmp eax, 0x85                   ; SIGTRAP | 0x80: syscall stop
-    jne .tr_signal
+    jne .th_signal
     mov edi, ebx
     call tr_syscall_stop
-    jmp .tr_resume
-.tr_signal:
+    jmp .th_resume
+.th_signal:
     cmp eax, TR_SIGSTOP
-    je .tr_resume
+    je .th_resume
     cmp eax, TR_SIGTRAP
-    je .tr_resume
+    je .th_resume
     mov r13d, eax
-.tr_resume:
+.th_resume:
     mov eax, TR_SYS_PTRACE
     mov edi, TR_PTRACE_SYSCALL
     mov esi, ebx
     xor edx, edx
     mov r10d, r13d
     syscall
-    jmp .tr_loop
+    jmp .th_loop
 
-.tr_child_gone:
-.tr_noperm:
+.th_noperm:
     lea rdi, [tr_s_noperm]
     call ash_write_err
     mov dword [tr_child_status], 1
-.tr_done:
-    cmp byte [interactive_mode], 0
-    je .tr_summary
-    call setup_raw_mode
-.tr_summary:
+.th_done:
     lea rdi, [tr_s_sum1]
     call ash_write_err
     mov eax, [tr_counts + TK_EXEC * 4]
@@ -1132,23 +2941,18 @@ handler_trace:
     mov eax, [tr_counts + TK_NET * 4]
     lea rsi, [tr_s_sum_net]
     call tr_write_count
-    mov eax, [tr_child_status]
-    mov [last_exit_status], eax
-    jmp .tr_ret
-.tr_usage:
-    lea rdi, [tr_s_usage]
-    call print_cstring
-    mov dword [last_exit_status], 2
-.tr_ret:
-    mov byte [stats_valid], 0
-    add rsp, 8
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
-    ret
+    mov eax, [tr_counts + TK_HIDDEN * 4]
+    test eax, eax
+    jz .th_exit
+    lea rdi, [tr_s_hid1]
+    call ash_write_err
+    mov eax, [tr_counts + TK_HIDDEN * 4]
+    lea rsi, [tr_s_hid2]
+    call tr_write_count
+.th_exit:
+    mov edi, [tr_child_status]
+    mov eax, SYS_EXIT
+    syscall
 
 .tr_child_proc:
     mov eax, TR_SYS_PTRACE
@@ -1221,6 +3025,21 @@ tr_find_slot:
 .fs_ret:
     ret
 
+; tr_peek(edi = pid, rsi = remote address, rdx = dst, ecx = length) -> rax = bytes read
+tr_peek:
+    mov [tr_liov], rdx
+    mov [tr_liov + 8], rcx
+    mov [tr_riov], rsi
+    mov [tr_riov + 8], rcx
+    lea rsi, [tr_liov]
+    mov edx, 1
+    lea r10, [tr_riov]
+    mov r8d, 1
+    xor r9d, r9d
+    mov eax, TR_SYS_VM_READV
+    syscall
+    ret
+
 ; tr_read_str(edi = pid, rsi = remote address, rdx = dst, ecx = max)
 ; -> eax = length (dst NUL-terminated)
 tr_read_str:
@@ -1285,6 +3104,371 @@ tr_read_str:
     pop rbx
     ret
 
+; tr_put_str(rdi = dst, rsi = NUL ended text, edx = most bytes to write)
+; -> rax = end of what was written (no NUL)
+; Control bytes, DEL, backslash and anything that is not well formed UTF-8
+; are written as \xNN, and so are the C1 controls, so text from the
+; traced program cannot start a new line or drive the terminal.
+tr_put_str:
+    push rbx
+    mov eax, edx
+    lea rbx, [rdi + rax]            ; end of the room
+    sub rbx, 4                      ; every item below needs at most 4 bytes
+.pt_loop:
+    movzx eax, byte [rsi]
+    test eax, eax
+    jz .pt_done
+    cmp rdi, rbx
+    ja .pt_done
+    cmp eax, '\'
+    je .pt_hex
+    cmp eax, 0x20
+    jb .pt_hex
+    cmp eax, 0x7F
+    je .pt_hex
+    jb .pt_plain
+    ; a byte of 0x80 or more: accept only a whole, shortest-form sequence
+    mov r9d, 0x80                   ; lowest allowed second byte
+    mov r10d, 0xBF                  ; highest allowed second byte
+    cmp eax, 0xC2
+    jb .pt_hex
+    cmp eax, 0xDF
+    jbe .pt_len2
+    cmp eax, 0xEF
+    jbe .pt_len3
+    cmp eax, 0xF4
+    ja .pt_hex
+    mov r8d, 4
+    cmp eax, 0xF0
+    jne .pt_f4
+    mov r9d, 0x90
+.pt_f4:
+    cmp eax, 0xF4
+    jne .pt_check
+    mov r10d, 0x8F
+    jmp .pt_check
+.pt_len2:
+    mov r8d, 2
+    cmp eax, 0xC2
+    jne .pt_check
+    ; U+0080 to U+009F are C1 controls: reject them
+    movzx ecx, byte [rsi + 1]
+    cmp ecx, 0xA0
+    jb .pt_hex
+    jmp .pt_check
+.pt_len3:
+    mov r8d, 3
+    cmp eax, 0xE0
+    jne .pt_ed
+    mov r9d, 0xA0
+.pt_ed:
+    cmp eax, 0xED
+    jne .pt_check
+    mov r10d, 0x9F
+.pt_check:
+    movzx ecx, byte [rsi + 1]
+    cmp ecx, r9d
+    jb .pt_hex
+    cmp ecx, r10d
+    ja .pt_hex
+    cmp r8d, 3
+    jb .pt_copy
+    movzx ecx, byte [rsi + 2]
+    sub ecx, 0x80
+    cmp ecx, 0x3F
+    ja .pt_hex
+    cmp r8d, 4
+    jb .pt_copy
+    movzx ecx, byte [rsi + 3]
+    sub ecx, 0x80
+    cmp ecx, 0x3F
+    ja .pt_hex
+.pt_copy:
+    mov ecx, r8d
+.pt_copy_loop:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .pt_copy_loop
+    jmp .pt_loop
+.pt_plain:
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .pt_loop
+.pt_hex:
+    mov byte [rdi], '\'
+    mov byte [rdi + 1], 'x'
+    mov ecx, eax
+    shr ecx, 4
+    movzx ecx, byte [tr_hexd + rcx]
+    mov [rdi + 2], cl
+    and eax, 15
+    movzx ecx, byte [tr_hexd + rax]
+    mov [rdi + 3], cl
+    add rdi, 4
+    inc rsi
+    jmp .pt_loop
+.pt_done:
+    mov rax, rdi
+    pop rbx
+    ret
+
+; tr_canon_path(rdi = dst, rsi = path, edx = dirfd, ecx = pid) -> eax 1 / 0
+; Writes the absolute path with "//" and "." folded. Returns 0 when the name
+; cannot be judged: it contains "..", it is relative to a descriptor, or the
+; working folder is unknown. A relative name is taken from /proc/<pid>/cwd.
+tr_canon_path:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                    ; dst
+    mov r13, rsi                    ; path
+    mov r14, rdi                    ; write position
+    mov ebx, ecx
+    cmp byte [rsi], 0
+    je .cp_fail
+    cmp byte [rsi], '/'
+    je .cp_start
+    cmp edx, AT_FDCWD
+    jne .cp_fail
+    lea rdi, [tr_tmp]
+    lea rsi, [tr_s_proc]
+    call upd_stpcpy
+    mov rdi, rax
+    mov esi, ebx
+    call ash_fmt_int
+    mov rdi, rax
+    lea rsi, [tr_s_cwd]
+    call upd_stpcpy
+    lea rdi, [tr_tmp]
+    mov rsi, r12
+    mov edx, TR_NAMES_MAX - 8
+    mov eax, SYS_READLINK
+    syscall
+    test rax, rax
+    jle .cp_fail
+    cmp byte [r12], '/'
+    jne .cp_fail
+    lea r14, [r12 + rax]
+    cmp rax, 1
+    jne .cp_start
+    mov r14, r12                    ; the root: nothing before the first "/name"
+.cp_start:
+    lea rbx, [r12 + TR_NAMES_MAX]   ; end of the room
+.cp_slashes:
+    cmp byte [r13], '/'
+    jne .cp_name
+    inc r13
+    jmp .cp_slashes
+.cp_name:
+    mov al, [r13]
+    test al, al
+    jz .cp_end
+    cmp al, '.'
+    jne .cp_copy
+    mov cl, [r13 + 1]
+    test cl, cl
+    jz .cp_dot
+    cmp cl, '/'
+    je .cp_dot
+    cmp cl, '.'
+    jne .cp_copy
+    mov cl, [r13 + 2]
+    test cl, cl
+    jz .cp_fail                     ; ".." ends the name: judging it needs the links
+    cmp cl, '/'
+    je .cp_fail
+    jmp .cp_copy
+.cp_dot:
+    inc r13
+    jmp .cp_slashes
+.cp_copy:
+    cmp r14, rbx
+    jae .cp_fail
+    mov byte [r14], '/'
+    inc r14
+.cp_chars:
+    mov al, [r13]
+    test al, al
+    jz .cp_end
+    cmp al, '/'
+    je .cp_slashes
+    cmp r14, rbx
+    jae .cp_fail
+    mov [r14], al
+    inc r14
+    inc r13
+    jmp .cp_chars
+.cp_end:
+    cmp r14, r12
+    jne .cp_term
+    mov byte [r14], '/'
+    inc r14
+.cp_term:
+    mov byte [r14], 0
+    mov eax, 1
+    jmp .cp_ret
+.cp_fail:
+    xor eax, eax
+.cp_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tr_is_hidden(rsi = canonical path) -> eax 1 if tr_hide_strs covers it
+tr_is_hidden:
+    lea r8, [tr_hide_strs]
+.ih_next:
+    cmp byte [r8], 0
+    je .ih_no
+    mov rdi, rsi
+    mov r9, r8
+.ih_cmp:
+    mov al, [r9]
+    test al, al
+    jz .ih_whole
+    cmp al, [rdi]
+    jne .ih_skip
+    inc r9
+    inc rdi
+    jmp .ih_cmp
+.ih_whole:
+    mov al, [rdi]                   ; the entry must end at a name boundary
+    test al, al
+    jz .ih_yes
+    cmp al, '/'
+    je .ih_yes
+.ih_skip:
+    cmp byte [r8], 0
+    je .ih_adv
+    inc r8
+    jmp .ih_skip
+.ih_adv:
+    inc r8
+    jmp .ih_next
+.ih_yes:
+    mov eax, 1
+    ret
+.ih_no:
+    xor eax, eax
+    ret
+
+; tr_fmt_sockaddr(rdi = dst, esi = bytes in tr_sockaddr) -> rax = end, 0 if the
+; address family is not one trace prints. dst receives an IPv4 or IPv6
+; address with the port, or "unix:" and the socket name.
+tr_fmt_sockaddr:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13d, esi
+    cmp esi, 2
+    jb .fa_none
+    movzx eax, word [tr_sockaddr]
+    cmp eax, 2
+    je .fa_inet
+    cmp eax, 10
+    je .fa_inet6
+    cmp eax, 1
+    jne .fa_none
+    ; unix: the name ends at the length given, or at a NUL
+    mov byte [tr_sockaddr + r13], 0
+    lea rsi, [tr_s_unix]
+    mov rdi, r12
+    call upd_stpcpy
+    mov rdi, rax
+    lea rsi, [tr_sockaddr + 2]
+    cmp byte [rsi], 0
+    jne .fa_unix_put
+    cmp r13d, 3
+    jb .fa_unix_end                 ; unnamed
+    mov byte [rdi], '@'             ; abstract name
+    inc rdi
+    inc rsi
+.fa_unix_put:
+    mov edx, 120
+    call tr_put_str
+.fa_unix_end:
+    jmp .fa_ret
+.fa_inet:
+    cmp r13d, 8
+    jb .fa_none
+    mov rdi, r12
+    xor ebx, ebx
+.fa_ip:
+    movzx esi, byte [tr_sockaddr + 4 + rbx]
+    call ash_fmt_int
+    mov rdi, rax
+    inc ebx
+    cmp ebx, 4
+    je .fa_port
+    mov byte [rdi], '.'
+    inc rdi
+    jmp .fa_ip
+.fa_inet6:
+    cmp r13d, 24
+    jb .fa_none
+    mov rdi, r12
+    mov byte [rdi], '['
+    inc rdi
+    xor ebx, ebx                    ; group 0..7
+.fa_group:
+    movzx eax, byte [tr_sockaddr + 8 + rbx * 2]
+    shl eax, 8
+    movzx ecx, byte [tr_sockaddr + 9 + rbx * 2]
+    or eax, ecx
+    mov r9d, eax
+    mov ecx, 12
+    xor r10d, r10d                  ; a non-zero digit was written
+.fa_digit:
+    mov eax, r9d
+    shr eax, cl
+    and eax, 15
+    test r10d, r10d
+    jnz .fa_wr
+    test eax, eax
+    jnz .fa_wr
+    test ecx, ecx
+    jnz .fa_next_digit              ; leading zero
+.fa_wr:
+    mov r10d, 1
+    movzx eax, byte [tr_hexd + rax]
+    mov [rdi], al
+    inc rdi
+.fa_next_digit:
+    sub ecx, 4
+    jns .fa_digit
+    inc ebx
+    cmp ebx, 8
+    je .fa_close
+    mov byte [rdi], ':'
+    inc rdi
+    jmp .fa_group
+.fa_close:
+    mov byte [rdi], ']'
+    inc rdi
+.fa_port:
+    mov byte [rdi], ':'
+    inc rdi
+    movzx esi, word [tr_sockaddr + 2]
+    rol si, 8                       ; network byte order
+    movzx esi, si
+    call ash_fmt_int
+    jmp .fa_ret
+.fa_none:
+    xor eax, eax
+.fa_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; tr_syscall_stop(edi = pid): on entry, build a line for interesting calls;
 ; on exit, print it if the call succeeded.
 tr_syscall_stop:
@@ -1312,40 +3496,78 @@ tr_syscall_stop:
     jne .ss_ret
 
     ; ---- entry ----
+    ; Only the x86-64 table is decoded; the 32-bit entry and the x32 numbers
+    ; mean other calls with the same numbers, so say so once and move on.
+    cmp dword [tr_info + 4], TR_AUDIT_X86_64
+    jne .ss_compat
     mov rax, [tr_info + 24]         ; syscall number
+    cmp rax, 0x40000000
+    jae .ss_compat
+    mov dword [tr_dirfd], AT_FDCWD
     mov r13, [tr_info + 32]         ; args[0]
     mov r14, [tr_info + 40]         ; args[1]
-    cmp rax, 59                     ; execve
+    cmp eax, 59                     ; execve
     je .ss_exec
-    cmp rax, 322                    ; execveat
-    je .ss_exec2
-    cmp rax, 2                      ; open
+    cmp eax, 322                    ; execveat
+    je .ss_execat
+    cmp eax, 2                      ; open
     je .ss_open
-    cmp rax, 257                    ; openat
+    cmp eax, 257                    ; openat
     je .ss_openat
-    cmp rax, 85                     ; creat
+    cmp eax, 437                    ; openat2
+    je .ss_openat2
+    cmp eax, 85                     ; creat
     je .ss_creat
-    cmp rax, 87                     ; unlink
+    cmp eax, 87                     ; unlink
     je .ss_unlink
-    cmp rax, 263                    ; unlinkat
+    cmp eax, 84                     ; rmdir
+    je .ss_unlink
+    cmp eax, 263                    ; unlinkat
     je .ss_unlinkat
-    cmp rax, 84                     ; rmdir
-    je .ss_unlink
-    cmp rax, 83                     ; mkdir
+    cmp eax, 83                     ; mkdir
     je .ss_mkdir
-    cmp rax, 258                    ; mkdirat
+    cmp eax, 258                    ; mkdirat
     je .ss_mkdirat
-    cmp rax, 82                     ; rename
+    cmp eax, 82                     ; rename
     je .ss_rename
-    cmp rax, 264                    ; renameat
+    cmp eax, 264                    ; renameat
     je .ss_renameat
-    cmp rax, 316                    ; renameat2
+    cmp eax, 316                    ; renameat2
     je .ss_renameat
-    cmp rax, 42                     ; connect
+    cmp eax, 86                     ; link
+    je .ss_link
+    cmp eax, 265                    ; linkat
+    je .ss_linkat
+    cmp eax, 88                     ; symlink
+    je .ss_symlink
+    cmp eax, 266                    ; symlinkat
+    je .ss_symlinkat
+    cmp eax, 76                     ; truncate
+    je .ss_truncate
+    cmp eax, 133                    ; mknod
+    je .ss_mknod
+    cmp eax, 259                    ; mknodat
+    je .ss_mknodat
+    cmp eax, 42                     ; connect
     je .ss_connect
+    cmp eax, 44                     ; sendto
+    je .ss_sendto
+    cmp eax, 46                     ; sendmsg
+    je .ss_sendmsg
+    cmp eax, 307                    ; sendmmsg
+    je .ss_sendmsg
     jmp .ss_ret
 
-.ss_exec2:
+.ss_compat:
+    cmp byte [tr_compat], 0
+    jne .ss_ret
+    mov byte [tr_compat], 1
+    lea rdi, [tr_s_compat]
+    call ash_write_err
+    jmp .ss_ret
+
+.ss_execat:
+    mov [tr_dirfd], r13d
     mov r13, r14
 .ss_exec:
     mov ebx, TK_EXEC
@@ -1355,10 +3577,36 @@ tr_syscall_stop:
     mov ebx, TK_WRITE
     lea rsi, [tr_t_write]
     jmp .ss_path
+.ss_truncate:
+.ss_mknod:
+    mov ebx, TK_WRITE
+    lea rsi, [tr_t_write]
+    jmp .ss_path
+.ss_mknodat:
+    mov [tr_dirfd], r13d
+    mov r13, r14
+    mov ebx, TK_WRITE
+    lea rsi, [tr_t_write]
+    jmp .ss_path
 .ss_open:
     mov rcx, r14                    ; flags
     jmp .ss_open_kind
+.ss_openat2:
+    mov [tr_dirfd], r13d
+    mov r13, r14
+    ; the flags are the first field of struct open_how
+    mov edi, r12d
+    mov rsi, [tr_info + 48]
+    lea rdx, [tr_how]
+    mov ecx, 8
+    call tr_peek
+    xor ecx, ecx
+    cmp rax, 8
+    jne .ss_open_kind
+    mov rcx, [tr_how]
+    jmp .ss_open_kind
 .ss_openat:
+    mov [tr_dirfd], r13d
     mov rcx, [tr_info + 48]         ; flags
     mov r13, r14
 .ss_open_kind:
@@ -1375,23 +3623,50 @@ tr_syscall_stop:
     lea rsi, [tr_t_write]
     jmp .ss_path
 .ss_unlinkat:
+    mov [tr_dirfd], r13d
     mov r13, r14
 .ss_unlink:
     mov ebx, TK_DELETE
     lea rsi, [tr_t_delete]
     jmp .ss_path
 .ss_mkdirat:
+    mov [tr_dirfd], r13d
     mov r13, r14
 .ss_mkdir:
     mov ebx, TK_MKDIR
     lea rsi, [tr_t_mkdir]
     jmp .ss_path
+
+    ; two names: r13 = first, r14 = second
 .ss_renameat:
     mov r13, r14                    ; old = args[1], new = args[3]
     mov r14, [tr_info + 56]
+    mov ebx, TK_RENAME
+    lea rsi, [tr_t_rename]
+    jmp .ss_pair
 .ss_rename:
     mov ebx, TK_RENAME
     lea rsi, [tr_t_rename]
+    jmp .ss_pair
+.ss_linkat:
+    mov r13, r14                    ; old = args[1], new = args[3]
+    mov r14, [tr_info + 56]
+.ss_link:
+    mov ebx, TK_WRITE
+    lea rsi, [tr_t_link]
+    jmp .ss_pair
+.ss_symlinkat:
+    mov r14, [tr_info + 48]         ; link name = args[2]
+    jmp .ss_symlink_order
+.ss_symlink:
+    ; shown as "link name -> target", the way ls -l prints it
+.ss_symlink_order:
+    mov rax, r13
+    mov r13, r14
+    mov r14, rax
+    mov ebx, TK_WRITE
+    lea rsi, [tr_t_symlink]
+.ss_pair:
     call .ss_begin
     test rax, rax
     jz .ss_ret
@@ -1412,81 +3687,85 @@ tr_syscall_stop:
     mov rdi, rax
     call .ss_add_path
     cmp ebx, TK_READ
+    je .ss_hide
+    cmp ebx, TK_LIST
     jne .ss_ret
+.ss_hide:
     cmp byte [tr_all], 0
     jne .ss_ret
-    call .ss_hidden
+    lea rdi, [tr_canon]
+    lea rsi, [tr_pathbuf]
+    mov edx, [tr_dirfd]
+    mov ecx, r12d
+    call tr_canon_path
+    test eax, eax
+    jz .ss_ret
+    lea rsi, [tr_canon]
+    call tr_is_hidden
+    test eax, eax
+    jz .ss_ret
+    mov dword [r15 + 4], 0          ; keep the slot, print nothing
+    inc dword [tr_counts + TK_HIDDEN * 4]
     jmp .ss_ret
 
+    ; network: r13 = address, r14 = its length
 .ss_connect:
-    ; read the sockaddr
-    mov edi, r12d
-    lea rax, [tr_sockaddr]
-    mov [tr_liov], rax
-    mov qword [tr_liov + 8], 28
-    mov [tr_riov], r14
-    mov qword [tr_riov + 8], 28
-    lea rsi, [tr_liov]
-    mov edx, 1
-    lea r10, [tr_riov]
-    mov r8d, 1
-    xor r9d, r9d
-    mov eax, TR_SYS_VM_READV
-    syscall
-    test rax, rax
-    jle .ss_ret
-    mov ebx, TK_NET
+    mov r13, r14                    ; args[1]
+    mov r14, [tr_info + 48]         ; args[2]
     lea rsi, [tr_t_net]
+    jmp .ss_net
+.ss_sendto:
+    mov r13, [tr_info + 64]         ; args[4]
+    mov r14, [tr_info + 72]         ; args[5]
+    lea rsi, [tr_t_send]
+    jmp .ss_net
+.ss_sendmsg:
+    ; msghdr starts with msg_name (pointer) and msg_namelen; for sendmmsg the
+    ; first message is looked at
+    mov edi, r12d
+    mov rsi, r14
+    lea rdx, [tr_msghdr]
+    mov ecx, 16
+    call tr_peek
+    cmp rax, 16
+    jne .ss_ret
+    mov r13, [tr_msghdr]
+    mov r14d, [tr_msghdr + 8]
+    lea rsi, [tr_t_send]
+.ss_net:
+    test r13, r13
+    jz .ss_ret
+    cmp r14, 2
+    jb .ss_ret
+    cmp r14, 110
+    jbe .ss_net_len
+    mov r14d, 110
+.ss_net_len:
+    mov edi, r12d
+    push rsi
+    sub rsp, 8
+    mov rsi, r13
+    lea rdx, [tr_sockaddr]
+    mov ecx, r14d
+    call tr_peek
+    add rsp, 8
+    pop rsi
+    cmp rax, 2
+    jl .ss_ret
+    mov r14d, eax
+    mov ebx, TK_NET
     call .ss_begin
     test rax, rax
     jz .ss_ret
     mov rdi, rax
-    movzx eax, word [tr_sockaddr]
-    cmp eax, 2
-    je .ss_inet
-    cmp eax, 10
-    je .ss_inet6
-    cmp eax, 1
-    jne .ss_drop                    ; other families: skip
-    lea rsi, [tr_s_unix]
-    call upd_stpcpy
-    lea rsi, [tr_sockaddr + 2]
-    mov byte [tr_sockaddr + 27], 0
-    call upd_stpcpy
+    mov esi, r14d
+    call tr_fmt_sockaddr
+    test rax, rax
+    jz .ss_net_drop
+    mov byte [rax], 0
     jmp .ss_ret
-.ss_inet6:
-    lea rsi, [tr_s_v6]
-    call upd_stpcpy
-    jmp .ss_port
-.ss_inet:
-    mov rax, rdi                    ; write pointer
-    xor ecx, ecx
-.ss_ip:
-    push rcx
-    push rcx
-    movzx esi, byte [tr_sockaddr + 4 + rcx]
-    mov rdi, rax
-    call ash_fmt_int
-    pop rcx
-    pop rcx
-    cmp ecx, 3
-    je .ss_port
-    mov byte [rax], '.'
-    inc rax
-    inc ecx
-    jmp .ss_ip
-.ss_port:
-    mov rdi, rax
-    lea rsi, [tr_s_colon]
-    call upd_stpcpy
-    mov rdi, rax
-    movzx esi, word [tr_sockaddr + 2]
-    rol si, 8                       ; network byte order
-    movzx esi, si
-    call ash_fmt_int
-    jmp .ss_ret
-.ss_drop:
-    mov dword [r15], 0              ; forget the slot (r15 = slot)
+.ss_net_drop:
+    mov dword [r15], 0              ; not an address family we print: forget it
     jmp .ss_ret
 
     ; ---- exit ----
@@ -1507,6 +3786,16 @@ tr_syscall_stop:
     test rax, rax
     js .ss_ret
 .ss_ok:
+    ; the first program the command starts is the /bin/sh wrapper
+    cmp ecx, TK_EXEC
+    jne .ss_count
+    cmp byte [tr_wrapper], 0
+    jne .ss_count
+    cmp r12d, [tr_child]
+    jne .ss_count
+    mov byte [tr_wrapper], 1
+    jmp .ss_ret
+.ss_count:
     cmp ecx, TK_LIST
     je .ss_print
     lea rax, [tr_counts]
@@ -1545,58 +3834,42 @@ tr_syscall_stop:
 .sb_ret:
     ret
 
-; local: append the tracee string at r13 to rdi -> rax = end
+; local: append the tracee string at r13 to rdi (escaped) -> rax = end.
+; The raw name stays in tr_pathbuf for the hide check.
 .ss_add_path:
     push rdi
-    mov rdx, rdi
     mov edi, r12d
     mov rsi, r13
-    lea rcx, [r15 + 8]
-    add rcx, TR_LINE_MAX / 2
-    sub rcx, rdx                    ; room left (keeps the line bounded)
-    cmp ecx, 16
-    jge .ap_room
-    mov ecx, 16
-.ap_room:
+    lea rdx, [tr_pathbuf]
+    mov ecx, TR_PATH_MAX
     call tr_read_str
+    mov r8d, eax
     pop rdi
-    add rax, rdi
-    ret
-
-; local: drop the pending read if its path is on the hide list
-.ss_hidden:
-    lea r8, [tr_hide_list]
-.sh_next:
-    mov rsi, [r8]
-    test rsi, rsi
-    jz .sh_ret
-    lea rdi, [r15 + 8 + 11]         ; path after the tag
-.sh_cmp:
-    mov al, [rsi]
-    test al, al
-    jz .sh_hit
-    cmp al, [rdi]
-    jne .sh_miss
-    inc rsi
-    inc rdi
-    jmp .sh_cmp
-.sh_hit:
-    mov dword [r15 + 4], 0          ; keep the slot, print nothing
-    ret
-.sh_miss:
-    add r8, 8
-    jmp .sh_next
-.sh_ret:
+    lea rsi, [tr_pathbuf]
+    test r8d, r8d
+    jnz .ap_put
+    lea rsi, [tr_s_empty]
+.ap_put:
+    mov edx, TR_PATH_BUDGET
+    sub rsp, 8
+    call tr_put_str
+    add rsp, 8
+    mov byte [rax], 0
     ret
 
 ; ============================================================================
-; sandbox [-w] [-n] COMMAND
+; sandbox [-w] [-n] [-b] [--] COMMAND
 ;   Runs COMMAND (through /bin/sh) with:
-;     - no network: socket(AF_INET/AF_INET6) fails with EPERM (seccomp);
-;       -n keeps the network
-;     - no file changes outside /tmp (Landlock); -w also allows the
-;       current folder. Reading and running programs stay allowed.
-;   The shell itself is not restricted, only the command.
+;     - no sockets (seccomp); -n allows IPv4 and IPv6 sockets only. io_uring
+;       is refused because it can open sockets behind the filter's back
+;     - file changes only in /tmp (Landlock), plus the current folder with -w,
+;       plus /dev/null, /dev/zero and /dev/tty. Reading and running programs
+;       stay allowed
+;     - no chmod, chown, extended attributes, truncate(2) or explicit
+;       timestamps (Landlock does not cover them), no ptrace, mount,
+;       namespace or module calls, and no terminal input injection (TIOCSTI)
+;   The shell itself is not restricted, only the command. When Landlock or
+;   seccomp cannot be installed the command is not run, unless -b is given.
 ; ============================================================================
 
 %define SB_SYS_PRCTL            157
@@ -1607,70 +3880,207 @@ tr_syscall_stop:
 %define SB_PR_NO_NEW_PRIVS      38
 %define SB_O_PATH               0x200000
 %define SB_FS_WRITE             0x1FF2      ; Landlock ABI 1 write/create/remove rights
-%define SB_FS_WRITE_FILE        2
+%define SB_FS_WRITE_FILE        0x0002
+%define SB_FS_REFER             0x2000      ; ABI 2
+%define SB_FS_TRUNCATE          0x4000      ; ABI 3
+%define SB_FS_IOCTL_DEV         0x8000      ; ABI 5
+%define SB_SCOPE_ALL            3           ; ABI 6: abstract unix sockets and signals
+%define SB_OPT_W                1
+%define SB_OPT_N                2
+%define SB_OPT_B                4
+
+%define SB_RET_ALLOW            0x7FFF0000
+%define SB_RET_EPERM            0x00050001
+%define SB_RET_ENOSYS           0x00050026
+
+; BPF helpers. A jump to a label is relative to the next instruction, in
+; units of 8 bytes; each macro emits exactly one instruction.
+%macro BPF_LD 1                         ; A = seccomp_data word at offset %1
+    dw 0x20
+    db 0, 0
+    dd %1
+%endmacro
+%macro BPF_IF_EQ 2                      ; if A == %1 goto %2
+    dw 0x15
+    db ((%2) - ($ + 6)) / 8, 0
+    dd %1
+%endmacro
+%macro BPF_IF_NE 2                      ; if A != %1 goto %2
+    dw 0x15
+    db 0, ((%2) - ($ + 6)) / 8
+    dd %1
+%endmacro
+%macro BPF_IF_GE 2                      ; if A >= %1 goto %2
+    dw 0x35
+    db ((%2) - ($ + 6)) / 8, 0
+    dd %1
+%endmacro
+%macro BPF_IF_SET 2                     ; if A & %1 goto %2
+    dw 0x45
+    db ((%2) - ($ + 6)) / 8, 0
+    dd %1
+%endmacro
+%macro BPF_RET 1
+    dw 0x06
+    db 0, 0
+    dd %1
+%endmacro
+
+; The filter, built twice: %1 = 1 keeps IPv4/IPv6 sockets (-n).
+; A process of another architecture, or the x32 ABI, gets EPERM for every call.
+%macro SB_FILTER 1
+    BPF_LD 4                            ; arch
+    BPF_IF_NE 0xC000003E, %%deny
+    BPF_LD 0                            ; nr
+    BPF_IF_GE 0x40000000, %%deny
+    BPF_IF_EQ 41, %%socket
+    BPF_IF_EQ 16, %%ioctl
+    BPF_IF_EQ 56, %%clone
+    BPF_IF_EQ 435, %%nosys              ; clone3: libc falls back to clone
+    BPF_IF_EQ 280, %%utimensat
+    ; ptrace and cross-process memory access
+    BPF_IF_EQ 101, %%deny               ; ptrace
+    BPF_IF_EQ 310, %%deny               ; process_vm_readv
+    BPF_IF_EQ 311, %%deny               ; process_vm_writev
+    BPF_IF_EQ 312, %%deny               ; kcmp
+    BPF_IF_EQ 438, %%deny               ; pidfd_getfd
+    ; io_uring can create sockets and bypass the socket() rule
+    BPF_IF_EQ 425, %%deny
+    BPF_IF_EQ 426, %%deny
+    BPF_IF_EQ 427, %%deny
+    ; metadata changes Landlock does not mediate
+    BPF_IF_EQ 76, %%deny                ; truncate
+    BPF_IF_EQ 90, %%deny                ; chmod
+    BPF_IF_EQ 91, %%deny                ; fchmod
+    BPF_IF_EQ 92, %%deny                ; chown
+    BPF_IF_EQ 93, %%deny                ; fchown
+    BPF_IF_EQ 94, %%deny                ; lchown
+    BPF_IF_EQ 132, %%deny               ; utime
+    BPF_IF_EQ 235, %%deny               ; utimes
+    BPF_IF_EQ 260, %%deny               ; fchownat
+    BPF_IF_EQ 261, %%deny               ; futimesat
+    BPF_IF_EQ 268, %%deny               ; fchmodat
+    BPF_IF_EQ 452, %%deny               ; fchmodat2
+    BPF_IF_EQ 188, %%deny               ; setxattr
+    BPF_IF_EQ 189, %%deny               ; lsetxattr
+    BPF_IF_EQ 190, %%deny               ; fsetxattr
+    BPF_IF_EQ 197, %%deny               ; removexattr
+    BPF_IF_EQ 198, %%deny               ; lremovexattr
+    BPF_IF_EQ 199, %%deny               ; fremovexattr
+    BPF_IF_EQ 463, %%deny               ; setxattrat
+    BPF_IF_EQ 466, %%deny               ; removexattrat
+    ; mounts, namespaces, root changes
+    BPF_IF_EQ 165, %%deny               ; mount
+    BPF_IF_EQ 166, %%deny               ; umount2
+    BPF_IF_EQ 155, %%deny               ; pivot_root
+    BPF_IF_EQ 161, %%deny               ; chroot
+    BPF_IF_EQ 272, %%deny               ; unshare
+    BPF_IF_EQ 308, %%deny               ; setns
+    BPF_IF_EQ 428, %%deny               ; open_tree
+    BPF_IF_EQ 429, %%deny               ; move_mount
+    BPF_IF_EQ 430, %%deny               ; fsopen
+    BPF_IF_EQ 431, %%deny               ; fsconfig
+    BPF_IF_EQ 432, %%deny               ; fsmount
+    BPF_IF_EQ 433, %%deny               ; fspick
+    BPF_IF_EQ 442, %%deny               ; mount_setattr
+    BPF_IF_EQ 467, %%deny               ; open_tree_attr
+    ; machine-wide calls
+    BPF_IF_EQ 167, %%deny               ; swapon
+    BPF_IF_EQ 168, %%deny               ; swapoff
+    BPF_IF_EQ 169, %%deny               ; reboot
+    BPF_IF_EQ 175, %%deny               ; init_module
+    BPF_IF_EQ 176, %%deny               ; delete_module
+    BPF_IF_EQ 246, %%deny               ; kexec_load
+    BPF_IF_EQ 313, %%deny               ; finit_module
+    BPF_IF_EQ 320, %%deny               ; kexec_file_load
+    BPF_RET SB_RET_ALLOW
+%%socket:
+%if %1
+    BPF_LD 16                           ; domain
+    BPF_IF_EQ 2, %%sock_ok              ; AF_INET
+    BPF_IF_EQ 10, %%sock_ok             ; AF_INET6
+%endif
+    BPF_RET SB_RET_EPERM
+%if %1
+%%sock_ok:
+    BPF_RET SB_RET_ALLOW
+%endif
+%%ioctl:
+    BPF_LD 24                           ; request (the kernel reads 32 bits)
+    BPF_IF_EQ 0x5412, %%deny            ; TIOCSTI
+    BPF_IF_EQ 0x541C, %%deny            ; TIOCLINUX
+    BPF_IF_EQ 0x541D, %%deny            ; TIOCCONS
+    BPF_IF_EQ 0x5423, %%deny            ; TIOCSETD
+    BPF_RET SB_RET_ALLOW
+%%clone:
+    BPF_LD 16                           ; flags: no new namespaces
+    BPF_IF_SET 0x7E020000, %%deny
+    BPF_RET SB_RET_ALLOW
+%%utimensat:
+    BPF_LD 32                           ; times == NULL: "set to now" is allowed
+    BPF_IF_NE 0, %%deny
+    BPF_LD 36
+    BPF_IF_NE 0, %%deny
+    BPF_RET SB_RET_ALLOW
+%%nosys:
+    BPF_RET SB_RET_ENOSYS
+%%deny:
+    BPF_RET SB_RET_EPERM
+%endmacro
 
 section .data
     sb_s_dash_w         db "-w", 0
     sb_s_sandbox        db "sandbox", 0
-    sb_s_dash_n         db "-n", 0
     sb_s_tmp            db "/tmp", 0
-    sb_s_dev            db "/dev", 0
+    sb_s_dev_null       db "/dev/null", 0
+    sb_s_dev_zero       db "/dev/zero", 0
+    sb_s_dev_tty        db "/dev/tty", 0
     sb_s_dot            db ".", 0
-    sb_s_usage          db "Usage: sandbox [-w] [-n] COMMAND", 10
-                        db "  default: no network, file changes only in /tmp", 10
-                        db "  -w  also allow changes in the current folder", 10
-                        db "  -n  keep network access", 10, 0
-    sb_s_no_landlock    db "sandbox: Landlock is not available; file changes are NOT restricted", 10, 0
-    sb_s_no_seccomp     db "sandbox: could not block the network", 10, 0
+    sb_s_usage          db "Usage: sandbox [-w] [-n] [-b] [--] COMMAND", 10
+                        db "  Runs COMMAND with these limits:", 10
+                        db "    - no sockets at all; -n allows IPv4 and IPv6 ones; no io_uring", 10
+                        db "    - files can only be created, changed or removed in /tmp (-w: and", 10
+                        db "      in the current folder), plus /dev/null, /dev/zero and /dev/tty", 10
+                        db "    - no chmod, chown, xattr, truncate(2) or explicit file times", 10
+                        db "    - no ptrace, mount, namespace, module or reboot calls", 10
+                        db "    - cannot type into the terminal (TIOCSTI)", 10
+                        db "  -b  run anyway if Landlock or seccomp is not available (weaker)", 10
+                        db "  Not blocked: reading any file, running any program, CPU and", 10
+                        db "  memory use, setting a file's time to now, and signals to other", 10
+                        db "  processes of yours (Landlock ABI 6+, Linux 6.12+, blocks those).", 10
+                        db "  A program you start with it can still do whatever /tmp allows.", 10, 0
+    sb_s_bad_opt        db "sandbox: unknown option", 10, 0
+    sb_s_no_landlock    db "sandbox: file changes cannot be restricted (Landlock is not available)", 10, 0
+    sb_s_no_seccomp     db "sandbox: system calls cannot be restricted (seccomp failed)", 10, 0
+    sb_s_no_nnp         db "sandbox: cannot set no_new_privs", 10, 0
+    sb_s_refused        db "sandbox: nothing was run; -b runs it with the restrictions that work", 10, 0
+    sb_s_wide           db "sandbox: warning: -w in / or in your home folder allows changes to everything below it", 10, 0
+    sb_s_home           db "HOME", 0
 
-    ; seccomp filter: socket(AF_INET|AF_INET6, ...) -> EPERM, x32 calls -> EPERM
+    ; Landlock handles an operation only when the ruleset names it, so the
+    ; filter below covers what Landlock cannot. socket() and ioctl() compare
+    ; the low 32 bits, like the kernel does.
     align 8
-    sb_filter:
-        dw 0x20
-        db 0, 0
-        dd 4                        ; ld arch
-        dw 0x15
-        db 1, 0
-        dd 0xC000003E               ; jeq x86_64
-        dw 0x06
-        db 0, 0
-        dd 0x80000000               ; ret KILL_PROCESS (other arch)
-        dw 0x20
-        db 0, 0
-        dd 0                        ; ld nr
-        dw 0x35
-        db 5, 0
-        dd 0x40000000               ; jge x32 -> EPERM
-        dw 0x15
-        db 0, 3
-        dd 41                       ; jeq socket
-        dw 0x20
-        db 0, 0
-        dd 16                       ; ld args[0] (low half)
-        dw 0x15
-        db 2, 0
-        dd 2                        ; AF_INET -> EPERM
-        dw 0x15
-        db 1, 0
-        dd 10                       ; AF_INET6 -> EPERM
-        dw 0x06
-        db 0, 0
-        dd 0x7FFF0000               ; ret ALLOW
-        dw 0x06
-        db 0, 0
-        dd 0x00050001               ; ret ERRNO(EPERM)
-    sb_filter_len equ ($ - sb_filter) / 8
-    sb_prog:
-        dw sb_filter_len
+    sb_filter_off:      SB_FILTER 0
+    sb_filter_off_len   equ ($ - sb_filter_off) / 8
+    sb_filter_net:      SB_FILTER 1
+    sb_filter_net_len   equ ($ - sb_filter_net) / 8
+    align 8
+    sb_prog_off:
+        dw sb_filter_off_len
         dw 0, 0, 0
-        dq sb_filter
+        dq sb_filter_off
+    sb_prog_net:
+        dw sb_filter_net_len
+        dw 0, 0, 0
+        dq sb_filter_net
 
 section .bss
     alignb 8
-    sb_ruleset_attr     resq 1
+    sb_ruleset_attr     resq 3          ; handled_access_fs, handled_access_net, scoped
     sb_rule             resb 16         ; u64 allowed_access, s32 parent_fd (packed)
     sb_wstatus          resd 1
-    sb_flags            resb 1          ; bit0 = -w, bit1 = -n
+    sb_flags            resb 1          ; SB_OPT_*
 
 section .text
 
@@ -1684,25 +4094,59 @@ handler_sandbox:
     jz .sb_usage
     mov r12, rdi
 .sb_opts:
-    mov rdi, r12
-    lea rsi, [sb_s_dash_w]
-    call ash_word_is
+    cmp byte [r12], '-'
+    jne .sb_cmd
+    movzx eax, byte [r12 + 1]
     test eax, eax
-    jz .sb_opt_n
-    or byte [sb_flags], 1
-    jmp .sb_opt_next
-.sb_opt_n:
-    mov rdi, r12
-    lea rsi, [sb_s_dash_n]
-    call ash_word_is
+    jz .sb_cmd                      ; a lone "-" is the command
+    cmp eax, ' '
+    je .sb_cmd
+    cmp eax, '-'
+    jne .sb_letters
+    movzx eax, byte [r12 + 2]       ; "--" ends the options
     test eax, eax
-    jz .sb_cmd
-    or byte [sb_flags], 2
-.sb_opt_next:
+    jz .sb_dashdash
+    cmp eax, ' '
+    je .sb_dashdash
+    cmp eax, 9
+    jne .sb_bad
+.sb_dashdash:
     lea rdi, [r12 + 2]
     call ash_skip_blanks
     mov r12, rax
+    jmp .sb_cmd
+.sb_letters:
+    lea rsi, [r12 + 1]
+.sb_letter:
+    movzx eax, byte [rsi]
+    test eax, eax
+    jz .sb_letters_end
+    cmp eax, ' '
+    je .sb_letters_end
+    cmp eax, 9
+    je .sb_letters_end
+    mov ecx, SB_OPT_W
+    cmp eax, 'w'
+    je .sb_set
+    mov ecx, SB_OPT_N
+    cmp eax, 'n'
+    je .sb_set
+    mov ecx, SB_OPT_B
+    cmp eax, 'b'
+    jne .sb_bad
+.sb_set:
+    or [sb_flags], cl
+    inc rsi
+    jmp .sb_letter
+.sb_letters_end:
+    mov rdi, rsi
+    call ash_skip_blanks
+    mov r12, rax
     jmp .sb_opts
+.sb_bad:
+    lea rdi, [sb_s_bad_opt]
+    call ash_write_err
+    jmp .sb_usage
 .sb_cmd:
     cmp byte [r12], 0
     je .sb_usage
@@ -1714,6 +4158,10 @@ handler_sandbox:
     mov rsi, r12
     call str_copy
 
+    test byte [sb_flags], SB_OPT_W
+    jz .sb_go
+    call sb_warn_wide
+.sb_go:
     cmp byte [interactive_mode], 0
     je .sb_fork
     call restore_terminal
@@ -1733,6 +4181,8 @@ handler_sandbox:
     syscall
     cmp rax, -EINTR
     je .sb_wait
+    test rax, rax
+    js .sb_fail                     ; no status to read
     mov eax, [sb_wstatus]
     mov edx, eax
     and edx, 0x7F
@@ -1771,27 +4221,69 @@ handler_sandbox:
     xor r10d, r10d
     xor r8d, r8d
     syscall
+    test rax, rax
+    jns .sbc_landlock
+    lea rdi, [sb_s_no_nnp]
+    call ash_write_err
+    jmp .sbc_refuse
 
-    ; Landlock: handle all write rights, then allow them under /tmp (+ cwd)
-    mov qword [sb_ruleset_attr], SB_FS_WRITE
-    lea rdi, [sb_ruleset_attr]
+.sbc_landlock:
+    ; Landlock ABI version decides which rights can be handled
+    xor edi, edi
+    xor esi, esi
+    mov edx, 1                      ; LANDLOCK_CREATE_RULESET_VERSION
+    mov eax, SB_SYS_LL_CREATE
+    syscall
+    test rax, rax
+    jle .sbc_no_ll
+    mov r13d, eax                   ; ABI
+    mov ebx, SB_FS_WRITE
+    cmp r13d, 2
+    jb .sbc_rights
+    or ebx, SB_FS_REFER
+    cmp r13d, 3
+    jb .sbc_rights
+    or ebx, SB_FS_TRUNCATE
+    cmp r13d, 5
+    jb .sbc_rights
+    or ebx, SB_FS_IOCTL_DEV
+.sbc_rights:
+    mov [sb_ruleset_attr], rbx
+    mov qword [sb_ruleset_attr + 8], 0
+    mov qword [sb_ruleset_attr + 16], 0
     mov esi, 8
+    cmp r13d, 6
+    jb .sbc_create
+    mov qword [sb_ruleset_attr + 16], SB_SCOPE_ALL
+    mov esi, 24
+.sbc_create:
+    lea rdi, [sb_ruleset_attr]
     xor edx, edx
     mov eax, SB_SYS_LL_CREATE
     syscall
     test rax, rax
     js .sbc_no_ll
     mov r12d, eax                   ; ruleset fd
+    mov r14, rbx
+    and r14d, ~SB_FS_IOCTL_DEV      ; folders: everything except device ioctls
+    mov r15, rbx
+    and r15d, SB_FS_WRITE_FILE | SB_FS_TRUNCATE | SB_FS_IOCTL_DEV
     lea rdi, [sb_s_tmp]
-    mov esi, SB_FS_WRITE
+    mov rbx, r14
     call .sbc_allow
-    lea rdi, [sb_s_dev]             ; /dev/null, /dev/tty
-    mov esi, SB_FS_WRITE_FILE
+    lea rdi, [sb_s_dev_null]
+    mov rbx, r15
     call .sbc_allow
-    test byte [sb_flags], 1
+    lea rdi, [sb_s_dev_zero]
+    mov rbx, r15
+    call .sbc_allow
+    lea rdi, [sb_s_dev_tty]
+    mov rbx, r15
+    call .sbc_allow
+    test byte [sb_flags], SB_OPT_W
     jz .sbc_restrict
     lea rdi, [sb_s_dot]
-    mov esi, SB_FS_WRITE
+    mov rbx, r14
     call .sbc_allow
 .sbc_restrict:
     mov edi, r12d
@@ -1799,35 +4291,44 @@ handler_sandbox:
     mov eax, SB_SYS_LL_RESTRICT
     syscall
     test rax, rax
-    jns .sbc_net
+    jns .sbc_seccomp
 .sbc_no_ll:
     lea rdi, [sb_s_no_landlock]
     call ash_write_err
-.sbc_net:
-    test byte [sb_flags], 2
-    jnz .sbc_exec
+    test byte [sb_flags], SB_OPT_B
+    jz .sbc_refuse
+
+.sbc_seccomp:
+    lea rdx, [sb_prog_off]
+    test byte [sb_flags], SB_OPT_N
+    jz .sbc_install
+    lea rdx, [sb_prog_net]
+.sbc_install:
     mov eax, SB_SYS_SECCOMP
     mov edi, 1                      ; SECCOMP_SET_MODE_FILTER
     xor esi, esi
-    lea rdx, [sb_prog]
     syscall
     test rax, rax
     jns .sbc_exec
     lea rdi, [sb_s_no_seccomp]
     call ash_write_err
-    mov edi, 126                    ; refuse to run unrestricted
-    mov eax, SYS_EXIT
-    syscall
+    test byte [sb_flags], SB_OPT_B
+    jz .sbc_refuse
 .sbc_exec:
     lea rdi, [ash_shc_argv]
     lea rax, [tl_cmd_buf]
     mov [rdi + 16], rax
     call ash_exec_argv              ; does not return
+.sbc_refuse:
+    lea rdi, [sb_s_refused]
+    call ash_write_err
+    mov edi, 126
+    mov eax, SYS_EXIT
+    syscall
 
-; local: add a path-beneath rule (rdi = path, esi = rights) to r12d
+; local: add a path-beneath rule (rdi = path, rbx = rights) to ruleset r12d.
+; A path that cannot be opened simply gets no rule, which only narrows access.
 .sbc_allow:
-    push rbx
-    mov ebx, esi
     mov esi, SB_O_PATH | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
@@ -1836,16 +4337,48 @@ handler_sandbox:
     js .sa_ret
     mov qword [sb_rule], rbx
     mov [sb_rule + 8], eax
-    push rax
+    mov r8d, eax                    ; syscall leaves r8 alone
     mov edi, r12d
     mov esi, 1                      ; LANDLOCK_RULE_PATH_BENEATH
     lea rdx, [sb_rule]
     xor r10d, r10d
     mov eax, SB_SYS_LL_ADD
     syscall
-    pop rdi
+    mov edi, r8d
     mov eax, SYS_CLOSE
     syscall
 .sa_ret:
+    ret
+
+; sb_warn_wide() - say so when -w would open "/" or $HOME to changes
+sb_warn_wide:
+    push rbx
+    lea rdi, [tl_path_s]
+    mov esi, TL_PATH_MAX
+    mov eax, SYS_GETCWD
+    syscall
+    test rax, rax
+    jle .ww_ret
+    cmp rax, 2
+    jne .ww_home
+    cmp byte [tl_path_s], '/'
+    je .ww_warn
+.ww_home:
+    lea rdi, [sb_s_home]
+    call getenv_internal
+    test rax, rax
+    jz .ww_ret
+    mov rbx, rax
+    cmp byte [rbx], '/'
+    jne .ww_ret
+    lea rdi, [tl_path_s]
+    mov rsi, rbx
+    call str_icompare
+    test eax, eax
+    jnz .ww_ret
+.ww_warn:
+    lea rdi, [sb_s_wide]
+    call ash_write_err
+.ww_ret:
     pop rbx
     ret
