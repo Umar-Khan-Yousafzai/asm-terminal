@@ -50,6 +50,8 @@ extern SetStdHandle
 extern GetLastError
 extern FormatMessageA
 extern SetConsoleCtrlHandler
+extern GetSystemDirectoryA
+extern GetFullPathNameA
 
 ; ---- Constants ----
 %define STD_INPUT_HANDLE  -10
@@ -60,6 +62,7 @@ extern SetConsoleCtrlHandler
 %define ENABLE_PROCESSED_INPUT  0x0001
 %define ENABLE_LINE_INPUT       0x0002
 %define ENABLE_ECHO_INPUT       0x0004
+%define GFA_INVALID             0xFFFFFFFF
 %define VK_BACK     0x08
 %define VK_TAB      0x09
 %define VK_RETURN   0x0D
@@ -73,11 +76,13 @@ extern SetConsoleCtrlHandler
 %define IR_EVENT_TYPE     0
 %define IR_KEY_DOWN       4
 %define IR_VKEY_CODE      10
+%define IR_REPEAT         8
 %define IR_ASCII_CHAR     14
 %define INPUT_RECORD_SIZE 20
 %define GENERIC_READ        0x80000000
 %define GENERIC_WRITE       0x40000000
 %define FILE_SHARE_READ     0x00000001
+%define FILE_SHARE_WRITE    0x00000002
 %define CREATE_ALWAYS       2
 %define OPEN_EXISTING       3
 %define OPEN_ALWAYS         4
@@ -137,7 +142,7 @@ section .data
                     db "  Files:", 13, 10
                     db "    dir [path]    List directory contents", 13, 10
                     db "    type <file>   Display file contents", 13, 10
-                    db "    copy <s> <d>  Copy file", 13, 10
+                    db "    copy [/y] <s> <d>  Copy file (/y: overwrite)", 13, 10
                     db "    move <s> <d>  Move/rename file", 13, 10
                     db "    rename <s><d> Rename file", 13, 10
                     db "    del <file>    Delete file", 13, 10
@@ -157,7 +162,7 @@ section .data
                     db "    time          Show current time", 13, 10
                     db "    alias <n>=<c> Create command alias", 13, 10
                     db "    help          This help message", 13, 10
-                    db "    exit          Exit the terminal", 13, 10
+                    db "    exit [n]      Exit the terminal with status n", 13, 10
                     db 13, 10
                     db "  Features: Tab completion, history (Up/Down),", 13, 10
                     db "  env vars (%VAR%), redirection (> >> <), piping (|)", 13, 10
@@ -182,9 +187,16 @@ section .data
     err_alias_f_len equ $ - err_alias_full - 1
     err_no_prev_dir db "Error: No previous directory.", 13, 10, 0
     err_no_prev_len equ $ - err_no_prev_dir - 1
+    err_toolong_msg db "Error: Line too long.", 13, 10, 0
+    err_toolong_len equ $ - err_toolong_msg - 1
+    err_color_msg   db "Error: Invalid color. Use one or two hex digits, e.g. 0A.", 13, 10, 0
+    err_color_len   equ $ - err_color_msg - 1
+    err_exists_hint db "Use copy /y to overwrite an existing file.", 13, 10, 0
+    err_exists_len  equ $ - err_exists_hint - 1
 
     title_default   db "ASM Terminal v", ASM_VERSION, 0
-    cmd_prefix      db "cmd.exe /c ", 0
+    cmd_prefix      db "cmd.exe /s /c ", 34, 0
+    cmd_exe_name    db "\cmd.exe", 0
     date_slash      db "/", 0
     time_colon      db ":", 0
     date_prefix     db "Date: ", 0
@@ -199,6 +211,10 @@ section .data
     str_equals      db "=", 0
     str_space       db " ", 0
     str_ctrlc       db "^C", 13, 10, 0
+    ; Redirected files must be inheritable or the child cannot write to them
+    redir_sa        dd 24, 0
+                    dq 0
+                    dd 1, 0
 
     ; Command name strings
     cmd_s_help      db "help", 0
@@ -256,6 +272,7 @@ section .data
         dq cmd_s_set,    handler_set,    3
         dq cmd_s_pushd,  handler_pushd,  5
         dq cmd_s_alias,  handler_alias,  5
+        dq cmd_s_exit,   handler_exit,   4
         dq 0, 0, 0
 
 ; ---- BSS Section ----
@@ -273,9 +290,15 @@ section .bss
     proc_info       resb 24
     csbi            resb 24
     orig_console_mode resd 1
+    console_mode_ok resb 1
+    child_running   resb 1
+    orig_attr       resb 1
+    user_attr       resb 1
     line_buf        resb MAX_INPUT
     line_len        resd 1
     line_cursor     resd 1
+    line_drawn      resd 1
+    key_repeat      resd 1
     input_record    resb 24
     events_read     resd 1
     prompt_row      resw 1
@@ -286,6 +309,7 @@ section .bss
     history_nav_idx resd 1
     history_saved   resb MAX_INPUT
     history_browsing resb 1
+    history_nav_steps resd 1
     find_data       resb FIND_DATA_SIZE
     read_buffer     resb READ_BUF_SIZE
     file_path_buf   resb MAX_PATH_BUF
@@ -294,6 +318,10 @@ section .bss
     tab_prefix      resb MAX_PATH_BUF
     tab_prefix_len  resd 1
     tab_active      resb 1
+    tab_found       resb 1
+    tab_head_len    resd 1
+    tab_tail_len    resd 1
+    tab_tail        resb MAX_INPUT
     tab_find_data   resb FIND_DATA_SIZE
     env_expand_buf  resb 1024
     env_var_name    resb 256
@@ -303,6 +331,7 @@ section .bss
     redir_stdout_active resb 1
     redir_stdin_active  resb 1
     redir_append        resb 1
+    redir_passthru      resb 1
     redir_filename      resb MAX_PATH_BUF
     cleaned_cmd_buf     resb MAX_INPUT
     alias_table     resb ALIAS_COUNT * ALIAS_ENTRY_SIZE
@@ -315,7 +344,12 @@ section .bss
     err_msg_buf     resb 512
     bytes_rw        resd 1
     autoexec_path   resb MAX_PATH_BUF
-    module_path     resb MAX_PATH_BUF
+    module_path     resb MAX_PATH_BUF + 16
+    autoexec_buf    resb READ_BUF_SIZE
+    cmd_exe_path    resb MAX_PATH_BUF
+    dst_path_buf    resb MAX_PATH_BUF
+    num64_buf       resb 32
+    drive_path      resb 8
 
 ; ---- Code Section ----
 section .text
@@ -335,6 +369,19 @@ main:
     mov ecx, STD_INPUT_HANDLE
     call GetStdHandle
     mov [hStdIn], rax
+    ; Remember the colors the console started with so exit can put them back
+    mov byte [orig_attr], COLOR_DEFAULT
+    mov rcx, [hStdOut]
+    lea rdx, [csbi]
+    call GetConsoleScreenBufferInfo
+    test eax, eax
+    jz .main_noattr
+    mov al, [csbi + 8]
+    test al, al
+    jz .main_noattr
+    mov [orig_attr], al
+.main_noattr:
+    mov byte [user_attr], COLOR_DEFAULT
     ; Set title
     lea rcx, [title_default]
     call SetConsoleTitleA
@@ -361,25 +408,37 @@ main:
     ; Autoexec
     call run_autoexec
 .main_loop:
-    ; Green path
+    ; Green path, on the background the user picked with color
+    movzx edx, byte [user_attr]
+    and edx, 0xF0
+    or edx, COLOR_GREEN
     mov rcx, [hStdOut]
-    mov edx, COLOR_GREEN
     call SetConsoleTextAttribute
     mov ecx, MAX_PATH_BUF
     lea rdx, [path_buf]
     call GetCurrentDirectoryA
+    ; A path longer than the buffer is not copied; show nothing stale
+    test eax, eax
+    jz .main_nopath
+    cmp eax, MAX_PATH_BUF
+    jb .main_path
+.main_nopath:
+    mov byte [path_buf], 0
+.main_path:
     lea rcx, [path_buf]
     call print_cstring
     ; White >
+    movzx edx, byte [user_attr]
+    and edx, 0xF0
+    or edx, COLOR_WHITE
     mov rcx, [hStdOut]
-    mov edx, COLOR_WHITE
     call SetConsoleTextAttribute
     lea rcx, [prompt_gt]
     mov edx, 2
     call print_string_len
     ; Default for input
     mov rcx, [hStdOut]
-    mov edx, COLOR_DEFAULT
+    movzx edx, byte [user_attr]
     call SetConsoleTextAttribute
     ; Save cursor position for line editing
     mov rcx, [hStdOut]
@@ -391,6 +450,7 @@ main:
     mov [prompt_row], ax
     ; Read line with editing
     call read_line
+    call trim_input
     cmp byte [input_buf], 0
     je .main_loop
     ; Add to history
@@ -410,12 +470,31 @@ setup_raw_mode:
     mov rcx, [hStdIn]
     lea rdx, [orig_console_mode]
     call GetConsoleMode
+    ; Not a console (input redirected): leave the mode alone
+    test eax, eax
+    jz .srm_done
+    mov byte [console_mode_ok], 1
+    call reapply_raw_mode
+.srm_done:
+    leave
+    ret
+
+; reapply_raw_mode - switch the console to raw input again after a child
+; program, starting from the mode saved at startup
+reapply_raw_mode:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    cmp byte [console_mode_ok], 0
+    je .rrm_done
     mov eax, [orig_console_mode]
-    and eax, 0xFFFFFFF9         ; clear LINE_INPUT | ECHO_INPUT
-    or eax, ENABLE_PROCESSED_INPUT
+    ; Clear LINE_INPUT, ECHO_INPUT and PROCESSED_INPUT: Ctrl+C then arrives
+    ; as a key and wakes the read instead of waiting for the next key
+    and eax, 0xFFFFFFF8
     mov rcx, [hStdIn]
     mov edx, eax
     call SetConsoleMode
+.rrm_done:
     leave
     ret
 
@@ -423,20 +502,44 @@ restore_console_mode:
     push rbp
     mov rbp, rsp
     sub rsp, 32
+    cmp byte [console_mode_ok], 0
+    je .rcm_done
     mov rcx, [hStdIn]
     mov edx, [orig_console_mode]
     call SetConsoleMode
+.rcm_done:
     leave
     ret
 
-; Ctrl+C handler (called by OS in separate thread)
+; restore_console_state - input mode and colors as they were at startup
+restore_console_state:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    call restore_console_mode
+    mov rcx, [hStdOut]
+    movzx edx, byte [orig_attr]
+    call SetConsoleTextAttribute
+    leave
+    ret
+
+; Console control handler (called by the OS on a separate thread)
+; ecx = event: 0 Ctrl+C, 1 Ctrl+Break, 2 close, 5 logoff, 6 shutdown
 ctrl_c_handler:
-    cmp ecx, 0
-    jne .cc_no
+    cmp ecx, 1
+    ja .cc_end
+    ; While a child program runs it gets the Ctrl+C too; the shell stays
+    cmp byte [child_running], 0
+    jne .cc_swallow
     mov byte [ctrl_c_flag], 1
+.cc_swallow:
     mov eax, 1
     ret
-.cc_no:
+.cc_end:
+    ; The process is going away: hand the console back as we found it
+    sub rsp, 40
+    call restore_console_state
+    add rsp, 40
     xor eax, eax
     ret
 
@@ -451,21 +554,44 @@ read_line:
     sub rsp, 48
     mov dword [line_len], 0
     mov dword [line_cursor], 0
+    mov dword [line_drawn], 0
     mov byte [line_buf], 0
     mov byte [history_browsing], 0
+    mov dword [history_nav_steps], 0
     mov byte [tab_active], 0
+    mov dword [key_repeat], 0
 .rl_loop:
     cmp byte [ctrl_c_flag], 0
     jne .rl_ctrlc
+    ; A key the console reported with a repeat count is replayed first
+    cmp dword [key_repeat], 0
+    je .rl_read
+    dec dword [key_repeat]
+    jmp .rl_have_key
+.rl_read:
     mov rcx, [hStdIn]
     lea rdx, [input_record]
     mov r8d, 1
     lea r9, [events_read]
     call ReadConsoleInputA
+    ; No console to read from (input redirected or closed): nothing more
+    ; will ever arrive, so leave instead of spinning on a stale record
+    test eax, eax
+    jz .rl_fail
     cmp word [input_record], 1
     jne .rl_loop
     cmp dword [input_record + IR_KEY_DOWN], 0
     je .rl_loop
+    movzx eax, word [input_record + IR_REPEAT]
+    cmp eax, 1
+    jbe .rl_have_key
+    cmp eax, 64
+    jbe .rl_rep_ok
+    mov eax, 64
+.rl_rep_ok:
+    dec eax
+    mov [key_repeat], eax
+.rl_have_key:
     movzx ebx, word [input_record + IR_VKEY_CODE]
     movzx edi, byte [input_record + IR_ASCII_CHAR]
     ; Cancel tab on non-tab key
@@ -473,17 +599,11 @@ read_line:
     je .rl_dispatch
     cmp byte [tab_active], 0
     je .rl_dispatch
-    push rbx
-    push rdi
-    mov rcx, [tab_find_handle]
-    cmp rcx, INVALID_HANDLE_VALUE
-    je .rl_tab_skip
-    call FindClose
-.rl_tab_skip:
-    mov byte [tab_active], 0
-    pop rdi
-    pop rbx
+    call tab_cancel
 .rl_dispatch:
+    ; Ctrl+C arrives as a character because processed input is off
+    cmp edi, 3
+    je .rl_ctrlc
     cmp bx, VK_RETURN
     je .rl_enter
     cmp bx, VK_BACK
@@ -619,6 +739,15 @@ read_line:
     jmp .rl_loop
 .rl_ctrlc:
     mov byte [ctrl_c_flag], 0
+    ; A search left open by Tab would keep the directory locked
+    cmp byte [tab_active], 0
+    je .rl_cc_nofind
+    call tab_cancel
+.rl_cc_nofind:
+    ; Put ^C after the text, not over it
+    mov eax, [line_len]
+    mov [line_cursor], eax
+    call update_cursor_pos
     mov dword [line_len], 0
     mov dword [line_cursor], 0
     mov byte [line_buf], 0
@@ -631,6 +760,62 @@ read_line:
     pop rbx
     pop rbp
     ret
+.rl_fail:
+    xor ecx, ecx
+    call handler_exit
+
+; tab_cancel - end the current Tab completion and release its search handle
+tab_cancel:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    cmp byte [tab_active], 0
+    je .tcc_done
+    mov byte [tab_active], 0
+    mov rcx, [tab_find_handle]
+    cmp rcx, INVALID_HANDLE_VALUE
+    je .tcc_done
+    call FindClose
+.tcc_done:
+    leave
+    ret
+
+; ============================================================================
+; get_con_width - eax = console width in cells (80 when it cannot be read)
+; ============================================================================
+get_con_width:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov rcx, [hStdOut]
+    lea rdx, [csbi]
+    call GetConsoleScreenBufferInfo
+    test eax, eax
+    jz .gcw_default
+    movzx eax, word [csbi]
+    test eax, eax
+    jnz .gcw_done
+.gcw_default:
+    mov eax, 80
+.gcw_done:
+    leave
+    ret
+
+; ============================================================================
+; cell_to_coord - eax = cells after the start of the input, ecx = width
+; Returns eax = COORD of that cell. The input starts at the prompt and
+; wraps onto the next rows when it is wider than the console.
+; ============================================================================
+cell_to_coord:
+    movzx edx, word [prompt_col]
+    add eax, edx
+    xor edx, edx
+    div ecx
+    movzx ecx, word [prompt_row]
+    add eax, ecx
+    shl eax, 16
+    or eax, edx
+    ret
 
 ; ============================================================================
 ; redraw_line - Redraw line buffer at prompt position
@@ -638,12 +823,15 @@ read_line:
 redraw_line:
     push rbp
     mov rbp, rsp
+    push rbx
+    push rsi
     sub rsp, 48
+    call get_con_width
+    mov ebx, eax                ; console width
     ; Move cursor to prompt start
-    movzx eax, word [prompt_col]
-    movzx ecx, word [prompt_row]
-    shl ecx, 16
-    or eax, ecx
+    xor eax, eax
+    mov ecx, ebx
+    call cell_to_coord
     mov rcx, [hStdOut]
     mov edx, eax
     call SetConsoleCursorPosition
@@ -654,35 +842,46 @@ redraw_line:
     lea rcx, [line_buf]
     call print_string_len
 .rd_clear:
-    ; Fill spaces past text to clear old chars
-    movzx eax, word [prompt_col]
-    add eax, [line_len]
-    movzx ecx, word [prompt_row]
-    shl ecx, 16
-    or eax, ecx
+    ; Blank what a longer previous line left behind
+    mov esi, [line_drawn]
+    sub esi, [line_len]
+    jle .rd_nofill
+    mov eax, [line_len]
+    mov ecx, ebx
+    call cell_to_coord
+    mov r9d, eax
     mov rcx, [hStdOut]
     mov edx, ' '
-    mov r8d, 20
-    mov r9d, eax
+    mov r8d, esi
     lea rax, [chars_written]
     mov [rsp + 32], rax
     call FillConsoleOutputCharacterA
-    call update_cursor_pos
-    leave
+.rd_nofill:
+    mov eax, [line_len]
+    mov [line_drawn], eax
+    mov eax, [line_cursor]
+    mov ecx, ebx
+    call cell_to_coord
+    mov rcx, [hStdOut]
+    mov edx, eax
+    call SetConsoleCursorPosition
+    add rsp, 48
+    pop rsi
+    pop rbx
+    pop rbp
     ret
 
 ; ============================================================================
-; update_cursor_pos - Set cursor to prompt_col + line_cursor
+; update_cursor_pos - Set cursor to the cell for line_cursor
 ; ============================================================================
 update_cursor_pos:
     push rbp
     mov rbp, rsp
     sub rsp, 32
-    movzx eax, word [prompt_col]
-    add eax, [line_cursor]
-    movzx edx, word [prompt_row]
-    shl edx, 16
-    or eax, edx
+    call get_con_width
+    mov ecx, eax
+    mov eax, [line_cursor]
+    call cell_to_coord
     mov rcx, [hStdOut]
     mov edx, eax
     call SetConsoleCursorPosition
@@ -754,6 +953,7 @@ history_add:
     mov eax, [history_write_idx]
     mov [history_nav_idx], eax
     mov byte [history_browsing], 0
+    mov dword [history_nav_steps], 0
     add rsp, 56
     pop rdi
     pop rsi
@@ -774,6 +974,10 @@ history_navigate_up:
     mov eax, [history_count]
     test eax, eax
     jz .hnu_done
+    ; Already showing the oldest entry?
+    mov eax, [history_nav_steps]
+    cmp eax, [history_count]
+    jae .hnu_done
     ; Save current line if first navigation
     cmp byte [history_browsing], 0
     jne .hnu_nav
@@ -782,20 +986,13 @@ history_navigate_up:
     lea rdx, [line_buf]
     call str_copy
 .hnu_nav:
+    inc dword [history_nav_steps]
     mov eax, [history_nav_idx]
     test eax, eax
     jnz .hnu_dec
     mov eax, HISTORY_COUNT
 .hnu_dec:
     dec eax
-    ; Check if at oldest entry
-    mov ecx, [history_write_idx]
-    sub ecx, [history_count]
-    jge .hnu_check
-    add ecx, HISTORY_COUNT
-.hnu_check:
-    cmp eax, ecx
-    je .hnu_done
     mov [history_nav_idx], eax
     imul eax, HISTORY_ENTRY_SIZE
     lea rdx, [history_buf]
@@ -825,14 +1022,14 @@ history_navigate_down:
     sub rsp, 40
     cmp byte [history_browsing], 0
     je .hnd_done
+    dec dword [history_nav_steps]
+    jz .hnd_restore
     mov eax, [history_nav_idx]
     inc eax
     cmp eax, HISTORY_COUNT
     jl .hnd_nowrap
     xor eax, eax
 .hnd_nowrap:
-    cmp eax, [history_write_idx]
-    je .hnd_restore
     mov [history_nav_idx], eax
     imul eax, HISTORY_ENTRY_SIZE
     lea rdx, [history_buf]
@@ -846,6 +1043,7 @@ history_navigate_down:
     call redraw_line
     jmp .hnd_done
 .hnd_restore:
+    mov eax, [history_write_idx]
     mov [history_nav_idx], eax
     mov byte [history_browsing], 0
     lea rcx, [line_buf]
@@ -863,6 +1061,55 @@ history_navigate_down:
     ret
 
 ; ============================================================================
+; trim_input - Remove leading and trailing blanks from input_buf
+; ============================================================================
+trim_input:
+    lea rdx, [input_buf]
+    mov rcx, rdx
+.ti_lead:
+    mov al, [rdx]
+    cmp al, ' '
+    je .ti_skip
+    cmp al, 9
+    jne .ti_move
+.ti_skip:
+    inc rdx
+    jmp .ti_lead
+.ti_move:
+    cmp rdx, rcx
+    je .ti_trail
+.ti_shift:
+    mov al, [rdx]
+    mov [rcx], al
+    inc rdx
+    inc rcx
+    test al, al
+    jnz .ti_shift
+.ti_trail:
+    lea rcx, [input_buf]
+.ti_end:
+    cmp byte [rcx], 0
+    je .ti_back
+    inc rcx
+    jmp .ti_end
+.ti_back:
+    lea rdx, [input_buf]
+.ti_cut:
+    cmp rcx, rdx
+    je .ti_done
+    mov al, [rcx - 1]
+    cmp al, ' '
+    je .ti_drop
+    cmp al, 9
+    jne .ti_done
+.ti_drop:
+    dec rcx
+    mov byte [rcx], 0
+    jmp .ti_cut
+.ti_done:
+    ret
+
+; ============================================================================
 ; dispatch_command - Expand env, check alias, parse redir, dispatch
 ; ============================================================================
 dispatch_command:
@@ -873,10 +1120,18 @@ dispatch_command:
     push rdi
     push r12
     sub rsp, 48
+    ; Blank lines (also from autoexec) do nothing, not even start a shell
+    call trim_input
+    cmp byte [input_buf], 0
+    je .dc_done
     ; Expand environment variables
     call expand_env_vars
+    test eax, eax
+    jnz .dc_toolong
     ; Check aliases
     call check_alias
+    test eax, eax
+    jnz .dc_toolong
     ; Check for pipe - if found, pass entire command to cmd.exe
     lea rcx, [input_buf]
 .dc_pipe_check:
@@ -890,6 +1145,11 @@ dispatch_command:
 .dc_no_pipe:
     ; Parse redirection
     call parse_redirection
+    test eax, eax
+    jnz .dc_done                ; a redirect target could not be opened
+    ; 2>&1 and friends: cmd.exe does the whole line
+    cmp byte [redir_passthru], 0
+    jne .dc_external
     ; Try exact match table
     lea rsi, [cmd_table_exact]
 .dc_exact:
@@ -913,7 +1173,7 @@ dispatch_command:
 .dc_pfx_loop:
     mov rdi, [rsi]
     test rdi, rdi
-    jz .dc_external
+    jz .dc_try_cd
     mov r12d, [rsi + 16]
     lea rcx, [input_buf]
     mov rdx, rdi
@@ -944,6 +1204,56 @@ dispatch_command:
     xor ecx, ecx
     call rax
     jmp .dc_done
+.dc_try_cd:
+    ; "cd.." and "cd\" are valid cmd.exe spellings with no blank after cd
+    lea rax, [input_buf]
+    movzx ecx, byte [rax]
+    or cl, 0x20
+    cmp cl, 'c'
+    jne .dc_try_drive
+    movzx ecx, byte [rax + 1]
+    or cl, 0x20
+    cmp cl, 'd'
+    jne .dc_try_drive
+    cmp byte [rax + 2], '.'
+    je .dc_cd_glued
+    cmp byte [rax + 2], 92
+    jne .dc_try_drive
+.dc_cd_glued:
+    lea rcx, [rax + 2]
+    call handler_cd
+    jmp .dc_done
+.dc_try_drive:
+    ; "D:" on its own switches to that drive
+    lea rax, [input_buf]
+    cmp byte [rax + 1], ':'
+    jne .dc_external
+    cmp byte [rax + 2], 0
+    jne .dc_external
+    movzx ecx, byte [rax]
+    mov edx, ecx
+    or dl, 0x20
+    sub dl, 'a'
+    cmp dl, 25
+    ja .dc_external
+    lea rdx, [drive_path]
+    mov [rdx], cl
+    mov byte [rdx + 1], ':'
+    mov byte [rdx + 2], 92
+    mov byte [rdx + 3], 0
+    mov rcx, rdx
+    call SetCurrentDirectoryA
+    test eax, eax
+    jnz .dc_done
+    lea rcx, [err_cd_msg]
+    mov edx, err_cd_len
+    call print_string_len
+    jmp .dc_done
+.dc_toolong:
+    lea rcx, [err_toolong_msg]
+    mov edx, err_toolong_len
+    call print_string_len
+    jmp .dc_done
 .dc_external:
     call execute_external
 .dc_done:
@@ -958,6 +1268,9 @@ dispatch_command:
 
 ; ============================================================================
 ; expand_env_vars - Replace %VAR% in input_buf with env values
+; A reference to a name that is not defined stays as typed, like cmd.exe
+; does at the prompt, and "%%" is one percent sign. Returns eax = 1 and
+; leaves input_buf alone when the expanded line would not fit.
 ; ============================================================================
 expand_env_vars:
     push rbp
@@ -965,56 +1278,95 @@ expand_env_vars:
     push r12
     push r13
     push r14
-    sub rsp, 40
+    push r15
+    sub rsp, 32
     lea r12, [input_buf]
     lea r13, [env_expand_buf]
+    lea r15, [env_expand_buf + MAX_INPUT - 1]   ; last byte a character may use
 .ev_loop:
     movzx eax, byte [r12]
     test al, al
     jz .ev_done
     cmp al, '%'
     je .ev_pct
-    mov [r13], al
     inc r12
+.ev_emit:
+    cmp r13, r15
+    jae .ev_over
+    mov [r13], al
     inc r13
     jmp .ev_loop
 .ev_pct:
-    inc r12
+    cmp byte [r12 + 1], '%'
+    jne .ev_name
+    add r12, 2
+    mov al, '%'
+    jmp .ev_emit
+.ev_name:
+    ; The name runs up to the next percent sign and may only hold the
+    ; characters environment names use: "50% off, 100% sure" is plain text
     xor r14d, r14d
-.ev_find:
-    movzx eax, byte [r12 + r14]
-    test al, al
-    jz .ev_literal
+.ev_scan:
+    movzx eax, byte [r12 + r14 + 1]
     cmp al, '%'
-    je .ev_found
+    je .ev_close
+    mov ecx, eax
+    or cl, 0x20
+    sub cl, 'a'
+    cmp cl, 25
+    jbe .ev_namechar
+    lea ecx, [rax - '0']
+    cmp cl, 9
+    jbe .ev_namechar
+    cmp al, '_'
+    je .ev_namechar
+    cmp al, '('
+    je .ev_namechar
+    cmp al, ')'
+    je .ev_namechar
+    cmp al, '#'
+    je .ev_namechar
+    cmp al, '$'
+    je .ev_namechar
+    cmp al, '-'
+    je .ev_namechar
+    cmp al, '.'
+    jne .ev_notvar
+.ev_namechar:
     inc r14d
-    jmp .ev_find
-.ev_literal:
-    mov byte [r13], '%'
-    inc r13
-    jmp .ev_loop
-.ev_found:
-    test r14d, r14d
-    jz .ev_empty_pct
+    cmp r14d, 255
+    jb .ev_scan
+.ev_notvar:
+    inc r12
+    mov al, '%'
+    jmp .ev_emit
+.ev_close:
     lea rdi, [env_var_name]
     xor ecx, ecx
 .ev_cpname:
     cmp ecx, r14d
     jge .ev_cpname_done
-    mov al, [r12 + rcx]
+    mov al, [r12 + rcx + 1]
     mov [rdi + rcx], al
     inc ecx
     jmp .ev_cpname
 .ev_cpname_done:
     mov byte [rdi + rcx], 0
-    add r12, r14
-    inc r12
     lea rcx, [env_var_name]
     lea rdx, [env_var_value]
     mov r8d, 1024
     call GetEnvironmentVariableA
     test eax, eax
-    jz .ev_loop
+    jz .ev_undef
+    ; 1024 or more means the value did not fit the buffer; a line cannot
+    ; hold such a value anyway
+    cmp eax, 1024
+    jae .ev_over
+    mov ecx, eax
+    add rcx, r13
+    cmp rcx, r15
+    ja .ev_over
+    lea r12, [r12 + r14 + 2]
     lea rcx, [env_var_value]
 .ev_cpval:
     mov al, [rcx]
@@ -1024,17 +1376,31 @@ expand_env_vars:
     inc r13
     inc rcx
     jmp .ev_cpval
-.ev_empty_pct:
-    mov byte [r13], '%'
+.ev_undef:
+    ; Keep "%name%" exactly as typed
+    lea ecx, [r14 + 2]
+.ev_lit:
+    cmp r13, r15
+    jae .ev_over
+    mov al, [r12]
+    mov [r13], al
     inc r13
     inc r12
+    dec ecx
+    jnz .ev_lit
     jmp .ev_loop
+.ev_over:
+    mov eax, 1
+    jmp .ev_ret
 .ev_done:
     mov byte [r13], 0
     lea rcx, [input_buf]
     lea rdx, [env_expand_buf]
     call str_copy
-    add rsp, 40
+    xor eax, eax
+.ev_ret:
+    add rsp, 32
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -1079,6 +1445,16 @@ check_alias:
     inc r12d
     jmp .ca_loop
 .ca_match:
+    ; The expanded line has to fit input_buf
+    lea rcx, [rbx + ALIAS_NAME_SIZE]
+    call str_len
+    mov [rsp + 32], eax
+    lea rcx, [input_buf]
+    add rcx, r13
+    call str_len
+    add eax, [rsp + 32]
+    cmp eax, MAX_INPUT - 1
+    ja .ca_over
     lea rcx, [env_expand_buf]
     lea rdx, [rbx + ALIAS_NAME_SIZE]
     call str_copy
@@ -1093,6 +1469,11 @@ check_alias:
     lea rdx, [env_expand_buf]
     call str_copy
 .ca_done:
+    xor eax, eax
+    jmp .ca_ret
+.ca_over:
+    mov eax, 1
+.ca_ret:
     add rsp, 40
     pop r13
     pop r12
@@ -1101,7 +1482,69 @@ check_alias:
     ret
 
 ; ============================================================================
+; redir_read_name - Read the file name after a redirection operator
+; rcx = text after the operator. The name (optionally in double quotes)
+; goes to redir_filename. Returns rax = text after the name, edx = 0, or
+; edx = 1 when the name is missing or longer than a path can be.
+; ============================================================================
+redir_read_name:
+.rn_skip:
+    cmp byte [rcx], ' '
+    jne .rn_start
+    inc rcx
+    jmp .rn_skip
+.rn_start:
+    lea r8, [redir_filename]
+    lea r9, [redir_filename + MAX_PATH_BUF - 1]
+    xor r10d, r10d              ; 1 inside quotes
+    cmp byte [rcx], '"'
+    jne .rn_loop
+    inc rcx
+    mov r10d, 1
+.rn_loop:
+    movzx eax, byte [rcx]
+    test al, al
+    jz .rn_end
+    test r10d, r10d
+    jz .rn_bare
+    cmp al, '"'
+    je .rn_close
+    jmp .rn_store
+.rn_bare:
+    cmp al, ' '
+    je .rn_end
+    cmp al, '<'
+    je .rn_end
+    cmp al, '>'
+    je .rn_end
+.rn_store:
+    cmp r8, r9
+    jae .rn_bad
+    mov [r8], al
+    inc r8
+    inc rcx
+    jmp .rn_loop
+.rn_close:
+    inc rcx
+.rn_end:
+    mov byte [r8], 0
+    lea rdx, [redir_filename]
+    cmp r8, rdx
+    je .rn_bad
+    mov rax, rcx
+    xor edx, edx
+    ret
+.rn_bad:
+    mov byte [r8], 0
+    mov rax, rcx
+    mov edx, 1
+    ret
+
+; ============================================================================
 ; parse_redirection - Scan input_buf for > >> <, open files, clean command
+; Quoted text is left alone. A file descriptor form (2>, >&1) cannot be
+; done here, so the whole line is left to cmd.exe (redir_passthru).
+; Returns eax = 1 after reporting a file that could not be opened.
 ; ============================================================================
 parse_redirection:
     push rbp
@@ -1109,108 +1552,136 @@ parse_redirection:
     push rdi
     push r12
     push r13
-    sub rsp, 56
+    push r14
+    sub rsp, 64
     mov byte [redir_stdout_active], 0
     mov byte [redir_stdin_active], 0
     mov byte [redir_append], 0
+    mov byte [redir_passthru], 0
     mov qword [redir_stdout_handle], 0
     mov qword [redir_stdin_handle], 0
     lea r12, [input_buf]
     lea r13, [cleaned_cmd_buf]
+    xor r14d, r14d              ; 1 while inside double quotes
 .pr_loop:
     movzx eax, byte [r12]
     test al, al
     jz .pr_finish
+    cmp al, '"'
+    jne .pr_noquote
+    xor r14d, 1
+.pr_noquote:
+    test r14d, r14d
+    jnz .pr_copy
     cmp al, '>'
-    je .pr_out
+    je .pr_op
     cmp al, '<'
-    je .pr_in
+    je .pr_op
+.pr_copy:
     mov [r13], al
     inc r12
     inc r13
     jmp .pr_loop
-.pr_out:
-    inc r12
-    cmp byte [r12], '>'
-    jne .pr_out_create
-    inc r12
+.pr_op:
+    ; A digit on its own right before the operator names a handle: 2>nul
+    lea rdx, [cleaned_cmd_buf]
+    cmp r13, rdx
+    je .pr_nofd
+    movzx ecx, byte [r13 - 1]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .pr_nofd
+    lea rcx, [r13 - 1]
+    cmp rcx, rdx
+    je .pr_passthru
+    cmp byte [r13 - 2], ' '
+    je .pr_passthru
+.pr_nofd:
+    cmp al, '<'
+    je .pr_in
+    lea rcx, [r12 + 1]
+    mov byte [redir_append], 0
+    cmp byte [rcx], '>'
+    jne .pr_o_amp
+    inc rcx
     mov byte [redir_append], 1
-.pr_out_create:
-.pr_skip1:
-    cmp byte [r12], ' '
-    jne .pr_fname_out
-    inc r12
-    jmp .pr_skip1
-.pr_fname_out:
-    lea rdi, [redir_filename]
-.pr_cpfn1:
-    movzx eax, byte [r12]
-    test al, al
-    jz .pr_cpfn1_done
-    cmp al, ' '
-    je .pr_cpfn1_done
-    mov [rdi], al
-    inc r12
-    inc rdi
-    jmp .pr_cpfn1
-.pr_cpfn1_done:
-    mov byte [rdi], 0
+.pr_o_amp:
+    cmp byte [rcx], '&'
+    je .pr_passthru
+    call redir_read_name
+    mov r12, rax
+    test edx, edx
+    jnz .pr_fail
     lea rcx, [redir_filename]
     cmp byte [redir_append], 0
     jne .pr_append
     mov edx, GENERIC_WRITE
-    xor r8d, r8d
-    xor r9d, r9d
     mov dword [rsp + 32], CREATE_ALWAYS
     jmp .pr_do_open
 .pr_append:
     mov edx, FILE_APPEND_DATA
-    xor r8d, r8d
-    xor r9d, r9d
     mov dword [rsp + 32], OPEN_ALWAYS
 .pr_do_open:
+    xor r8d, r8d
+    lea r9, [redir_sa]
     mov dword [rsp + 40], FILE_ATTRIBUTE_NORMAL
     mov qword [rsp + 48], 0
     call CreateFileA
     cmp rax, INVALID_HANDLE_VALUE
-    je .pr_loop
+    je .pr_fail
+    ; A second ">" on the line replaces the first; do not leak its handle
+    cmp byte [redir_stdout_active], 0
+    je .pr_o_store
+    mov [rsp + 56], rax
+    mov rcx, [redir_stdout_handle]
+    call CloseHandle
+    mov rax, [rsp + 56]
+.pr_o_store:
     mov [redir_stdout_handle], rax
     mov byte [redir_stdout_active], 1
     jmp .pr_loop
 .pr_in:
-    inc r12
-.pr_skip2:
-    cmp byte [r12], ' '
-    jne .pr_fname_in
-    inc r12
-    jmp .pr_skip2
-.pr_fname_in:
-    lea rdi, [redir_filename]
-.pr_cpfn2:
-    movzx eax, byte [r12]
-    test al, al
-    jz .pr_cpfn2_done
-    cmp al, ' '
-    je .pr_cpfn2_done
-    mov [rdi], al
-    inc r12
-    inc rdi
-    jmp .pr_cpfn2
-.pr_cpfn2_done:
-    mov byte [rdi], 0
+    lea rcx, [r12 + 1]
+    cmp byte [rcx], '&'
+    je .pr_passthru
+    call redir_read_name
+    mov r12, rax
+    test edx, edx
+    jnz .pr_fail
     lea rcx, [redir_filename]
     mov edx, GENERIC_READ
-    mov r8d, FILE_SHARE_READ
-    xor r9d, r9d
+    mov r8d, FILE_SHARE_READ | FILE_SHARE_WRITE
+    lea r9, [redir_sa]
     mov dword [rsp + 32], OPEN_EXISTING
     mov dword [rsp + 40], FILE_ATTRIBUTE_NORMAL
     mov qword [rsp + 48], 0
     call CreateFileA
     cmp rax, INVALID_HANDLE_VALUE
-    je .pr_loop
+    je .pr_fail
+    cmp byte [redir_stdin_active], 0
+    je .pr_i_store
+    mov [rsp + 56], rax
+    mov rcx, [redir_stdin_handle]
+    call CloseHandle
+    mov rax, [rsp + 56]
+.pr_i_store:
     mov [redir_stdin_handle], rax
     mov byte [redir_stdin_active], 1
     jmp .pr_loop
+.pr_passthru:
+    call restore_redirection
+    mov byte [redir_passthru], 1
+    xor eax, eax
+    jmp .pr_ret
+.pr_fail:
+    ; Do not run the command without its redirection; the message must go
+    ; to the console, so drop what was opened first
+    call restore_redirection
+    lea rcx, [err_file_msg]
+    mov edx, err_file_len
+    call print_string_len
+    mov eax, 1
+    jmp .pr_ret
 .pr_finish:
     ; Strip trailing spaces from cleaned cmd
     lea rax, [cleaned_cmd_buf]
@@ -1226,7 +1697,10 @@ parse_redirection:
     lea rcx, [input_buf]
     lea rdx, [cleaned_cmd_buf]
     call str_copy
-    add rsp, 56
+    xor eax, eax
+.pr_ret:
+    add rsp, 64
+    pop r14
     pop r13
     pop r12
     pop rdi
@@ -1257,46 +1731,73 @@ restore_redirection:
 
 ; ============================================================================
 ; tab_complete - File/dir name completion on Tab key
+; The first Tab remembers the text around the word being completed; every
+; later Tab swaps in the next match, so cycling never loses the typed prefix
+; (directory part included) or the text after the cursor.
 ; ============================================================================
 tab_complete:
     push rbp
     mov rbp, rsp
     push rbx
+    push rsi
+    push rdi
     push r12
     push r13
-    sub rsp, 40
+    push r14
+    sub rsp, 48
     cmp byte [tab_active], 1
     je .tc_next
     ; Find word start
     mov r12d, [line_cursor]
+    lea rsi, [line_buf]
 .tc_scan:
     test r12d, r12d
     jz .tc_start
+    cmp byte [rsi + r12 - 1], ' '
+    je .tc_start
     dec r12d
-    lea rax, [line_buf]
-    cmp byte [rax + r12], ' '
-    jne .tc_scan
-    inc r12d
+    jmp .tc_scan
 .tc_start:
-    ; Copy prefix + append *
+    ; ebx = characters of the word before the cursor
     mov ebx, [line_cursor]
     sub ebx, r12d
-    mov [tab_prefix_len], ebx
+    cmp ebx, MAX_PATH_BUF - 4
+    ja .tc_done
+    ; Copy the word as a pattern; r13d = length of its directory part
+    lea rdi, [tab_prefix]
+    add rsi, r12
     xor ecx, ecx
+    xor r13d, r13d
 .tc_cp:
     cmp ecx, ebx
     jge .tc_cp_done
-    lea rax, [line_buf]
-    add rax, r12
-    mov dl, [rax + rcx]
-    lea r8, [tab_prefix]
-    mov [r8 + rcx], dl
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
     inc ecx
+    cmp al, 92                  ; backslash
+    je .tc_sep
+    cmp al, '/'
+    jne .tc_cp
+.tc_sep:
+    mov r13d, ecx
     jmp .tc_cp
 .tc_cp_done:
-    lea rax, [tab_prefix]
-    mov byte [rax + rbx], '*'
-    mov byte [rax + rbx + 1], 0
+    mov byte [rdi + rbx], '*'
+    mov byte [rdi + rbx + 1], 0
+    mov [tab_prefix_len], ebx
+    add r13d, r12d
+    mov [tab_head_len], r13d
+    ; Keep the text after the cursor, it goes back behind the name
+    mov eax, [line_len]
+    sub eax, [line_cursor]
+    mov [tab_tail_len], eax
+    lea rsi, [line_buf]
+    mov ecx, [line_cursor]
+    add rsi, rcx
+    lea rdi, [tab_tail]
+    mov ecx, eax
+    rep movsb
+    mov byte [rdi], 0
     lea rcx, [tab_prefix]
     lea rdx, [tab_find_data]
     call FindFirstFileA
@@ -1304,6 +1805,7 @@ tab_complete:
     je .tc_done
     mov [tab_find_handle], rax
     mov byte [tab_active], 1
+    mov byte [tab_found], 0
     jmp .tc_check
 .tc_next:
     mov rcx, [tab_find_handle]
@@ -1311,13 +1813,18 @@ tab_complete:
     call FindNextFileA
     test eax, eax
     jnz .tc_check
+    ; End of the list. Start over, but only if this pass offered a name;
+    ; a pattern that matches nothing but "." and ".." must not loop.
     mov rcx, [tab_find_handle]
     call FindClose
+    cmp byte [tab_found], 0
+    je .tc_stop
+    mov byte [tab_found], 0
     lea rcx, [tab_prefix]
     lea rdx, [tab_find_data]
     call FindFirstFileA
     cmp rax, INVALID_HANDLE_VALUE
-    je .tc_done
+    je .tc_stop
     mov [tab_find_handle], rax
 .tc_check:
     lea rcx, [tab_find_data + FD_FILENAME]
@@ -1332,31 +1839,68 @@ tab_complete:
 .tc_replace:
     lea rcx, [tab_find_data + FD_FILENAME]
     call str_len
-    mov r13d, eax
-    lea r8, [line_buf]
-    add r8, r12
-    lea r9, [tab_find_data + FD_FILENAME]
-    xor edx, edx
-.tc_ins:
-    cmp edx, r13d
-    jge .tc_ins_done
-    movzx eax, byte [r9 + rdx]
-    mov [r8 + rdx], al
-    inc edx
-    jmp .tc_ins
-.tc_ins_done:
-    mov eax, r12d
+    mov r13d, eax               ; name length
+    ; A name with a space needs quotes
+    xor r14d, r14d
+    lea rcx, [tab_find_data + FD_FILENAME]
+.tc_spc:
+    mov al, [rcx]
+    test al, al
+    jz .tc_spc_done
+    cmp al, ' '
+    jne .tc_spc_next
+    mov r14d, 2
+.tc_spc_next:
+    inc rcx
+    jmp .tc_spc
+.tc_spc_done:
+    ; Skip a name that would not fit on the line
+    mov eax, [tab_head_len]
     add eax, r13d
-    mov [line_len], eax
-    mov [line_cursor], eax
+    add eax, r14d
+    add eax, [tab_tail_len]
+    cmp eax, MAX_INPUT - 2
+    ja .tc_next
+    lea rdi, [line_buf]
+    mov eax, [tab_head_len]
+    add rdi, rax
+    test r14d, r14d
+    jz .tc_nq1
+    mov byte [rdi], '"'
+    inc rdi
+.tc_nq1:
+    lea rsi, [tab_find_data + FD_FILENAME]
+    mov ecx, r13d
+    rep movsb
+    test r14d, r14d
+    jz .tc_nq2
+    mov byte [rdi], '"'
+    inc rdi
+.tc_nq2:
+    ; Cursor ends up right behind the name, in front of the old tail
     lea rax, [line_buf]
-    mov ecx, [line_len]
-    mov byte [rax + rcx], 0
+    mov rcx, rdi
+    sub rcx, rax
+    mov [line_cursor], ecx
+    lea rsi, [tab_tail]
+    mov ecx, [tab_tail_len]
+    rep movsb
+    mov byte [rdi], 0
+    lea rax, [line_buf]
+    sub rdi, rax
+    mov [line_len], edi
+    mov byte [tab_found], 1
     call redraw_line
+    jmp .tc_done
+.tc_stop:
+    mov byte [tab_active], 0
 .tc_done:
-    add rsp, 40
+    add rsp, 48
+    pop r14
     pop r13
     pop r12
+    pop rdi
+    pop rsi
     pop rbx
     pop rbp
     ret
@@ -1382,12 +1926,38 @@ handler_cls:
     leave
     ret
 
+; handler_exit - "exit", "exit N" and "exit /b N" end the shell with status N
 handler_exit:
     push rbp
     mov rbp, rsp
-    sub rsp, 32
-    call restore_console_mode
-    xor ecx, ecx
+    push rbx
+    sub rsp, 40
+    xor ebx, ebx
+    test rcx, rcx
+    jz .hx_go
+    call skip_spaces
+    mov rcx, rax
+    cmp byte [rcx], '/'
+    jne .hx_num
+    movzx eax, byte [rcx + 1]
+    or al, 0x20
+    cmp al, 'b'
+    jne .hx_go
+    add rcx, 2
+    call skip_spaces
+    mov rcx, rax
+.hx_num:
+    movzx eax, byte [rcx]
+    sub eax, '0'
+    cmp eax, 9
+    ja .hx_go
+    imul ebx, ebx, 10
+    add ebx, eax
+    inc rcx
+    jmp .hx_num
+.hx_go:
+    call restore_console_state
+    mov ecx, ebx
     call ExitProcess
 
 handler_ver:
@@ -1471,32 +2041,48 @@ handler_title:
     leave
     ret
 
+; handler_color - "color" resets, "color 0A" sets background 0 / foreground A,
+; "color A" sets the foreground only. The choice lasts: the prompt keeps it.
 handler_color:
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 40
+    push rsi
+    sub rsp, 48
+    mov ebx, COLOR_DEFAULT
     test rcx, rcx
-    jz .hco_done
-    mov rbx, rcx
-.hco_skip:
-    cmp byte [rbx], ' '
-    jne .hco_parse
-    inc rbx
-    jmp .hco_skip
-.hco_parse:
-    movzx eax, byte [rbx]
+    jz .hco_apply
+    cmp byte [rcx], 0
+    je .hco_apply
+    mov rsi, rcx
+    movzx eax, byte [rsi]
     call hex_to_int
-    shl eax, 4
-    mov [rsp + 32], eax
-    movzx eax, byte [rbx + 1]
+    cmp eax, -1
+    je .hco_bad
+    mov ebx, eax
+    movzx eax, byte [rsi + 1]
+    test al, al
+    jz .hco_apply
     call hex_to_int
-    or eax, [rsp + 32]
+    cmp eax, -1
+    je .hco_bad
+    shl ebx, 4
+    or ebx, eax
+    cmp byte [rsi + 2], 0
+    jne .hco_bad
+.hco_apply:
+    mov [user_attr], bl
     mov rcx, [hStdOut]
-    mov edx, eax
+    mov edx, ebx
     call SetConsoleTextAttribute
+    jmp .hco_done
+.hco_bad:
+    lea rcx, [err_color_msg]
+    mov edx, err_color_len
+    call print_string_len
 .hco_done:
-    add rsp, 40
+    add rsp, 48
+    pop rsi
     pop rbx
     pop rbp
     ret
@@ -1510,6 +2096,24 @@ handler_cd:
     mov rbx, rcx
     test rbx, rbx
     jz .hcd_show
+    ; "cd /d X": SetCurrentDirectory switches drives anyway
+    cmp byte [rbx], '/'
+    jne .hcd_nosw
+    movzx eax, byte [rbx + 1]
+    or al, 0x20
+    cmp al, 'd'
+    jne .hcd_nosw
+    cmp byte [rbx + 2], 0
+    je .hcd_show
+    cmp byte [rbx + 2], ' '
+    jne .hcd_nosw
+    lea rcx, [rbx + 2]
+    call skip_spaces
+    mov rbx, rax
+.hcd_nosw:
+    mov rcx, rbx
+    call unquote_arg
+    mov rbx, rax
     cmp byte [rbx], 0
     je .hcd_show
     ; cd -
@@ -1543,13 +2147,24 @@ handler_cd:
     jmp .hcd_done
 .hcd_change:
     mov ecx, MAX_PATH_BUF
-    lea rdx, [prev_dir_buf]
+    lea rdx, [file_path_buf]
     call GetCurrentDirectoryA
-    mov byte [has_prev_dir], 1
+    mov [rsp + 32], eax
     mov rcx, rbx
     call SetCurrentDirectoryA
     test eax, eax
-    jnz .hcd_done
+    jz .hcd_err
+    ; Only a change that worked becomes the "previous" directory
+    mov eax, [rsp + 32]
+    test eax, eax
+    jz .hcd_done
+    cmp eax, MAX_PATH_BUF
+    jae .hcd_done
+    lea rcx, [prev_dir_buf]
+    lea rdx, [file_path_buf]
+    call str_copy
+    mov byte [has_prev_dir], 1
+    jmp .hcd_done
 .hcd_err:
     lea rcx, [err_cd_msg]
     mov edx, err_cd_len
@@ -1600,6 +2215,8 @@ handler_whoami:
     ret
 
 ; handler_dir - List directory contents
+; "dir", "dir folder", "dir *.txt" and "dir file" are done here; anything
+; with a /switch is handed to cmd.exe, which knows what they mean
 handler_dir:
     push rbp
     mov rbp, rsp
@@ -1612,15 +2229,55 @@ handler_dir:
     jz .hd_noargs
     cmp byte [rcx], 0
     je .hd_noargs
-    mov rdx, rcx
-    mov rcx, rdi
-    call str_copy
-    lea rcx, [find_pattern]
+    mov rsi, rcx
+    mov edx, 4
+    call args_need_cmd
+    test eax, eax
+    jnz .hd_forward
+    mov rcx, rsi
+    call unquote_arg
+    mov rsi, rax
+    cmp byte [rsi], 0
+    je .hd_noargs
+    mov rcx, rsi
     call str_len
-    lea rcx, [find_pattern]
-    mov byte [rcx + rax], 92    ; backslash
-    mov byte [rcx + rax + 1], '*'
-    mov byte [rcx + rax + 2], 0
+    cmp eax, MAX_PATH_BUF - 4
+    ja .hd_toolong
+    mov rcx, rdi
+    mov rdx, rsi
+    call str_copy
+    ; A wildcard is a pattern already
+    mov rcx, rdi
+.hd_wild:
+    mov al, [rcx]
+    test al, al
+    jz .hd_nowild
+    cmp al, '*'
+    je .hd_search
+    cmp al, '?'
+    je .hd_search
+    inc rcx
+    jmp .hd_wild
+.hd_nowild:
+    ; A folder is listed by its contents; a file or a name that does not
+    ; exist is searched for as typed
+    mov rcx, rdi
+    call GetFileAttributesA
+    cmp eax, GFA_INVALID
+    je .hd_search
+    test eax, FILE_ATTRIBUTE_DIRECTORY
+    jz .hd_search
+    mov rcx, rdi
+    call str_len
+    cmp byte [rdi + rax - 1], 92
+    je .hd_star
+    cmp byte [rdi + rax - 1], '/'
+    je .hd_star
+    mov byte [rdi + rax], 92    ; backslash
+    inc eax
+.hd_star:
+    mov byte [rdi + rax], '*'
+    mov byte [rdi + rax + 1], 0
     jmp .hd_search
 .hd_noargs:
     mov byte [rdi], '*'
@@ -1629,9 +2286,38 @@ handler_dir:
     call print_newline
     lea rcx, [dir_header]
     call print_cstring
+    ; Header: the folder that is being listed
+    mov rcx, rdi
+    mov edx, MAX_PATH_BUF
+    lea r8, [path_buf]
+    xor r9d, r9d
+    call GetFullPathNameA
+    test eax, eax
+    jz .hd_hdr_cwd
+    cmp eax, MAX_PATH_BUF
+    jae .hd_hdr_cwd
+    lea rcx, [path_buf]
+    mov edx, eax
+.hd_cut:
+    test edx, edx
+    jz .hd_hdr_print
+    dec edx
+    cmp byte [rcx + rdx], 92
+    jne .hd_cut
+    cmp edx, 2
+    jne .hd_cut_at
+    cmp byte [rcx + 1], ':'
+    jne .hd_cut_at
+    mov byte [rcx + rdx + 1], 0 ; keep the backslash of "C:\"
+    jmp .hd_hdr_print
+.hd_cut_at:
+    mov byte [rcx + rdx], 0
+    jmp .hd_hdr_print
+.hd_hdr_cwd:
     mov ecx, MAX_PATH_BUF
     lea rdx, [path_buf]
     call GetCurrentDirectoryA
+.hd_hdr_print:
     lea rcx, [path_buf]
     call print_cstring
     call print_newline
@@ -1640,7 +2326,7 @@ handler_dir:
     lea rdx, [find_data]
     call FindFirstFileA
     cmp rax, INVALID_HANDLE_VALUE
-    je .hd_done
+    je .hd_notfound
     mov rbx, rax
 .hd_entry:
     lea rcx, [find_data + FD_FILENAME]
@@ -1661,6 +2347,9 @@ handler_dir:
     jmp .hd_name
 .hd_file:
     mov eax, [find_data + FD_SIZE_LOW]
+    mov edx, [find_data + FD_SIZE_HIGH]
+    shl rdx, 32
+    or rax, rdx
     call print_number_9pad
     lea rcx, [str_space]
     call print_cstring
@@ -1676,8 +2365,20 @@ handler_dir:
     jnz .hd_entry
     mov rcx, rbx
     call FindClose
+    jmp .hd_done
+.hd_notfound:
+    call print_last_error
 .hd_done:
     call print_newline
+    jmp .hd_ret
+.hd_forward:
+    call execute_external
+    jmp .hd_ret
+.hd_toolong:
+    lea rcx, [err_toolong_msg]
+    mov edx, err_toolong_len
+    call print_string_len
+.hd_ret:
     add rsp, 56
     pop rdi
     pop rsi
@@ -1695,8 +2396,10 @@ handler_type:
     jz .hty_noargs
     cmp byte [rcx], 0
     je .hty_noargs
+    call unquote_arg
+    mov rcx, rax
     mov edx, GENERIC_READ
-    mov r8d, FILE_SHARE_READ
+    mov r8d, FILE_SHARE_READ | FILE_SHARE_WRITE
     xor r9d, r9d
     mov dword [rsp + 32], OPEN_EXISTING
     mov dword [rsp + 40], FILE_ATTRIBUTE_NORMAL
@@ -1743,11 +2446,68 @@ handler_type:
 handler_mkdir:
     push rbp
     mov rbp, rsp
-    sub rsp, 32
+    push rbx
+    push rsi
+    sub rsp, 48
     test rcx, rcx
     jz .hmk_err
     cmp byte [rcx], 0
     je .hmk_err
+    call unquote_arg
+    mov rbx, rax
+    cmp byte [rbx], 0
+    je .hmk_err
+    ; Drop trailing separators, then create each folder on the way first
+    mov rsi, rbx
+.hmk_end:
+    cmp byte [rsi], 0
+    je .hmk_trim
+    inc rsi
+    jmp .hmk_end
+.hmk_trim:
+    cmp rsi, rbx
+    jbe .hmk_walk_init
+    mov al, [rsi - 1]
+    cmp al, 92
+    je .hmk_cut
+    cmp al, '/'
+    jne .hmk_walk_init
+.hmk_cut:
+    dec rsi
+    mov byte [rsi], 0
+    jmp .hmk_trim
+.hmk_walk_init:
+    mov rsi, rbx
+.hmk_walk:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .hmk_last
+    cmp al, 92
+    je .hmk_sep
+    cmp al, '/'
+    jne .hmk_next
+.hmk_sep:
+    cmp rsi, rbx
+    je .hmk_next
+    movzx ecx, byte [rsi - 1]
+    cmp cl, 92
+    je .hmk_next
+    cmp cl, '/'
+    je .hmk_next
+    cmp cl, ':'
+    je .hmk_next
+    mov [rsp + 32], al
+    mov byte [rsi], 0
+    mov rcx, rbx
+    xor edx, edx
+    call CreateDirectoryA       ; fails when it exists already; that is fine
+    movzx eax, byte [rsp + 32]
+    mov [rsi], al
+.hmk_next:
+    inc rsi
+    jmp .hmk_walk
+.hmk_last:
+    mov rcx, rbx
     xor edx, edx
     call CreateDirectoryA
     test eax, eax
@@ -1759,7 +2519,10 @@ handler_mkdir:
     mov edx, err_args_len
     call print_string_len
 .hmk_done:
-    leave
+    add rsp, 48
+    pop rsi
+    pop rbx
+    pop rbp
     ret
 
 handler_rmdir:
@@ -1770,6 +2533,8 @@ handler_rmdir:
     jz .hrd_err
     cmp byte [rcx], 0
     je .hrd_err
+    call unquote_arg
+    mov rcx, rax
     call RemoveDirectoryA
     test eax, eax
     jnz .hrd_done
@@ -1786,49 +2551,111 @@ handler_rmdir:
 handler_del:
     push rbp
     mov rbp, rsp
-    sub rsp, 32
+    push rbx
+    sub rsp, 40
     test rcx, rcx
     jz .hdl_err
     cmp byte [rcx], 0
     je .hdl_err
+    mov rbx, rcx
+    ; Wildcards and /switches are cmd.exe's del
+    mov edx, 5
+    call args_need_cmd
+    test eax, eax
+    jnz .hdl_forward
+    mov rcx, rbx
+    call unquote_arg
+    mov rcx, rax
     call DeleteFileA
     test eax, eax
     jnz .hdl_done
     call print_last_error
+    jmp .hdl_done
+.hdl_forward:
+    call execute_external
     jmp .hdl_done
 .hdl_err:
     lea rcx, [err_args_msg]
     mov edx, err_args_len
     call print_string_len
 .hdl_done:
-    leave
+    add rsp, 40
+    pop rbx
+    pop rbp
     ret
 
+; handler_copy - copy [/y] <source> <destination>
+; An existing destination is kept unless /y is given. A folder as the
+; destination receives the file under its own name. Wildcards, "a+b" joins
+; and other switches are left to cmd.exe.
 handler_copy:
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 40
+    push rsi
+    push rdi
+    sub rsp, 56
     test rcx, rcx
     jz .hcp_err
+    mov rsi, rcx
+    xor edi, edi                ; 1 once /y was given
+    cmp byte [rsi], '/'
+    jne .hcp_args
+    movzx eax, byte [rsi + 1]
+    or al, 0x20
+    cmp al, 'y'
+    jne .hcp_args
+    cmp byte [rsi + 2], ' '
+    jne .hcp_args
+    mov edi, 1
+    lea rcx, [rsi + 2]
+    call skip_spaces
+    mov rsi, rax
+.hcp_args:
+    mov rcx, rsi
+    mov edx, 7
+    call args_need_cmd
+    test eax, eax
+    jnz .hcp_forward
+    mov rcx, rsi
     call parse_two_args
     test rax, rax
     jz .hcp_err
     test rdx, rdx
     jz .hcp_err
+    mov rbx, rax
     mov rcx, rax
-    mov r8d, 0
+    call resolve_target
+    mov rdx, rax
+    mov rcx, rbx
+    mov r8d, 1
+    sub r8d, edi                ; fail if it exists, unless /y
     call CopyFileA
     test eax, eax
     jnz .hcp_done
+    call GetLastError
+    mov ebx, eax
     call print_last_error
+    cmp ebx, 80                 ; ERROR_FILE_EXISTS
+    je .hcp_hint
+    cmp ebx, 183                ; ERROR_ALREADY_EXISTS
+    jne .hcp_done
+.hcp_hint:
+    lea rcx, [err_exists_hint]
+    mov edx, err_exists_len
+    call print_string_len
+    jmp .hcp_done
+.hcp_forward:
+    call execute_external
     jmp .hcp_done
 .hcp_err:
     lea rcx, [err_args_msg]
     mov edx, err_args_len
     call print_string_len
 .hcp_done:
-    add rsp, 40
+    add rsp, 56
+    pop rdi
+    pop rsi
     pop rbx
     pop rbp
     ret
@@ -1837,26 +2664,116 @@ handler_move:
 handler_rename:
     push rbp
     mov rbp, rsp
-    sub rsp, 32
+    push rbx
+    sub rsp, 40
     test rcx, rcx
     jz .hmv_err
+    mov rbx, rcx
+    mov edx, 5
+    call args_need_cmd
+    test eax, eax
+    jnz .hmv_forward
+    mov rcx, rbx
     call parse_two_args
     test rax, rax
     jz .hmv_err
     test rdx, rdx
     jz .hmv_err
+    mov rbx, rax
     mov rcx, rax
+    call resolve_target
+    mov rdx, rax
+    mov rcx, rbx
     call MoveFileA
     test eax, eax
     jnz .hmv_done
     call print_last_error
+    jmp .hmv_done
+.hmv_forward:
+    call execute_external
     jmp .hmv_done
 .hmv_err:
     lea rcx, [err_args_msg]
     mov edx, err_args_len
     call print_string_len
 .hmv_done:
-    leave
+    add rsp, 40
+    pop rbx
+    pop rbp
+    ret
+
+; resolve_target - rcx = source, rdx = destination. When the destination is
+; an existing folder the file goes into it under its own name.
+; Returns rax = the path to hand to the file API.
+resolve_target:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push rsi
+    sub rsp, 48
+    mov rbx, rcx
+    mov rsi, rdx
+    mov rcx, rdx
+    call GetFileAttributesA
+    cmp eax, GFA_INVALID
+    je .rt_asis
+    test eax, FILE_ATTRIBUTE_DIRECTORY
+    jz .rt_asis
+    ; Base name of the source: what follows the last \, / or :
+    mov rcx, rbx
+    mov rdx, rbx
+.rt_base:
+    movzx eax, byte [rcx]
+    test al, al
+    jz .rt_based
+    inc rcx
+    cmp al, 92
+    je .rt_sep
+    cmp al, '/'
+    je .rt_sep
+    cmp al, ':'
+    jne .rt_base
+.rt_sep:
+    mov rdx, rcx
+    jmp .rt_base
+.rt_based:
+    mov rbx, rdx
+    mov rcx, rsi
+    call str_len
+    mov [rsp + 32], eax
+    mov rcx, rbx
+    call str_len
+    add eax, [rsp + 32]
+    add eax, 2
+    cmp eax, MAX_PATH_BUF
+    ja .rt_asis
+    lea rcx, [dst_path_buf]
+    mov rdx, rsi
+    call str_copy
+    mov eax, [rsp + 32]
+    lea rcx, [dst_path_buf]
+    add rcx, rax
+    movzx eax, byte [rcx - 1]
+    cmp al, 92
+    je .rt_join
+    cmp al, '/'
+    je .rt_join
+    cmp al, ':'
+    je .rt_join
+    mov byte [rcx], 92
+    inc rcx
+.rt_join:
+    mov rdx, rbx
+    call str_copy
+    lea rax, [dst_path_buf]
+    jmp .rt_ret
+.rt_asis:
+    mov rax, rsi
+.rt_ret:
+    add rsp, 48
+    pop rsi
+    pop rbx
+    pop rbp
     ret
 
 ; handler_set - View/set environment variables
@@ -1919,9 +2836,13 @@ handler_set:
 .hs_list_loop:
     cmp byte [rsi], 0
     je .hs_list_end
+    ; "=C:=C:\dir" entries keep the per-drive directories; cmd.exe hides them
+    cmp byte [rsi], '='
+    je .hs_list_skip
     mov rcx, rsi
     call print_cstring
     call print_newline
+.hs_list_skip:
     mov rcx, rsi
     call str_len
     lea rsi, [rsi + rax + 1]
@@ -1945,7 +2866,8 @@ handler_pushd:
     jz .hpd_err
     cmp byte [rcx], 0
     je .hpd_err
-    mov rbx, rcx
+    call unquote_arg
+    mov rbx, rax
     cmp dword [dir_stack_top], DIR_STACK_COUNT
     jge .hpd_full
     mov eax, [dir_stack_top]
@@ -2030,8 +2952,15 @@ handler_alias:
 .hal_set:
     mov byte [rsi], 0
     inc rsi
-    cmp dword [alias_count], ALIAS_COUNT
-    jge .hal_full
+    ; Name and command have to fit their table slots
+    mov rcx, rbx
+    call str_len
+    cmp eax, ALIAS_NAME_SIZE - 1
+    ja .hal_toolong
+    mov rcx, rsi
+    call str_len
+    cmp eax, ALIAS_CMD_SIZE - 1
+    ja .hal_toolong
     ; Check if alias already exists, update it
     push rsi
     lea r8, [alias_table]
@@ -2059,6 +2988,9 @@ handler_alias:
     jmp .hal_done
 .hal_add_new:
     pop rsi
+    ; A full table can still update an alias, but not take a new one
+    cmp dword [alias_count], ALIAS_COUNT
+    jge .hal_full
     mov eax, [alias_count]
     imul eax, ALIAS_ENTRY_SIZE
     lea rcx, [alias_table]
@@ -2097,6 +3029,11 @@ handler_alias:
     lea rcx, [err_alias_full]
     mov edx, err_alias_f_len
     call print_string_len
+    jmp .hal_done
+.hal_toolong:
+    lea rcx, [err_toolong_msg]
+    mov edx, err_toolong_len
+    call print_string_len
 .hal_done:
     add rsp, 48
     pop rsi
@@ -2105,7 +3042,7 @@ handler_alias:
     ret
 
 ; ============================================================================
-; execute_external - Run command via cmd.exe /c with redirection support
+; execute_external - Run command via cmd.exe /s /c with redirection support
 ; ============================================================================
 execute_external:
     push rbp
@@ -2114,7 +3051,8 @@ execute_external:
     push rsi
     push rdi
     sub rsp, 120
-    ; Build "cmd.exe /c <input>"
+    ; Build 'cmd.exe /s /c "<input>"': with /s, cmd strips exactly the outer
+    ; pair of quotes, so quotes inside the command line survive
     lea rdi, [cmd_line_buf]
     lea rsi, [cmd_prefix]
 .ee_pre:
@@ -2127,9 +3065,36 @@ execute_external:
     lea rsi, [input_buf]
 .ee_inp_loop:
     lodsb
+    test al, al
+    jz .ee_inp_done
+    stosb
+    jmp .ee_inp_loop
+.ee_inp_done:
+    mov al, '"'
+    stosb
+    xor al, al
+    stosb
+    ; Run the shell from the system directory, not by searching the
+    ; application and current directories for a cmd.exe
+    xor ebx, ebx
+    lea rcx, [cmd_exe_path]
+    mov edx, MAX_PATH_BUF - 16
+    call GetSystemDirectoryA
+    test eax, eax
+    jz .ee_no_sysdir
+    cmp eax, MAX_PATH_BUF - 16
+    jae .ee_no_sysdir
+    lea rdi, [cmd_exe_path]
+    mov ecx, eax
+    add rdi, rcx
+    lea rsi, [cmd_exe_name]
+.ee_sys:
+    lodsb
     stosb
     test al, al
-    jnz .ee_inp_loop
+    jnz .ee_sys
+    lea rbx, [cmd_exe_path]
+.ee_no_sysdir:
     ; Zero STARTUPINFO
     lea rdi, [startup_info]
     mov ecx, 104
@@ -2164,8 +3129,12 @@ execute_external:
     mov ecx, 24
     xor al, al
     rep stosb
+    ; The child gets the console the way we found it (line input, echo),
+    ; and Ctrl+C belongs to it while it runs
+    call restore_console_mode
+    mov byte [child_running], 1
     ; CreateProcessA
-    xor ecx, ecx
+    mov rcx, rbx
     lea rdx, [cmd_line_buf]
     xor r8d, r8d
     xor r9d, r9d
@@ -2196,12 +3165,15 @@ execute_external:
     call CloseHandle
     mov rcx, [proc_info + 8]
     call CloseHandle
-    jmp .ee_done
+    jmp .ee_back
 .ee_error:
     lea rcx, [err_exec_msg]
     mov edx, err_exec_len
     call print_string_len
-.ee_done:
+.ee_back:
+    mov byte [child_running], 0
+    mov byte [ctrl_c_flag], 0   ; a Ctrl+C meant for the child is not ours
+    call reapply_raw_mode
     add rsp, 120
     pop rdi
     pop rsi
@@ -2330,22 +3302,22 @@ str_icompare_n:
     mov eax, 1
     ret
 
-; hex_to_int - Convert hex char in al to 0-15
+; hex_to_int - Convert hex char in al to 0-15, or eax = -1 when it is not one
 hex_to_int:
     cmp al, '0'
-    jb .hti_zero
+    jb .hti_bad
     cmp al, '9'
     jbe .hti_digit
-    cmp al, 'a'
-    jb .hti_upper
-    cmp al, 'f'
-    jbe .hti_lower
     cmp al, 'A'
-    jb .hti_zero
+    jb .hti_bad
     cmp al, 'F'
     jbe .hti_upper
-.hti_zero:
-    xor eax, eax
+    cmp al, 'a'
+    jb .hti_bad
+    cmp al, 'f'
+    jbe .hti_lower
+.hti_bad:
+    mov eax, -1
     ret
 .hti_digit:
     sub al, '0'
@@ -2416,39 +3388,37 @@ print_number_2digit:
     pop rbp
     ret
 
-; print_number_9pad - Print eax right-aligned in 9-char field
+; print_number_9pad - Print rax right-aligned in a 9-char field
+; (a bigger number simply takes more room)
 print_number_9pad:
     push rbp
     mov rbp, rsp
     push rbx
     push rdi
     sub rsp, 32
-    lea rdi, [num_buf]
-    ; Fill with spaces
-    mov ecx, 9
-.np9_fill:
-    mov byte [rdi + rcx - 1], ' '
-    dec ecx
-    jnz .np9_fill
-    mov byte [rdi + 9], 0
-    ; Convert right to left
-    lea rdi, [num_buf + 8]
+    lea rdi, [num64_buf + 24]
+    mov byte [rdi], 0
     mov ebx, 10
-    test eax, eax
-    jnz .np9_loop
-    mov byte [rdi], '0'
-    jmp .np9_print
 .np9_loop:
-    test eax, eax
-    jz .np9_print
     xor edx, edx
-    div ebx
+    div rbx
     add dl, '0'
-    mov [rdi], dl
     dec rdi
-    jmp .np9_loop
+    mov [rdi], dl
+    test rax, rax
+    jnz .np9_loop
+    lea rax, [num64_buf + 24]
+    sub rax, rdi                ; digits
+    mov ecx, 9
+    sub ecx, eax
+    jle .np9_print
+.np9_pad:
+    dec rdi
+    mov byte [rdi], ' '
+    dec ecx
+    jnz .np9_pad
 .np9_print:
-    lea rcx, [num_buf]
+    mov rcx, rdi
     call print_cstring
     add rsp, 32
     pop rdi
@@ -2527,12 +3497,86 @@ skip_spaces:
     mov rax, rcx
     ret
 
-; parse_two_args - Split string at first space (modifies string in-place)
+; unquote_arg - rcx = argument text. Returns rax = the text without one
+; surrounding pair of double quotes (the closing quote is cut off in place).
+unquote_arg:
+    mov rax, rcx
+    cmp byte [rcx], '"'
+    jne .ua_done
+    inc rax
+    mov rdx, rax
+.ua_end:
+    cmp byte [rdx], 0
+    je .ua_close
+    inc rdx
+    jmp .ua_end
+.ua_close:
+    cmp rdx, rax
+    je .ua_done
+    cmp byte [rdx - 1], '"'
+    jne .ua_done
+    mov byte [rdx - 1], 0
+.ua_done:
+    ret
+
+; args_need_cmd - eax = 1 when the arguments use something the built-in
+; commands do not do. rcx = text, edx = what to look for:
+; 1 wildcards (* ?), 2 a '+' join, 4 a /switch (a word starting with '/')
+args_need_cmd:
+    mov r8b, ' '                ; previous character
+.an_loop:
+    movzx eax, byte [rcx]
+    test al, al
+    jz .an_no
+    cmp al, '*'
+    je .an_wild
+    cmp al, '?'
+    je .an_wild
+    cmp al, '+'
+    je .an_plus
+    cmp al, '/'
+    jne .an_next
+    test edx, 4
+    jz .an_next
+    cmp r8b, ' '
+    je .an_yes
+    jmp .an_next
+.an_wild:
+    test edx, 1
+    jnz .an_yes
+    jmp .an_next
+.an_plus:
+    test edx, 2
+    jnz .an_yes
+.an_next:
+    mov r8b, al
+    inc rcx
+    jmp .an_loop
+.an_yes:
+    mov eax, 1
+    ret
+.an_no:
+    xor eax, eax
+    ret
+
+; parse_two_args - Split "src dst" in place; either may be in double quotes
 ; rcx = input, Returns: rax = arg1, rdx = arg2 (or both NULL)
 parse_two_args:
+    sub rsp, 40
     mov rax, rcx
     test rax, rax
     jz .pta_fail
+    cmp byte [rcx], '"'
+    jne .pta_find
+    inc rcx
+    mov rax, rcx
+.pta_qfind:
+    cmp byte [rcx], 0
+    je .pta_fail
+    cmp byte [rcx], '"'
+    je .pta_split
+    inc rcx
+    jmp .pta_qfind
 .pta_find:
     cmp byte [rcx], 0
     je .pta_fail
@@ -2551,11 +3595,16 @@ parse_two_args:
 .pta_check:
     cmp byte [rcx], 0
     je .pta_fail
-    mov rdx, rcx
+    mov r9, rax
+    call unquote_arg
+    mov rdx, rax
+    mov rax, r9
+    add rsp, 40
     ret
 .pta_fail:
     xor eax, eax
     xor edx, edx
+    add rsp, 40
     ret
 
 ; print_last_error - Print descriptive error from GetLastError + FormatMessageA
@@ -2590,12 +3639,18 @@ run_autoexec:
     mov rbp, rsp
     push rbx
     push rsi
-    sub rsp, 64
+    push rdi
+    sub rsp, 72
     ; Get module path
     xor ecx, ecx
     lea rdx, [module_path]
     mov r8d, MAX_PATH_BUF
     call GetModuleFileNameA
+    ; Nothing sensible to append to when the path did not fit
+    test eax, eax
+    jz .ra_done
+    cmp eax, MAX_PATH_BUF - 1
+    jae .ra_done
     ; Strip filename
     lea rcx, [module_path]
     call str_len
@@ -2636,19 +3691,21 @@ run_autoexec:
     mov rbx, rax
     ; Read entire file
     mov rcx, rbx
-    lea rdx, [read_buffer]
+    ; Own buffer: a command in the file such as type uses read_buffer
+    lea rdx, [autoexec_buf]
     mov r8d, READ_BUF_SIZE - 1
     lea r9, [bytes_rw]
     mov qword [rsp + 32], 0
+    mov dword [bytes_rw], 0
     call ReadFile
     mov rcx, rbx
     call CloseHandle
     ; Null-terminate
     mov eax, [bytes_rw]
-    lea rcx, [read_buffer]
+    lea rcx, [autoexec_buf]
     mov byte [rcx + rax], 0
     ; Process line by line
-    lea rsi, [read_buffer]
+    lea rsi, [autoexec_buf]
 .ra_line:
     cmp byte [rsi], 0
     je .ra_done
@@ -2663,8 +3720,12 @@ run_autoexec:
     je .ra_skip_cr
     cmp al, 10
     je .ra_exec
+    ; A longer line is cut to what input_buf holds
+    cmp ecx, MAX_INPUT - 1
+    jae .ra_cut
     mov [rdi + rcx], al
     inc ecx
+.ra_cut:
     inc rsi
     jmp .ra_cpy
 .ra_skip_cr:
@@ -2681,7 +3742,8 @@ run_autoexec:
     call dispatch_command
     jmp .ra_line
 .ra_done:
-    add rsp, 64
+    add rsp, 72
+    pop rdi
     pop rsi
     pop rbx
     pop rbp
