@@ -99,10 +99,19 @@ a terminal left in a broken state, job control that did not exist, and many smal
   programs ran, `%VAR%` overflow, history, line wrapping, `autoexec.txt` corruption, `cmd.exe`
   quoting and Ctrl+C handling.
 - Documentation numbers (binary size, history size, line counts) match the build.
+- `$(...)` and backticks no longer capture terminal escape sequences when the shell runs on a
+  terminal; newlines in an assignment are kept; a builtin as a pipeline stage no longer hangs;
+  `ls` takes quoted paths and Tab escapes blanks; aliases may hold `;`, `&&` and `||`; a builtin
+  with a trailing `&` runs in the background.
+- `unset` takes several names; `export` and `set` reject names that are not identifiers; `fg` and
+  `bg` without an argument use the most recent job.
+- `sandbox`, `trace` and `bench` honour the shell's `>`, `>>` and `<` redirections.
 
 ### Known limits
 - `case`/`esac` and loops with a redirected or piped `done` still run in `/bin/sh` and lose
   assignments and `cd`. `local`, `read`, `${x:-d}`, here-docs and `$((x=1))` are not supported.
+- `"$@"` is one word, `. file` is not supported, builtins do not expand globs, and a line longer
+  than 511 bytes after expansion is an error (for example `cd ~` with a very long `HOME`).
 - `sandbox` cannot stop `kill()` of same-user processes on kernels older than 6.12 and cannot
   restrict reading files; see `sandbox` for the full list.
 - Windows Unicode input and file names are not supported yet.
