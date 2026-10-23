@@ -118,6 +118,9 @@ o = lines_of(['set X=a', 'echo $X~/y', 'echo ~/y', 'echo "~"', 'echo a~'], cwd=c
 T.check("tilde after a variable is literal", o[0] == 'a~/y', o)
 T.check("tilde at word start is HOME", o[1] == c + '/y', o)
 T.check("tilde in double quotes is literal", o[2] == '~' and o[3] == 'a~', o)
+o = lines_of(["x=''", 'echo ~$x', 'echo $x~/z', 'echo a~b', 'x=/tmp; echo ~$x'], cwd=c, home=c)
+T.check("tilde next to an empty value stays literal", o[:3] == ['~', '~/z', 'a~b'], o)
+T.check("tilde before a value stays literal", o[3] == '~/tmp', o)
 
 c = T.tmpdir()
 long = 'A' * 600
