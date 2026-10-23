@@ -200,6 +200,28 @@ out, err, st = sh('del huge\necho st=$?\nexit\n', home=h, cwd=d)
 T.check('del refuses a file over the trash limit', os.path.exists(hugef) and 'st=1' in out, out + err)
 os.unlink(hugef)
 
+# size cap: two 300 MiB files do not fit together, the older one is dropped
+for n in ('big1', 'big2'):
+    with open(d + '/' + n, 'wb') as f:
+        f.truncate(300 * 1024 * 1024)
+sh('del big1\ndel big2\nexit\n', home=h, cwd=d)
+tf = trash_files(h)
+T.check('trash keeps the newest within the size cap', len(tf) == 1 and tf[0].endswith('.big2'), tf)
+
+# age cap: an entry older than 30 days goes when the next one is added
+import struct
+h5 = T.tmpdir()
+open(d + '/oldie', 'w').write('o\n')
+open(d + '/newer', 'w').write('n\n')
+sh('del oldie\nexit\n', home=h5, cwd=d)
+jp = h5 + '/.asm_trash/.journal'
+buf = bytearray(open(jp, 'rb').read())
+struct.pack_into('<Q', buf, 16, int(time.time()) - 31 * 86400)
+open(jp, 'wb').write(buf)
+sh('del newer\nexit\n', home=h5, cwd=d)
+tf = trash_files(h5)
+T.check('trash drops entries older than 30 days', len(tf) == 1 and tf[0].endswith('.newer'), tf)
+
 # ---------------------------------------------------------------- bench
 out, err, st = sh('bench bench -n 2 true\necho STILL-VISIBLE\nexit\n')
 T.check('nested bench keeps stdout', 'STILL-VISIBLE' in out, out)
