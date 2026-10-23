@@ -17,7 +17,7 @@ A terminal/shell written **entirely in x86-64 assembly** (NASM) for Linux and Wi
 
 ## Why
 
-Because modern shells are fat. `bash` ships megabytes of C and a libc behind it. This project proves you can build a **real, usable shell** with history, tab completion, reverse search, job control, compound commands, aliases, theming and syntax highlighting in **pure assembly**, statically linked with no libc, in a binary of about 170 KB (Linux).
+Because modern shells are fat. `bash` ships megabytes of C and a libc behind it. This project proves you can build a **real, usable shell** with history, tab completion, reverse search, job control, compound commands, aliases, theming and syntax highlighting in **pure assembly**, statically linked with no libc, in a binary of about 250 KB (Linux, with symbols).
 
 It is part serious tool, part love letter to the x86-64 ISA and the Linux kernel syscall interface.
 
@@ -26,40 +26,50 @@ It is part serious tool, part love letter to the x86-64 ISA and the Linux kernel
 ## Features
 
 ### Shell
-- **ASH (Assembly Shell)** executor: pipelines, quotes, escapes and `<` `>` `>>` `2>` `2>>` `2>&1` run natively, no `/bin/sh` process.
-- **ASH script engine**: `if`/`elif`/`else`, `while`, `until`, `for`, `break`/`continue`, functions, `test` / `[ ]`, `$?`, `$$`, `$((...))`, `NAME=value`, multi-line blocks. Syntax ASH does not handle yet (for example `case`, a loop piped into another command, `$(...)`, here-docs, `&`) is handed to `/bin/sh`, which therefore has to be installed.
+- **ASH (Assembly Shell)** executor: pipelines, quotes, escapes, `$(...)` and backticks run natively, no `/bin/sh` process. Builtins (`history`, `set`, `alias`, ...) work in pipelines and in `$(...)`.
+- **ASH script engine**: `if`/`elif`/`else`, `while`, `until`, `for`, `break [N]`/`continue [N]`, functions (they accept pipes and redirections), `shift`, `test` / `[ ]` (with `-a`, `-o`, `!`, `( )`), `$?`, `$$`, `$((...))` (C-like operators with short-circuit `&&`/`||`, `?:`, hex and octal), `NAME=value`, multi-line blocks. Syntax ASH does not handle yet (`case`/`esac`, a loop piped into another command, here-docs) is handed to `/bin/sh`, which therefore has to be installed; such statements see shell functions, positional parameters and `$?` but cannot change your variables or directory. Not supported: `local`, `read`, `${x:-d}`, `${#x}`, `$((x=1))`.
 - Compound commands: `cmd1 ; cmd2`, `cmd1 && cmd2`, `cmd1 || cmd2`
-- I/O redirection: `>`, `>>`, `<`, `2>`, `2>>`, `2>&1`
+- I/O redirection: `>`, `>>`, `<`, `N>`, `N>>`, `N<`, `>&N`, `&>`, applied in the order written (`2>&1 >f` and `>f 2>&1` differ). A redirect to a file that cannot be opened stops the command with status 1.
 - Piping: `cmd1 | cmd2`
-- Environment variable expansion: `$VAR` and `${VAR}`
+- Environment variable expansion: `$VAR` and `${VAR}`. Values are data: a variable, loop variable or file name that contains `$(...)`, backticks, `|`, `>` or quotes is never run or re-parsed. Names are case-sensitive.
 - Wildcard expansion (`*`, `?`) for external commands (via `/bin/sh`)
+- Job control: each foreground command and background job has its own process group; Ctrl+C reaches only the foreground job, Ctrl+Z stops it, `fg`/`bg` resume it.
+- Exit statuses: the exit code, 128+signal for a killed command, 126 for found but not runnable, 127 for not found. Builtins set `$?` too, so `&&`, `||` and `if` work after a failing `cd`, `mkdir` or `copy`. Builtin error messages go to stderr.
 
 ### Line editor
 - Tab completion for files and directories (with cycling)
 - Command history: Up/Down arrows, 500-entry circular buffer
-- **Persistent history** saved to `~/.asm_history`
+- **Persistent history** saved to `~/.asm_history` (mode 0600; the newest 256 KiB are loaded and big files are trimmed; scripts and piped runs do not write it)
 - Reverse search with Ctrl+R (incremental)
 - Line editing: Backspace, Delete, Left/Right, Home/End
-- Shortcuts: Ctrl+L (clear), Ctrl+W (delete word), Ctrl+U (clear line)
+- Shortcuts: Ctrl+L (clear), Ctrl+W (delete word), Ctrl+U (clear line), Ctrl+D (exit on an empty line)
+- Long lines wrap and redraw correctly (and follow window resizes); UTF-8 can be typed and edited; bracketed paste never runs a pasted command
+- The terminal is restored on `SIGTERM`, `SIGHUP`, `SIGQUIT`, a crash or a vanished terminal. `NO_COLOR` and `TERM=dumb` turn colors off
 - Live command colors: the command word is teal when it is a builtin or on `PATH`, blue for help commands, gray when unknown, and red for commands that destroy data (`rm`, `dd`, `mkfs`, `curl ... | sh`, ...)
 
 ### Built-in commands (40+, Linux)
 | Category | Commands |
 |---|---|
 | Navigation | `cd`, `pwd`, `pushd`, `popd` |
-| Files | `ls [-la]`, `dir`, `cat`/`type`, `copy`, `move`/`rename`, `del`, `mkdir`, `rmdir`, `grep` |
-| Env | `set`, `whoami` |
+| Files | `ls [-la]` (sorted, symlinks shown, colors only on a terminal), `dir`, `cat`/`type`, `copy`, `move`/`rename`, `del`, `mkdir`, `rmdir`, `grep` |
+| Env | `set`, `export`, `unset`, `whoami` |
 | Display | `echo`, `cls`/`clear`, `color`, `title` |
 | System | `ver`, `about`, `update`, `date`, `time`, `uptime`, `free`, `calc`, `source`, `help`, `exit [N]`, `true`, `false`, `which`, `history`, `kill`, `test` / `[ ]` |
-| Tools | `bench`, `undo`, `trace`, `sandbox` (`del` keeps files in `~/.asm_trash` so `undo` can restore them) |
-| Customization | `alias`, `theme` |
-| Jobs | `<cmd> &`, `jobs`, `fg` |
+| Tools | `bench`, `undo`, `trash`, `trace`, `sandbox` (see [Safety tools](#safety-tools)) |
+| Customization | `alias`, `unalias`, `theme` |
+| Jobs | `<cmd> &`, `jobs`, `fg`, `bg`, `kill [-s NAME] PID\|%JOB`, `kill -l`, Ctrl+Z |
 
 Run `help` inside the shell for the full list with examples.
 
+### Safety tools
+- **Trash and undo**: `del`, `move` and `copy` keep what they would destroy in `~/.asm_trash` (unique names that keep the original name, plus a persistent journal), and `undo` reverses the last operation, also after a restart. `trash` lists the trash, `trash empty` empties it. It is capped at 512 MiB and 30 days. If the trash cannot be used these commands refuse; `-f` overrides. `copy` keeps permissions and refuses to copy a file onto itself.
+- **`sandbox [-w] [-n] [-b] [--] cmd`**: runs a command with Landlock and seccomp. Only `/tmp` (plus the current directory with `-w`, and `/dev/null`, `/dev/zero`, `/dev/tty`) is writable, and sockets (`-n` allows IPv4/IPv6), `io_uring`, `ptrace`, `TIOCSTI`, `chmod`/`chown`/xattr/`truncate` and mount or namespace calls are denied. It refuses to run (status 126) when Landlock or seccomp cannot be set up; `-b` runs anyway with what works. It does not stop reading files, and on kernels older than 6.12 it cannot stop `kill()` of your other processes. `sandbox` with no arguments prints the full list.
+- **`trace cmd`**: lists the programs started, files opened and network calls of a command, with names escaped and a count of hidden reads. It is a debugging aid, not a security boundary.
+
 ### Startup
 - `~/.asmrc` — user config, executed at launch
-- `autoexec.txt` next to the binary — for packaged setups
+- `autoexec.txt` next to the binary — for packaged setups; ignored unless you or root own it and it is not world-writable
+- Files are read whole, up to 64 KiB; a longer file is an error, never a half-run last line
 
 ### Themes
 Three presets: `default`, `minimal`, `classic`. Switch with `theme <name>`.
@@ -110,7 +120,7 @@ Requires `nasm` and `ld` (binutils).
 ```bash
 make
 ```
-Produces `terminal`, a statically linked ELF64 binary (about 170 KB).
+Produces `terminal`, a statically linked ELF64 binary (about 250 KB with symbols).
 
 Install with an app-launcher entry and icon (search "ASM" in GNOME, KDE, COSMIC, etc.):
 ```bash
@@ -144,7 +154,7 @@ The Windows build is a smaller shell than the Linux one. It has the file and dir
 
 ## Architecture
 
-### Linux version: `terminal_linux.asm` (about 9,400 lines, plus about 9,000 in `ash/`)
+### Linux version: `terminal_linux.asm` (about 13,300 lines, plus about 14,300 in `ash/`)
 - **Target**: Linux x86-64, ELF64
 - **Dependencies**: no libc, raw syscalls only. `update` runs `curl` and `sha256sum`, and `/bin/sh` is the fallback for syntax ASH does not handle
 - **Calling convention**: System V AMD64 (args in `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`)
@@ -153,7 +163,7 @@ The Windows build is a smaller shell than the Linux one. It has the file and dir
 - **Terminal control**: `termios` via `ioctl(TCGETS/TCSETS)` for raw mode
 - **Colors/cursor**: ANSI escape sequences
 - **External commands**: ASH (`ash/ash_exec.asm`) resolves `PATH`, sets up pipes and redirects, then `fork` + `execve` + `wait4`; lines it cannot run go to `fork` + `execve(/bin/sh -c)`
-- **Signals**: `sigaction` for SIGINT (Ctrl+C)
+- **Signals**: `sigaction` for SIGINT (Ctrl+C), SIGWINCH, and SIGTERM/SIGHUP/SIGQUIT/SIGSEGV (restore the terminal, on an alternate stack); SIGTSTP/SIGTTIN/SIGTTOU are ignored in the shell and reset in children (job control)
 - **Entry**: `_start` → parses kernel stack for `envp` → `call main`
 
 Key syscalls used:
@@ -180,7 +190,7 @@ SYS_CLOCK_GETTIME=228, SYS_NEWFSTATAT=262
 
 ```
 asm-terminal/
-├── terminal_linux.asm   # Linux source (full-featured, about 9,400 lines)
+├── terminal_linux.asm   # Linux source (full-featured, about 13,300 lines)
 ├── ash/                 # ASH executor, script engine, builtins, tools, highlighter, updater
 ├── terminal.asm         # Windows source (about 2,700 lines)
 ├── version.inc          # the version, in one place
@@ -213,7 +223,7 @@ asm-terminal/
 - `ash_eval` — ASH script engine (`ash/script.asm`): runs `;` `&&` `||`, `if`, `while`, `for` natively
 - Handlers: `handler_*(rdi=args)`
 
-### Memory layout (`.bss`, about 1.1 MB, zero-filled and not stored in the file)
+### Memory layout (`.bss`, about 20 MB of address space, zero-filled and not stored in the file; only pages that are used cost memory)
 The main regions:
 | Region | Size | Purpose |
 |---|---|---|
@@ -223,16 +233,17 @@ The main regions:
 | `history_read_buf` | 256 KB | loading `~/.asm_history` |
 | `alias_table` | 10 KB | 32 entries |
 | `dir_stack` | 64 KB | 16 entries |
-| `env_overlay` | 32 KB | 64 entries |
-| `tab_dirent_buf` | 8 KB | completion |
-| `job_pids` / `job_cmds` | 8 + 1 KB | background jobs |
+| `env_overlay` | 128 KB | 256 entries |
+| `ash_arena` | 16 MB | script text, nodes and `for` word lists |
+| `ash_pending` | 512 KB | one unfinished block typed or piped in |
+| job table | small | 8 jobs: pids, process groups, state, command text |
 
 ---
 
 ## Configuration
 
 ### Timezone
-Hardcoded to PKT (UTC+5) via `%define TZ_OFFSET_SECONDS 18000` in `terminal_linux.asm`. Change the constant and rebuild for another timezone.
+`date` and `time` use `ASM_TZ` (a UTC offset in seconds, shown as `+HHMM`), else a simple POSIX `TZ` such as `EST5` or `<+0530>-5:30`, else the build default PKT (UTC+5, `%define TZ_OFFSET_SECONDS 18000` in `terminal_linux.asm`). Zone names such as `Europe/Paris` and daylight saving are not supported.
 
 ### Startup files
 1. `~/.asmrc` — executed line-by-line at startup
