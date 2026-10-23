@@ -100,7 +100,7 @@ hp_table:
     HROW "calc <expr>",          "Integer math, left to right",    "calc 10 + 5 * 2", "calc 100 / 3", "calc 6 * 7"
     HROW "source <file>",        "Run commands from a file",       "source setup.sh", "source ~/.asmrc"
     HROW "which <name>",         "Builtin / alias / program?",     "which ls", "which git"
-    HROW "history [-c]",         "List history (-c clears it)",    "history", "history -c"
+    HROW "history [-c | .]",     "History (. = run in this folder)", "history", "history ."
     HROW "kill [-SIG] <id>",     "Signal a PID or %job",           "kill %1", "kill -9 1234", "kill -TERM 4321"
     HROW "true / false",         "Set status 0 / 1",               "false || echo failed"
     HROW "help",                 "This table",                     "help"
@@ -136,7 +136,8 @@ hp_table:
     HROW "break / continue",     "Leave or skip a loop turn",      "break", "continue"
 
     HSEC "KEYS"
-    HROW "Tab",                  "Complete file names",            "cat REA<Tab>"
+    HROW "Tab",                  "Complete file names (lists all)", "cat REA<Tab>"
+    HROW "Right / End",          "Accept the grey suggestion"
     HROW "Up / Down",            "Browse history"
     HROW "Ctrl+R",               "Search history"
     HROW "Ctrl+L",               "Clear the screen"
