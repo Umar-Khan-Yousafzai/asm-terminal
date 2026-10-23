@@ -238,4 +238,28 @@ T.check('bench hides stderr of the command', out.count('nonexistent_dir_q') <= 1
 out, err, st = sh('bench -n 3 cat\necho after\nexit\n')
 T.check('bench gives the command an empty stdin', 'after' in out and 'mean' in out, out)
 
+# ---------------------------------------------------------------- redirection of the tool commands
+d = T.tmpdir()
+h = T.tmpdir()
+open(d + '/in', 'w').write('input-data\n')
+for name, cmd in (('sandbox', 'sandbox -b /usr/bin/printf sb'), ('trace', 'trace /usr/bin/printf sb'),
+                  ('bench', 'bench -n 2 /usr/bin/printf sb')):
+    for op in ('>', '>>'):
+        if os.path.exists(d + '/f'):
+            os.unlink(d + '/f')
+        out, err, st = sh('%s %s f\nexit\n' % (cmd, op), home=h, cwd=d)
+        got = rd(d + '/f') or b''
+        if name == 'bench':
+            ok_ = b'mean' in got and b'sbsb' not in got and b'sb' not in got.replace(b'sbsb', b'').replace(b'bench: /usr/bin/printf sb', b'')
+        else:
+            ok_ = got == b'sb'
+        T.check('%s %s file receives the output' % (name, op), ok_ and 'mean' not in out if name != 'bench' else ok_, (got, out[-200:]))
+        T.check('%s %s file: nothing leaks to the terminal' % (name, op), (name == 'bench' and 'mean' not in out) or (name != 'bench' and 'sb' not in out.replace(cmd, '').replace('printf sb', '')), out[-200:])
+out, err, st = sh('sandbox -b /usr/bin/cat < in > f\nexit\n', home=h, cwd=d)
+T.check('sandbox < in > f copies the file', rd(d + '/f') == b'input-data\n', (rd(d + '/f'), out[-200:]))
+out, err, st = sh('trace /usr/bin/cat < in > f\nexit\n', home=h, cwd=d)
+T.check('trace < in > f copies the file', rd(d + '/f') == b'input-data\n', (rd(d + '/f'), out[-200:]))
+out, err, st = sh('bench -n 3 /usr/bin/cat < in > f\nexit\n', home=h, cwd=d)
+T.check('bench does not feed its stdin or stdout to the runs', b'input-data' not in (rd(d + '/f') or b''), rd(d + '/f'))
+
 T.cleanup()

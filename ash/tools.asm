@@ -167,6 +167,8 @@ section .bss
     tl_max              resq 1
     tl_peak             resq 1
     bench_active        resb 1
+    bench_saved_in      resb 1          ; redir_stdin_active while the runs go to /dev/null
+    bench_saved_out     resb 1
     alignb 4
     tl_trash_seq        resd 1
     tl_err              resd 1          ; errno of the last trash failure, 0 = no usable HOME
@@ -294,6 +296,13 @@ handler_bench:
     ; Hide the command's output and keep it off the keyboard: stdin, stdout
     ; and stderr point at /dev/null for the runs. The saved copies are close
     ; on exec so the commands never see them.
+    ; A "> file" on the bench line is for the report, not for the runs
+    mov al, [redir_stdin_active]
+    mov [bench_saved_in], al
+    mov byte [redir_stdin_active], 0
+    mov al, [redir_stdout_active]
+    mov [bench_saved_out], al
+    mov byte [redir_stdout_active], 0
     mov dword [rsp], -1
     mov dword [rsp + 4], -1
     mov dword [rsp + 8], -1
@@ -396,6 +405,10 @@ handler_bench:
     inc ebx
     cmp ebx, 3
     jb .bn_unhide
+    mov al, [bench_saved_in]
+    mov [redir_stdin_active], al
+    mov al, [bench_saved_out]
+    mov [redir_stdout_active], al
     mov byte [bench_active], 0
 .bn_report:
     mov byte [stats_valid], 0       ; no "took" line for bench itself
@@ -469,6 +482,39 @@ handler_bench:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; tl_child_redirect() - in a forked tool child, put the shell's "<" and ">"
+; files on descriptors 0 and 1, as ash does for the commands it starts.
+; The files were opened by the shell with close-on-exec, so the copies made
+; here are the only ones the program sees.
+tl_child_redirect:
+    cmp byte [redir_stdin_active], 0
+    je .cr_out
+    mov edi, [redir_stdin_fd]
+    xor esi, esi
+    call .cr_dup
+.cr_out:
+    cmp byte [redir_stdout_active], 0
+    je .cr_ret
+    mov edi, [redir_stdout_fd]
+    mov esi, 1
+    call .cr_dup
+.cr_ret:
+    ret
+.cr_dup:
+    cmp edi, esi
+    je .cr_same
+    mov eax, SYS_DUP2
+    syscall
+    ret
+.cr_same:
+    mov edx, esi                    ; already there: only clear close-on-exec
+    mov edi, esi
+    mov esi, 2                      ; F_SETFD
+    xor edx, edx
+    mov eax, TL_SYS_FCNTL
+    syscall
     ret
 
 ; tl_print_time(rax = ns): "850 us", "12.34 ms" or "2.31 s"
@@ -2955,6 +3001,7 @@ handler_trace:
     syscall
 
 .tr_child_proc:
+    call tl_child_redirect
     mov eax, TR_SYS_PTRACE
     mov edi, TR_PTRACE_TRACEME
     xor esi, esi
@@ -4214,6 +4261,7 @@ handler_sandbox:
 
 ; ---- child: lock itself down, then exec /bin/sh -c COMMAND ----
 .sb_child:
+    call tl_child_redirect
     mov eax, SB_SYS_PRCTL
     mov edi, SB_PR_NO_NEW_PRIVS
     mov esi, 1
