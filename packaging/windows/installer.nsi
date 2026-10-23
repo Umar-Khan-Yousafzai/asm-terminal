@@ -68,7 +68,7 @@ Section "Install"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "URLInfoAbout"    "${APP_URL}"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "InstallLocation" "$INSTDIR"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "DisplayIcon"     "$INSTDIR\asm-terminal.ico"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "UninstallString" "$INSTDIR\uninstall.exe"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "UninstallString" "\"$INSTDIR\uninstall.exe\""
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "NoModify" 1
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "NoRepair" 1
 

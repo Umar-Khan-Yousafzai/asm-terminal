@@ -6,13 +6,18 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     name: Build + smoke tests (Ubuntu x86-64)
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install NASM
         run: |
@@ -36,10 +41,16 @@ jobs:
           if ldd terminal 2>&1 | grep -q "not a dynamic executable"; then
               echo "OK: statically linked"
           else
-              echo "WARNING: binary has dynamic dependencies"
+              echo "::error::binary has dynamic dependencies"
               ldd terminal
+              exit 1
           fi
           ls -la terminal
+
+      - name: Shell scripts parse
+        run: |
+          for f in packaging/*/*.sh packaging/linux/asm-terminal-launch; do bash -n "$f"; done
+          sh -n packaging/linux/install-release.sh
 
       - name: Run smoke test harness
         run: |
@@ -50,7 +61,7 @@ jobs:
           fi
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: asm-terminal-linux-x86_64
           path: terminal
@@ -62,14 +73,14 @@ jobs:
     if: false  # disabled until Windows build is validated in CI
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install NASM
         run: choco install -y nasm
       - name: Build
         run: |
           & ".\build.bat"
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: asm-terminal-windows-x86_64
           path: terminal.exe
