@@ -356,4 +356,30 @@ s.close()
 out, err, st = T.run_script("echo alive\nexit\n", env={"HOME": longhome}, cwd="/tmp")
 T.check("startup: a 40 KB HOME works non-interactively", "alive" in out and st == 0, (st, err))
 
+# ---- unset / export names, fg and bg without an argument --------------------
+out, err, st = run(["set UA=1", "set UB=2", "set UC=3", "unset UA UB", "echo [$UA][$UB][$UC]"])
+T.check("unset: every name given is removed", "[][][3]" in body(out), body(out)[-3:])
+out, err, st = run(["set UA=1", "unset UA  1X UC", "echo st=$?", "echo [$UA]"])
+T.check("unset: an invalid name is reported, the others still go and the status is 1",
+        "st=1" in out and "invalid variable name" in err and "[]" in body(out), (err, body(out)[-3:]))
+out, err, st = run(["unset", "echo st=$?"])
+T.check("unset: no name is a usage error", "Usage" in err and "st=1" in out, (err, body(out)[-2:]))
+out, err, st = run(["unset NEVER_SET_ZZ", "echo st=$?"])
+T.check("unset: a name that was never set is fine", "st=0" in out and not err, (err, body(out)[-2:]))
+for line in ("export 1X=2", "export A-B=1", "set 9=1", "export =x", "set a.b=2"):
+    out, err, st = run([line, "echo st=$?"])
+    T.check("%s is refused" % line, "st=1" in out and "invalid variable name" in err, (err, body(out)[-2:]))
+out, err, st = run(["export OK_1=2", "echo st=$? $OK_1", "set _u=3", "set mixedCase9=4", "echo $_u $mixedCase9"])
+T.check("export/set: valid identifiers still work", "st=0 2" in body(out) and "3 4" in body(out), (err, body(out)[-3:]))
+out, err, st = run(["fg", "echo st=$?"])
+T.check("fg: no jobs is an error with status 1", "no current job" in err and "st=1" in out, (err, body(out)[-2:]))
+out, err, st = run(["bg", "echo st=$?"])
+T.check("bg: no jobs is an error with status 1", "no current job" in err and "st=1" in out, (err, body(out)[-2:]))
+out, err, st = run(["sleep 1 &", "fg", "echo st=$?"])
+T.check("fg: no argument resumes the most recent job", "sleep 1" in body(out) and "st=0" in out and "Usage" not in err,
+        (err, body(out)[-4:]))
+out, err, st = run(["sleep 2 &", "sleep 2 &", "bg", "bg x", "echo st=$?"])
+T.check("bg: no argument resumes the most recent job, a bad one is a usage error",
+        "resumed job 2" in out and "Usage: bg" in err and "st=1" in out, (err, body(out)[-4:]))
+
 T.cleanup()
