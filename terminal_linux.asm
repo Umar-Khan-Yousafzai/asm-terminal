@@ -6665,8 +6665,10 @@ env_trim_count:
 ; unset marker), else 0. Keeps rdi; clobbers rax, rcx, rdx, r8, r9.
 ; ----------------------------------------------------------------------------
 env_is_shadowed:
+    sub rsp, 8                      ; keep the stack 16-byte aligned for the calls
     call env_name_len
     call env_find_slot
+    add rsp, 8
     test rax, rax
     setnz al
     movzx eax, al

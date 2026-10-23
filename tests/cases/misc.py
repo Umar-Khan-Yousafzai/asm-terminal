@@ -315,4 +315,32 @@ open(rc + "/ok.rc", "w").write("echo one\necho partial")
 out, err, st = T.run_script("source %s/ok.rc\nexit\n" % rc, home=rc)
 T.check("source: a last line without a newline still runs", "one" in out and "partial" in out, out[-60:])
 
+# ---- environment passed to children -----------------------------------------
+big = {"V%d" % i: "x" for i in range(1, 701)}
+big["ZLAST"] = "found"
+out, err, st = run(["set A=1", "sh -c 'echo ZLAST=$ZLAST; env | wc -l'"], env=big)
+T.check("env: a large inherited environment reaches children whole",
+        "ZLAST=found" in body(out) and any(l.strip().isdigit() and int(l) >= 700 for l in body(out)), body(out)[-3:])
+
+# ---- autoexec.txt -----------------------------------------------------------
+ax = T.tmpdir()
+shutil.copy(T.BIN, ax + "/asm")
+os.chmod(ax + "/asm", 0o755)
+open(ax + "/autoexec.txt", "w").write("echo from-autoexec\n")
+os.chmod(ax + "/autoexec.txt", 0o644)
+home = T.tmpdir()
+def run_ax():
+    p = subprocess.run([ax + "/asm"], input=b"exit\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=home,
+                       env={"PATH": "/usr/bin:/bin", "HOME": home, "ASM_NO_UPDATE_CHECK": "1"})
+    return p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
+o, e = run_ax()
+T.check("autoexec: a private file next to the binary runs", "from-autoexec" in o, (o[-60:], e))
+os.chmod(ax + "/autoexec.txt", 0o666)
+o, e = run_ax()
+T.check("autoexec: a world-writable file is ignored with a message", "from-autoexec" not in o and "autoexec.txt" in e, (o[-60:], e))
+os.chmod(ax + "/autoexec.txt", 0o644)
+open(ax + "/autoexec.txt", "w").write("#" * 5000 + "\necho late-line\n")
+o, e = run_ax()
+T.check("autoexec: a file past 4095 bytes runs to the end", "late-line" in o, (o[-60:], e))
+
 T.cleanup()
