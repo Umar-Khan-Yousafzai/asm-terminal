@@ -3301,13 +3301,18 @@ tr_syscall_stop:
     ret
 
 ; ============================================================================
-; sandbox [-w] [-n] COMMAND
+; sandbox [-w] [-n] [-b] [--] COMMAND
 ;   Runs COMMAND (through /bin/sh) with:
-;     - no network: socket(AF_INET/AF_INET6) fails with EPERM (seccomp);
-;       -n keeps the network
-;     - no file changes outside /tmp (Landlock); -w also allows the
-;       current folder. Reading and running programs stay allowed.
-;   The shell itself is not restricted, only the command.
+;     - no sockets (seccomp); -n allows IPv4 and IPv6 sockets only. io_uring
+;       is refused because it can open sockets behind the filter's back
+;     - file changes only in /tmp (Landlock), plus the current folder with -w,
+;       plus /dev/null, /dev/zero and /dev/tty. Reading and running programs
+;       stay allowed
+;     - no chmod, chown, extended attributes, truncate(2) or explicit
+;       timestamps (Landlock does not cover them), no ptrace, mount,
+;       namespace or module calls, and no terminal input injection (TIOCSTI)
+;   The shell itself is not restricted, only the command. When Landlock or
+;   seccomp cannot be installed the command is not run, unless -b is given.
 ; ============================================================================
 
 %define SB_SYS_PRCTL            157
@@ -3318,70 +3323,207 @@ tr_syscall_stop:
 %define SB_PR_NO_NEW_PRIVS      38
 %define SB_O_PATH               0x200000
 %define SB_FS_WRITE             0x1FF2      ; Landlock ABI 1 write/create/remove rights
-%define SB_FS_WRITE_FILE        2
+%define SB_FS_WRITE_FILE        0x0002
+%define SB_FS_REFER             0x2000      ; ABI 2
+%define SB_FS_TRUNCATE          0x4000      ; ABI 3
+%define SB_FS_IOCTL_DEV         0x8000      ; ABI 5
+%define SB_SCOPE_ALL            3           ; ABI 6: abstract unix sockets and signals
+%define SB_OPT_W                1
+%define SB_OPT_N                2
+%define SB_OPT_B                4
+
+%define SB_RET_ALLOW            0x7FFF0000
+%define SB_RET_EPERM            0x00050001
+%define SB_RET_ENOSYS           0x00050026
+
+; BPF helpers. A jump to a label is relative to the next instruction, in
+; units of 8 bytes; each macro emits exactly one instruction.
+%macro BPF_LD 1                         ; A = seccomp_data word at offset %1
+    dw 0x20
+    db 0, 0
+    dd %1
+%endmacro
+%macro BPF_IF_EQ 2                      ; if A == %1 goto %2
+    dw 0x15
+    db ((%2) - ($ + 6)) / 8, 0
+    dd %1
+%endmacro
+%macro BPF_IF_NE 2                      ; if A != %1 goto %2
+    dw 0x15
+    db 0, ((%2) - ($ + 6)) / 8
+    dd %1
+%endmacro
+%macro BPF_IF_GE 2                      ; if A >= %1 goto %2
+    dw 0x35
+    db ((%2) - ($ + 6)) / 8, 0
+    dd %1
+%endmacro
+%macro BPF_IF_SET 2                     ; if A & %1 goto %2
+    dw 0x45
+    db ((%2) - ($ + 6)) / 8, 0
+    dd %1
+%endmacro
+%macro BPF_RET 1
+    dw 0x06
+    db 0, 0
+    dd %1
+%endmacro
+
+; The filter, built twice: %1 = 1 keeps IPv4/IPv6 sockets (-n).
+; A process of another architecture, or the x32 ABI, gets EPERM for every call.
+%macro SB_FILTER 1
+    BPF_LD 4                            ; arch
+    BPF_IF_NE 0xC000003E, %%deny
+    BPF_LD 0                            ; nr
+    BPF_IF_GE 0x40000000, %%deny
+    BPF_IF_EQ 41, %%socket
+    BPF_IF_EQ 16, %%ioctl
+    BPF_IF_EQ 56, %%clone
+    BPF_IF_EQ 435, %%nosys              ; clone3: libc falls back to clone
+    BPF_IF_EQ 280, %%utimensat
+    ; ptrace and cross-process memory access
+    BPF_IF_EQ 101, %%deny               ; ptrace
+    BPF_IF_EQ 310, %%deny               ; process_vm_readv
+    BPF_IF_EQ 311, %%deny               ; process_vm_writev
+    BPF_IF_EQ 312, %%deny               ; kcmp
+    BPF_IF_EQ 438, %%deny               ; pidfd_getfd
+    ; io_uring can create sockets and bypass the socket() rule
+    BPF_IF_EQ 425, %%deny
+    BPF_IF_EQ 426, %%deny
+    BPF_IF_EQ 427, %%deny
+    ; metadata changes Landlock does not mediate
+    BPF_IF_EQ 76, %%deny                ; truncate
+    BPF_IF_EQ 90, %%deny                ; chmod
+    BPF_IF_EQ 91, %%deny                ; fchmod
+    BPF_IF_EQ 92, %%deny                ; chown
+    BPF_IF_EQ 93, %%deny                ; fchown
+    BPF_IF_EQ 94, %%deny                ; lchown
+    BPF_IF_EQ 132, %%deny               ; utime
+    BPF_IF_EQ 235, %%deny               ; utimes
+    BPF_IF_EQ 260, %%deny               ; fchownat
+    BPF_IF_EQ 261, %%deny               ; futimesat
+    BPF_IF_EQ 268, %%deny               ; fchmodat
+    BPF_IF_EQ 452, %%deny               ; fchmodat2
+    BPF_IF_EQ 188, %%deny               ; setxattr
+    BPF_IF_EQ 189, %%deny               ; lsetxattr
+    BPF_IF_EQ 190, %%deny               ; fsetxattr
+    BPF_IF_EQ 197, %%deny               ; removexattr
+    BPF_IF_EQ 198, %%deny               ; lremovexattr
+    BPF_IF_EQ 199, %%deny               ; fremovexattr
+    BPF_IF_EQ 463, %%deny               ; setxattrat
+    BPF_IF_EQ 466, %%deny               ; removexattrat
+    ; mounts, namespaces, root changes
+    BPF_IF_EQ 165, %%deny               ; mount
+    BPF_IF_EQ 166, %%deny               ; umount2
+    BPF_IF_EQ 155, %%deny               ; pivot_root
+    BPF_IF_EQ 161, %%deny               ; chroot
+    BPF_IF_EQ 272, %%deny               ; unshare
+    BPF_IF_EQ 308, %%deny               ; setns
+    BPF_IF_EQ 428, %%deny               ; open_tree
+    BPF_IF_EQ 429, %%deny               ; move_mount
+    BPF_IF_EQ 430, %%deny               ; fsopen
+    BPF_IF_EQ 431, %%deny               ; fsconfig
+    BPF_IF_EQ 432, %%deny               ; fsmount
+    BPF_IF_EQ 433, %%deny               ; fspick
+    BPF_IF_EQ 442, %%deny               ; mount_setattr
+    BPF_IF_EQ 467, %%deny               ; open_tree_attr
+    ; machine-wide calls
+    BPF_IF_EQ 167, %%deny               ; swapon
+    BPF_IF_EQ 168, %%deny               ; swapoff
+    BPF_IF_EQ 169, %%deny               ; reboot
+    BPF_IF_EQ 175, %%deny               ; init_module
+    BPF_IF_EQ 176, %%deny               ; delete_module
+    BPF_IF_EQ 246, %%deny               ; kexec_load
+    BPF_IF_EQ 313, %%deny               ; finit_module
+    BPF_IF_EQ 320, %%deny               ; kexec_file_load
+    BPF_RET SB_RET_ALLOW
+%%socket:
+%if %1
+    BPF_LD 16                           ; domain
+    BPF_IF_EQ 2, %%sock_ok              ; AF_INET
+    BPF_IF_EQ 10, %%sock_ok             ; AF_INET6
+%endif
+    BPF_RET SB_RET_EPERM
+%if %1
+%%sock_ok:
+    BPF_RET SB_RET_ALLOW
+%endif
+%%ioctl:
+    BPF_LD 24                           ; request (the kernel reads 32 bits)
+    BPF_IF_EQ 0x5412, %%deny            ; TIOCSTI
+    BPF_IF_EQ 0x541C, %%deny            ; TIOCLINUX
+    BPF_IF_EQ 0x541D, %%deny            ; TIOCCONS
+    BPF_IF_EQ 0x5423, %%deny            ; TIOCSETD
+    BPF_RET SB_RET_ALLOW
+%%clone:
+    BPF_LD 16                           ; flags: no new namespaces
+    BPF_IF_SET 0x7E020000, %%deny
+    BPF_RET SB_RET_ALLOW
+%%utimensat:
+    BPF_LD 32                           ; times == NULL: "set to now" is allowed
+    BPF_IF_NE 0, %%deny
+    BPF_LD 36
+    BPF_IF_NE 0, %%deny
+    BPF_RET SB_RET_ALLOW
+%%nosys:
+    BPF_RET SB_RET_ENOSYS
+%%deny:
+    BPF_RET SB_RET_EPERM
+%endmacro
 
 section .data
     sb_s_dash_w         db "-w", 0
     sb_s_sandbox        db "sandbox", 0
-    sb_s_dash_n         db "-n", 0
     sb_s_tmp            db "/tmp", 0
-    sb_s_dev            db "/dev", 0
+    sb_s_dev_null       db "/dev/null", 0
+    sb_s_dev_zero       db "/dev/zero", 0
+    sb_s_dev_tty        db "/dev/tty", 0
     sb_s_dot            db ".", 0
-    sb_s_usage          db "Usage: sandbox [-w] [-n] COMMAND", 10
-                        db "  default: no network, file changes only in /tmp", 10
-                        db "  -w  also allow changes in the current folder", 10
-                        db "  -n  keep network access", 10, 0
-    sb_s_no_landlock    db "sandbox: Landlock is not available; file changes are NOT restricted", 10, 0
-    sb_s_no_seccomp     db "sandbox: could not block the network", 10, 0
+    sb_s_usage          db "Usage: sandbox [-w] [-n] [-b] [--] COMMAND", 10
+                        db "  Runs COMMAND with these limits:", 10
+                        db "    - no sockets at all; -n allows IPv4 and IPv6 ones; no io_uring", 10
+                        db "    - files can only be created, changed or removed in /tmp (-w: and", 10
+                        db "      in the current folder), plus /dev/null, /dev/zero and /dev/tty", 10
+                        db "    - no chmod, chown, xattr, truncate(2) or explicit file times", 10
+                        db "    - no ptrace, mount, namespace, module or reboot calls", 10
+                        db "    - cannot type into the terminal (TIOCSTI)", 10
+                        db "  -b  run anyway if Landlock or seccomp is not available (weaker)", 10
+                        db "  Not blocked: reading any file, running any program, CPU and", 10
+                        db "  memory use, setting a file's time to now, and signals to other", 10
+                        db "  processes of yours (Landlock ABI 6+, Linux 6.12+, blocks those).", 10
+                        db "  A program you start with it can still do whatever /tmp allows.", 10, 0
+    sb_s_bad_opt        db "sandbox: unknown option", 10, 0
+    sb_s_no_landlock    db "sandbox: file changes cannot be restricted (Landlock is not available)", 10, 0
+    sb_s_no_seccomp     db "sandbox: system calls cannot be restricted (seccomp failed)", 10, 0
+    sb_s_no_nnp         db "sandbox: cannot set no_new_privs", 10, 0
+    sb_s_refused        db "sandbox: nothing was run; -b runs it with the restrictions that work", 10, 0
+    sb_s_wide           db "sandbox: warning: -w in / or in your home folder allows changes to everything below it", 10, 0
+    sb_s_home           db "HOME", 0
 
-    ; seccomp filter: socket(AF_INET|AF_INET6, ...) -> EPERM, x32 calls -> EPERM
+    ; Landlock handles an operation only when the ruleset names it, so the
+    ; filter below covers what Landlock cannot. socket() and ioctl() compare
+    ; the low 32 bits, like the kernel does.
     align 8
-    sb_filter:
-        dw 0x20
-        db 0, 0
-        dd 4                        ; ld arch
-        dw 0x15
-        db 1, 0
-        dd 0xC000003E               ; jeq x86_64
-        dw 0x06
-        db 0, 0
-        dd 0x80000000               ; ret KILL_PROCESS (other arch)
-        dw 0x20
-        db 0, 0
-        dd 0                        ; ld nr
-        dw 0x35
-        db 5, 0
-        dd 0x40000000               ; jge x32 -> EPERM
-        dw 0x15
-        db 0, 3
-        dd 41                       ; jeq socket
-        dw 0x20
-        db 0, 0
-        dd 16                       ; ld args[0] (low half)
-        dw 0x15
-        db 2, 0
-        dd 2                        ; AF_INET -> EPERM
-        dw 0x15
-        db 1, 0
-        dd 10                       ; AF_INET6 -> EPERM
-        dw 0x06
-        db 0, 0
-        dd 0x7FFF0000               ; ret ALLOW
-        dw 0x06
-        db 0, 0
-        dd 0x00050001               ; ret ERRNO(EPERM)
-    sb_filter_len equ ($ - sb_filter) / 8
-    sb_prog:
-        dw sb_filter_len
+    sb_filter_off:      SB_FILTER 0
+    sb_filter_off_len   equ ($ - sb_filter_off) / 8
+    sb_filter_net:      SB_FILTER 1
+    sb_filter_net_len   equ ($ - sb_filter_net) / 8
+    align 8
+    sb_prog_off:
+        dw sb_filter_off_len
         dw 0, 0, 0
-        dq sb_filter
+        dq sb_filter_off
+    sb_prog_net:
+        dw sb_filter_net_len
+        dw 0, 0, 0
+        dq sb_filter_net
 
 section .bss
     alignb 8
-    sb_ruleset_attr     resq 1
+    sb_ruleset_attr     resq 3          ; handled_access_fs, handled_access_net, scoped
     sb_rule             resb 16         ; u64 allowed_access, s32 parent_fd (packed)
     sb_wstatus          resd 1
-    sb_flags            resb 1          ; bit0 = -w, bit1 = -n
+    sb_flags            resb 1          ; SB_OPT_*
 
 section .text
 
@@ -3395,25 +3537,59 @@ handler_sandbox:
     jz .sb_usage
     mov r12, rdi
 .sb_opts:
-    mov rdi, r12
-    lea rsi, [sb_s_dash_w]
-    call ash_word_is
+    cmp byte [r12], '-'
+    jne .sb_cmd
+    movzx eax, byte [r12 + 1]
     test eax, eax
-    jz .sb_opt_n
-    or byte [sb_flags], 1
-    jmp .sb_opt_next
-.sb_opt_n:
-    mov rdi, r12
-    lea rsi, [sb_s_dash_n]
-    call ash_word_is
+    jz .sb_cmd                      ; a lone "-" is the command
+    cmp eax, ' '
+    je .sb_cmd
+    cmp eax, '-'
+    jne .sb_letters
+    movzx eax, byte [r12 + 2]       ; "--" ends the options
     test eax, eax
-    jz .sb_cmd
-    or byte [sb_flags], 2
-.sb_opt_next:
+    jz .sb_dashdash
+    cmp eax, ' '
+    je .sb_dashdash
+    cmp eax, 9
+    jne .sb_bad
+.sb_dashdash:
     lea rdi, [r12 + 2]
     call ash_skip_blanks
     mov r12, rax
+    jmp .sb_cmd
+.sb_letters:
+    lea rsi, [r12 + 1]
+.sb_letter:
+    movzx eax, byte [rsi]
+    test eax, eax
+    jz .sb_letters_end
+    cmp eax, ' '
+    je .sb_letters_end
+    cmp eax, 9
+    je .sb_letters_end
+    mov ecx, SB_OPT_W
+    cmp eax, 'w'
+    je .sb_set
+    mov ecx, SB_OPT_N
+    cmp eax, 'n'
+    je .sb_set
+    mov ecx, SB_OPT_B
+    cmp eax, 'b'
+    jne .sb_bad
+.sb_set:
+    or [sb_flags], cl
+    inc rsi
+    jmp .sb_letter
+.sb_letters_end:
+    mov rdi, rsi
+    call ash_skip_blanks
+    mov r12, rax
     jmp .sb_opts
+.sb_bad:
+    lea rdi, [sb_s_bad_opt]
+    call ash_write_err
+    jmp .sb_usage
 .sb_cmd:
     cmp byte [r12], 0
     je .sb_usage
@@ -3425,6 +3601,10 @@ handler_sandbox:
     mov rsi, r12
     call str_copy
 
+    test byte [sb_flags], SB_OPT_W
+    jz .sb_go
+    call sb_warn_wide
+.sb_go:
     cmp byte [interactive_mode], 0
     je .sb_fork
     call restore_terminal
@@ -3444,6 +3624,8 @@ handler_sandbox:
     syscall
     cmp rax, -EINTR
     je .sb_wait
+    test rax, rax
+    js .sb_fail                     ; no status to read
     mov eax, [sb_wstatus]
     mov edx, eax
     and edx, 0x7F
@@ -3482,27 +3664,69 @@ handler_sandbox:
     xor r10d, r10d
     xor r8d, r8d
     syscall
+    test rax, rax
+    jns .sbc_landlock
+    lea rdi, [sb_s_no_nnp]
+    call ash_write_err
+    jmp .sbc_refuse
 
-    ; Landlock: handle all write rights, then allow them under /tmp (+ cwd)
-    mov qword [sb_ruleset_attr], SB_FS_WRITE
-    lea rdi, [sb_ruleset_attr]
+.sbc_landlock:
+    ; Landlock ABI version decides which rights can be handled
+    xor edi, edi
+    xor esi, esi
+    mov edx, 1                      ; LANDLOCK_CREATE_RULESET_VERSION
+    mov eax, SB_SYS_LL_CREATE
+    syscall
+    test rax, rax
+    jle .sbc_no_ll
+    mov r13d, eax                   ; ABI
+    mov ebx, SB_FS_WRITE
+    cmp r13d, 2
+    jb .sbc_rights
+    or ebx, SB_FS_REFER
+    cmp r13d, 3
+    jb .sbc_rights
+    or ebx, SB_FS_TRUNCATE
+    cmp r13d, 5
+    jb .sbc_rights
+    or ebx, SB_FS_IOCTL_DEV
+.sbc_rights:
+    mov [sb_ruleset_attr], rbx
+    mov qword [sb_ruleset_attr + 8], 0
+    mov qword [sb_ruleset_attr + 16], 0
     mov esi, 8
+    cmp r13d, 6
+    jb .sbc_create
+    mov qword [sb_ruleset_attr + 16], SB_SCOPE_ALL
+    mov esi, 24
+.sbc_create:
+    lea rdi, [sb_ruleset_attr]
     xor edx, edx
     mov eax, SB_SYS_LL_CREATE
     syscall
     test rax, rax
     js .sbc_no_ll
     mov r12d, eax                   ; ruleset fd
+    mov r14, rbx
+    and r14d, ~SB_FS_IOCTL_DEV      ; folders: everything except device ioctls
+    mov r15, rbx
+    and r15d, SB_FS_WRITE_FILE | SB_FS_TRUNCATE | SB_FS_IOCTL_DEV
     lea rdi, [sb_s_tmp]
-    mov esi, SB_FS_WRITE
+    mov rbx, r14
     call .sbc_allow
-    lea rdi, [sb_s_dev]             ; /dev/null, /dev/tty
-    mov esi, SB_FS_WRITE_FILE
+    lea rdi, [sb_s_dev_null]
+    mov rbx, r15
     call .sbc_allow
-    test byte [sb_flags], 1
+    lea rdi, [sb_s_dev_zero]
+    mov rbx, r15
+    call .sbc_allow
+    lea rdi, [sb_s_dev_tty]
+    mov rbx, r15
+    call .sbc_allow
+    test byte [sb_flags], SB_OPT_W
     jz .sbc_restrict
     lea rdi, [sb_s_dot]
-    mov esi, SB_FS_WRITE
+    mov rbx, r14
     call .sbc_allow
 .sbc_restrict:
     mov edi, r12d
@@ -3510,35 +3734,44 @@ handler_sandbox:
     mov eax, SB_SYS_LL_RESTRICT
     syscall
     test rax, rax
-    jns .sbc_net
+    jns .sbc_seccomp
 .sbc_no_ll:
     lea rdi, [sb_s_no_landlock]
     call ash_write_err
-.sbc_net:
-    test byte [sb_flags], 2
-    jnz .sbc_exec
+    test byte [sb_flags], SB_OPT_B
+    jz .sbc_refuse
+
+.sbc_seccomp:
+    lea rdx, [sb_prog_off]
+    test byte [sb_flags], SB_OPT_N
+    jz .sbc_install
+    lea rdx, [sb_prog_net]
+.sbc_install:
     mov eax, SB_SYS_SECCOMP
     mov edi, 1                      ; SECCOMP_SET_MODE_FILTER
     xor esi, esi
-    lea rdx, [sb_prog]
     syscall
     test rax, rax
     jns .sbc_exec
     lea rdi, [sb_s_no_seccomp]
     call ash_write_err
-    mov edi, 126                    ; refuse to run unrestricted
-    mov eax, SYS_EXIT
-    syscall
+    test byte [sb_flags], SB_OPT_B
+    jz .sbc_refuse
 .sbc_exec:
     lea rdi, [ash_shc_argv]
     lea rax, [tl_cmd_buf]
     mov [rdi + 16], rax
     call ash_exec_argv              ; does not return
+.sbc_refuse:
+    lea rdi, [sb_s_refused]
+    call ash_write_err
+    mov edi, 126
+    mov eax, SYS_EXIT
+    syscall
 
-; local: add a path-beneath rule (rdi = path, esi = rights) to r12d
+; local: add a path-beneath rule (rdi = path, rbx = rights) to ruleset r12d.
+; A path that cannot be opened simply gets no rule, which only narrows access.
 .sbc_allow:
-    push rbx
-    mov ebx, esi
     mov esi, SB_O_PATH | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
@@ -3547,16 +3780,48 @@ handler_sandbox:
     js .sa_ret
     mov qword [sb_rule], rbx
     mov [sb_rule + 8], eax
-    push rax
+    mov r8d, eax                    ; syscall leaves r8 alone
     mov edi, r12d
     mov esi, 1                      ; LANDLOCK_RULE_PATH_BENEATH
     lea rdx, [sb_rule]
     xor r10d, r10d
     mov eax, SB_SYS_LL_ADD
     syscall
-    pop rdi
+    mov edi, r8d
     mov eax, SYS_CLOSE
     syscall
 .sa_ret:
+    ret
+
+; sb_warn_wide() - say so when -w would open "/" or $HOME to changes
+sb_warn_wide:
+    push rbx
+    lea rdi, [tl_path_s]
+    mov esi, TL_PATH_MAX
+    mov eax, SYS_GETCWD
+    syscall
+    test rax, rax
+    jle .ww_ret
+    cmp rax, 2
+    jne .ww_home
+    cmp byte [tl_path_s], '/'
+    je .ww_warn
+.ww_home:
+    lea rdi, [sb_s_home]
+    call getenv_internal
+    test rax, rax
+    jz .ww_ret
+    mov rbx, rax
+    cmp byte [rbx], '/'
+    jne .ww_ret
+    lea rdi, [tl_path_s]
+    mov rsi, rbx
+    call str_icompare
+    test eax, eax
+    jnz .ww_ret
+.ww_warn:
+    lea rdi, [sb_s_wide]
+    call ash_write_err
+.ww_ret:
     pop rbx
     ret
