@@ -1238,6 +1238,9 @@ ash_link:
     cmp ecx, N_ELIF
     jne .lk_err
 .lk_then_ok:
+    lea eax, [edx + 1]
+    cmp eax, r14d                   ; "if then": no condition to run
+    je .lk_err
     LK_SET_CUR
     jmp .lk_next
 
@@ -1285,6 +1288,12 @@ ash_link:
     cmp ecx, N_FOR
     jne .lk_err
 .lk_do_ok:
+    cmp ecx, N_FOR
+    je .lk_do_set
+    lea eax, [edx + 1]
+    cmp eax, r14d                   ; "while do": no condition, it would never end
+    je .lk_err
+.lk_do_set:
     mov [r9 + ND_J2], r14d
     mov [rsi + ND_J2], r8d
     LK_SET_CUR
