@@ -7243,9 +7243,17 @@ load_history:
     test rax, rax
     jz .lh_done
 
+    ; An absurdly long $HOME cannot be a real home directory and would
+    ; overrun the path buffer
+    mov r12, rax
+    mov rdi, rax
+    call str_len
+    cmp eax, MAX_PATH_BUF - 32
+    ja .lh_done
+
     ; Copy HOME to history_file_path
     lea rdi, [history_file_path]
-    mov rsi, rax
+    mov rsi, r12
 .lh_copy_home:
     mov cl, [rsi]
     mov [rdi], cl
