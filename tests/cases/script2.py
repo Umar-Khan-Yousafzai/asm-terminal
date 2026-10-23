@@ -212,7 +212,10 @@ T.check('case: nesting beyond the block limit is a syntax error, not a crash',
 longp = 'a' * 400
 o = out('case %s in\n%s) echo longmatch;;\nesac' % (longp, longp))
 T.check('case: a 400 byte word and pattern', o == ['longmatch'], o)
-lines, err, st = run('case ' + 'a' * 600 + ' in a) echo x;; esac\necho next')
+longw = 'a' * 600
+o = out('case %s in\n%s) echo longer;;\nesac' % (longw, longw))
+T.check('case: a 600 byte word and pattern', o == ['longer'], o)
+lines, err, st = run('case ' + 'a' * 70000 + ' in a) echo x;; esac\necho next')
 T.check('case: a word past the line limit is refused', 'too long' in err and 'next' in lines, (lines, err))
 o = out('f() { case $1 in 0) echo bottom;; *) f $(($1-1));; esac; }\nf 150')
 T.check('case: recursion 150 deep through a clause', o == ['bottom'], o)
