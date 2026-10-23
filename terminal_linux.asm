@@ -3731,6 +3731,17 @@ dc_run_handler:
     mov dword [last_exit_status], 1
     jmp .rh_ret
 .rh_len_ok:
+    ; Globs in the arguments of the builtins that take file names
+    mov rdi, rbx
+    call dc_glob_ok
+    test eax, eax
+    jz .rh_noglob
+    mov rdi, r12
+    mov rsi, rbx
+    call dc_glob_args
+    test eax, eax
+    jnz .rh_ret                     ; dealt with: an error, or run once per name
+.rh_noglob:
     mov rdi, rbx
     call dc_wants_raw
     test eax, eax
@@ -10443,7 +10454,7 @@ print_ls_perms:
 %define SYS_READLINKAT      267
 %define LS_POOL_SIZE        262144
 %define LS_MAX_ENTRIES      16384
-%define LS_MAX_PATHS        32
+%define LS_MAX_PATHS        4096
 
 section .data
     ansi_cyan       db 27, "[36m", 0
@@ -13724,4 +13735,5 @@ align 1
 %include "ash/builtins.asm"
 %include "ash/script.asm"
 %include "ash/tools.asm"
+%include "ash/glob.asm"
 %include "ash/highlight.asm"
