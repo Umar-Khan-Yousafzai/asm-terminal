@@ -1163,10 +1163,15 @@ main:
     jz .main_eof                    ; EOF -> exit
 
 .main_after_read:
-    ; Skip empty lines
+    ; Skip empty lines, except inside an open quote or block where the
+    ; blank line is part of the text
     cmp byte [input_buf], 0
+    jne .main_nonempty
+    cmp byte [ash_cont], 0
     je .main_loop
+    jmp .main_run
 
+.main_nonempty:
     ; Add to history; only a person typing at the terminal feeds the file
     lea rdi, [input_buf]
     call history_add
@@ -1176,6 +1181,7 @@ main:
     call history_save_entry
 .main_no_save:
 
+.main_run:
     ; OSC 133 C — output region begins (only for a terminal that asked for
     ; shell integration; a pipe must see the command output and nothing else)
     cmp byte [osc_enabled], 0
@@ -4091,6 +4097,10 @@ expand_env_vars:
     test rax, rax
     jz .ev_literal_dollar           ; no closing "))"
     mov r12, rax
+    cmp byte [ash_arith_failed], 0
+    je .ev_arith_ok
+    mov byte [ev_overflow], 2       ; message printed: cancel the command
+.ev_arith_ok:
     lea rcx, [ash_num_buf]
     jmp .ev_value
 .ev_status:
@@ -4723,6 +4733,9 @@ ev_capture:
     mov byte [color_enabled], 0
     mov byte [redir_stdout_active], 0
     mov byte [redir_stdin_active], 0
+    ; Its commands stay in the shell's process group, so a Ctrl+C at the
+    ; keyboard reaches them (a group of their own would never get it).
+    mov byte [jc_state], 2
     mov rdi, r12
     mov esi, 1
     call ash_eval
