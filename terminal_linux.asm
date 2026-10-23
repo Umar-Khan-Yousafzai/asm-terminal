@@ -408,11 +408,11 @@ section .data
     err_exec_msg    db "Error: Could not execute command.", 10, 0
     err_exec_len    equ $ - err_exec_msg - 1
     err_file_msg    db "Error: Could not open file.", 10, 0
+    err_file_len    equ $ - err_file_msg - 1
     err_copy_read_msg db "copy: read error from source.", 10, 0
     err_copy_read_len equ $ - err_copy_read_msg - 1
     err_copy_write_msg db "copy: write error to destination.", 10, 0
     err_copy_write_len equ $ - err_copy_write_msg - 1
-    err_file_len    equ $ - err_file_msg - 1
     err_args_msg    db "Error: Missing arguments.", 10, 0
     err_args_len    equ $ - err_args_msg - 1
     err_stack_empty db "Error: Directory stack empty.", 10, 0
@@ -535,6 +535,7 @@ section .data
         dq ash_s_lbracket, handler_bracket, 1
         dq ash_s_colon,  handler_true,   1
         dq tl_s_bench,   handler_bench,  5
+        dq tl_s_trashcmd, handler_trash, 5
         dq tr_s_trace,   handler_trace,  5
         dq sb_s_sandbox, handler_sandbox, 7
         dq cmd_s_ls,     handler_ls,     2
@@ -4759,27 +4760,28 @@ handler_del:
     neg eax
     mov edi, eax
     call print_last_error
+    mov dword [last_exit_status], 1
     jmp .hdl_done
 
 .hdl_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
     call print_string_len
+    mov dword [last_exit_status], 1
 
 .hdl_done:
     leave
     ret
 
 ; ---------- handler_copy ----------
-; Copy file: parse_two_args, open src, open dst, read/write loop, close both
+; Plain copy without the undo bookkeeping (handler_copy_safe in
+; ash/tools.asm is what the command table uses). Parses "src dst" and lets
+; tl_copy_cmd do the work: it refuses folders and copying a file onto itself,
+; keeps the source's permissions and reports every failure.
 handler_copy:
     push rbp
     mov rbp, rsp
     push rbx
-    push r12
-    push r13
-    push r14
-    push r15
     sub rsp, 24
 
     test rdi, rdi
@@ -4791,97 +4793,19 @@ handler_copy:
     test rdx, rdx
     jz .hcp_err
 
-    mov r12, rax                    ; r12 = source path
-    mov r13, rdx                    ; r13 = dest path
-
-    ; Open source: open(src, O_RDONLY, 0)
-    mov rdi, r12
-    mov esi, O_RDONLY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .hcp_src_err
-    mov ebx, eax                    ; ebx = src fd
-
-    ; Open dest: open(dst, O_WRONLY|O_CREAT|O_TRUNC, 0644)
-    mov rdi, r13
-    mov esi, O_WRONLY | O_CREAT | O_TRUNC
-    mov edx, PERM_0644
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .hcp_dst_err
-    mov r12d, eax                   ; r12d = dst fd
-
-.hcp_loop:
-    ; read(src_fd, read_buffer, READ_BUF_SIZE)
-    mov edi, ebx
-    lea rsi, [read_buffer]
-    mov edx, READ_BUF_SIZE
-    mov eax, SYS_READ
-    syscall
-    test rax, rax
-    jz .hcp_close_both              ; EOF
-    js .hcp_read_err                ; read error
-
-    ; write(dst_fd, read_buffer, bytes_read) — handle partial writes
-    mov r14, rax                    ; r14 = total bytes remaining
-    lea r15, [read_buffer]          ; r15 = current write pointer
-.hcp_write_loop:
-    mov edi, r12d
-    mov rsi, r15
-    mov rdx, r14
-    mov eax, SYS_WRITE
-    syscall
-    test rax, rax
-    js .hcp_write_err               ; EIO, ENOSPC, EPIPE etc.
-    add r15, rax                    ; advance pointer by bytes written
-    sub r14, rax                    ; decrement remaining
-    jnz .hcp_write_loop             ; loop until all bytes written
-    jmp .hcp_loop
-
-.hcp_read_err:
-    lea rdi, [err_copy_read_msg]
-    mov esi, err_copy_read_len
-    call print_string_len
-    jmp .hcp_close_both
-
-.hcp_write_err:
-    lea rdi, [err_copy_write_msg]
-    mov esi, err_copy_write_len
-    call print_string_len
-    jmp .hcp_close_both
-
-.hcp_close_both:
-    ; Close dst
-    mov edi, r12d
-    mov eax, SYS_CLOSE
-    syscall
-.hcp_dst_err:
-    ; Close src
-    mov edi, ebx
-    mov eax, SYS_CLOSE
-    syscall
-    jmp .hcp_done
-
-.hcp_src_err:
-    lea rdi, [err_file_msg]
-    mov esi, err_file_len
-    call print_string_len
+    mov rdi, rax
+    mov rsi, rdx
+    call tl_copy_cmd
     jmp .hcp_done
 
 .hcp_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
     call print_string_len
+    mov dword [last_exit_status], 1
 
 .hcp_done:
     add rsp, 24
-    pop r15
-    pop r14
-    pop r13
-    pop r12
     pop rbx
     pop rbp
     ret
@@ -4915,12 +4839,14 @@ handler_rename:
     neg eax
     mov edi, eax
     call print_last_error
+    mov dword [last_exit_status], 1
     jmp .hmv_done
 
 .hmv_err:
     lea rdi, [err_args_msg]
     mov esi, err_args_len
     call print_string_len
+    mov dword [last_exit_status], 1
 
 .hmv_done:
     add rsp, 24
