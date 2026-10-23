@@ -2876,7 +2876,61 @@ tab_complete:
 
 ; ============================================================================
 ; dispatch_command - Expand env, check alias, parse redir, dispatch
+;
+; Variable and command-substitution results are data. expand_env_vars marks
+; every byte of such a value that any later scanner could read as syntax by
+; putting EV_MARK in front of it; the scanners (read_word in ash_exec.asm,
+; ash_next_word, parse_redirection, the pipe scan) treat "EV_MARK c" as the
+; plain character c, and the text handed to /bin/sh goes through
+; ash_sh_decode first.
+;
+; Redirections are applied here only for builtins. Everything else keeps its
+; redirections in the text: the native executor (or /bin/sh) opens them in
+; the child, so a failed open stops the command and no descriptor leaks.
 ; ============================================================================
+section .data
+    ; Bytes of a substituted value that get an EV_MARK in front of them
+    ev_special_chars    db 0x5C, 0x27, '"', '`', '$', '|', '&', ';', '<', '>'
+                        db '(', ')', '*', '?', '[', '~', '=', '#', 0
+    ev_e_long           db "ash: line too long after expansion", 10, 0
+    ev_e_subst          db "ash: unterminated command substitution", 10, 0
+    ev_e_brace          db "ash: unsupported ${...} expansion", 10, 0
+    ev_e_redir          db "ash: syntax error in redirection", 10, 0
+    ev_e_alias          db "ash: alias expansion too long", 10, 0
+    ev_msg_ash          db "ash: ", 0
+    ev_msg_colon        db ": ", 0
+    ev_msg_generic      db "cannot open file", 10, 0
+    ev_dev_null         db "/dev/null", 0
+
+    ; Builtins that parse their own arguments word by word; every other
+    ; builtin gets its argument text unquoted as a single string.
+    dc_raw_handlers     dq handler_echo, handler_grep, handler_copy
+                        dq handler_move, handler_copy_safe, handler_move_safe
+                        dq handler_test, handler_bracket, handler_bench
+                        dq handler_trace, handler_sandbox, 0
+
+section .bss
+    ev_mode             resb 1              ; 1 = leave $( ) and `` for /bin/sh
+    ev_overflow         resb 1              ; 1 = too long, 2 = error reported
+    alignb 4
+    ev_subst_status     resd 1              ; status of the last $( ), -1 none
+    ev_inner_buf        resb MAX_INPUT
+    ev_cap_buf          resb 4096
+    sh_line_buf         resb 1100
+    dc_args_buf         resb MAX_INPUT
+    redir_ops           resb 8 * 16         ; kind, fd, target (see parse_redirection)
+    redir_nops          resd 1
+    redir_err_saved     resd 1              ; saved stderr fd + 1, 0 = none
+    redir_pool          resb 4096
+section .text
+
+%define EV_MARK             0x01
+%define EV_SYS_PIPE2        293
+%define EV_SYS_FCNTL        72
+%define EV_F_DUPFD_CLOEXEC  1030
+%define EV_O_CLOEXEC        0x80000
+%define EV_CAP_SIZE         4096
+
 dispatch_command:
     push rbp
     mov rbp, rsp
@@ -2884,10 +2938,28 @@ dispatch_command:
     push r12
     push r13
     push r14
-    sub rsp, 32
+    sub rsp, 48
 
-    ; Expand environment variables ($VAR, ${VAR}, $?, $((...)))
+    ; Save the caller's redirection state (a builtin such as "source f > out"
+    ; runs nested commands that must keep writing to out); it is put back
+    ; on the way out. Layout from rbp-56: stderr, stdin fd, stdin active,
+    ; stdout fd, stdout active.
+    mov eax, [redir_err_saved]
+    mov [rbp - 56], eax
+    mov dword [redir_err_saved], 0
+    mov eax, [redir_stdin_fd]
+    mov [rbp - 52], eax
+    movzx eax, byte [redir_stdin_active]
+    mov [rbp - 48], eax
+    mov eax, [redir_stdout_fd]
+    mov [rbp - 44], eax
+    movzx eax, byte [redir_stdout_active]
+    mov [rbp - 40], eax
+
+    ; Expand environment variables ($VAR, ${VAR}, $?, $((...)), $(cmd))
     call expand_env_vars
+    test eax, eax
+    jnz .dc_done                    ; message printed, status set
 
     ; Assume success by default (overwritten on failure). Done after the
     ; expansion so "$?" still sees the previous command's status.
@@ -2895,95 +2967,57 @@ dispatch_command:
 
     ; Check aliases
     call check_alias
+    test eax, eax
+    jnz .dc_done
 
-    ; Check for pipe '|' - if found, pass to external (sh -c)
+    ; A pipeline goes to the native executor as a whole
     lea rdi, [input_buf]
-.dc_pipe_check:
-    mov al, [rdi]
-    test al, al
-    jz .dc_no_pipe
-    cmp al, '|'
-    je .dc_external
-    cmp al, '`'                     ; command substitution -> /bin/sh
-    je .dc_external
-    cmp al, '$'
-    jne .dc_pipe_next
-    cmp byte [rdi + 1], '('
-    je .dc_external
-.dc_pipe_next:
-    inc rdi
-    jmp .dc_pipe_check
+    call dc_has_pipe
+    test eax, eax
+    jnz .dc_external
 
-.dc_no_pipe:
-    ; Parse redirection (>, >>, <)
+    ; Look for a builtin on the line without its redirections
     call parse_redirection
+    mov r14d, eax                   ; 1 = malformed redirection
+    lea rdi, [cleaned_cmd_buf]
+    call dc_find_builtin
+    test rax, rax
+    jz .dc_external                 ; not a builtin: the executor handles redirections
+    test r14d, r14d
+    jnz .dc_bad_redir
 
-    ; Try exact match table
-    lea r12, [cmd_table_exact]
-.dc_exact:
-    mov rdi, [r12]                  ; command name pointer
-    test rdi, rdi
-    jz .dc_prefix                   ; end of table
-
-    ; Compare input_buf with this command name (case-insensitive)
-    lea rdi, [input_buf]
-    mov rsi, [r12]
-    call str_icompare
+    lea rdi, [rbp - 56]
+    call apply_redirections
     test eax, eax
-    jz .dc_exact_found
-    add r12, 16                     ; next entry (2 qwords)
-    jmp .dc_exact
-
-.dc_exact_found:
-    mov rax, [r12 + 8]             ; handler address
-    xor edi, edi                    ; no args
-    call rax
-    jmp .dc_done
-
-.dc_prefix:
-    ; Try prefix match table
-    lea r12, [cmd_table_prefix]
-.dc_pfx_loop:
-    mov rdi, [r12]                  ; command name pointer
-    test rdi, rdi
-    jz .dc_external                 ; end of table, try external
-
-    mov r13d, [r12 + 16]           ; name length (3rd qword, lower dword)
+    jnz .dc_done
 
     lea rdi, [input_buf]
-    mov rsi, [r12]
-    mov edx, r13d
-    call str_icompare_n
+    lea rsi, [cleaned_cmd_buf]
+    call str_copy
+    lea rdi, [input_buf]
+    call dc_find_builtin
+    mov rbx, rax                    ; handler
+    mov r12, rdx                    ; argument text or 0
+    test r12, r12
+    jz .dc_call
+    mov rdi, rbx
+    call dc_wants_raw
     test eax, eax
-    jnz .dc_pfx_next
-
-    ; Check char after the prefix
-    lea rax, [input_buf]
-    movzx eax, byte [rax + r13]
-    cmp al, ' '
-    je .dc_pfx_args
-    cmp al, 0
-    je .dc_pfx_noargs
-
-.dc_pfx_next:
-    add r12, 24                     ; next entry (3 qwords)
-    jmp .dc_pfx_loop
-
-.dc_pfx_args:
-    ; Handler with arguments
-    mov rbx, [r12 + 8]             ; handler address
-    lea rdi, [input_buf]
-    add rdi, r13
-    inc rdi                         ; skip the space
-    call skip_spaces                ; rax = first non-space
-    mov rdi, rax                    ; args in rdi
+    jnz .dc_call
+    mov rdi, r12                    ; unquote the argument text as one string
+    lea rsi, [dc_args_buf]
+    xor edx, edx
+    call ash_next_word
+    lea r12, [dc_args_buf]
+.dc_call:
+    mov rdi, r12
     call rbx
     jmp .dc_done
 
-.dc_pfx_noargs:
-    mov rax, [r12 + 8]             ; handler address
-    xor edi, edi                    ; no args
-    call rax
+.dc_bad_redir:
+    lea rdi, [ev_e_redir]
+    call ash_write_err
+    mov dword [last_exit_status], 2
     jmp .dc_done
 
 .dc_external:
@@ -2992,9 +3026,10 @@ dispatch_command:
     call stats_end
 
 .dc_done:
+    lea rdi, [rbp - 56]
     call restore_redirection
 
-    add rsp, 32
+    add rsp, 48
     pop r14
     pop r13
     pop r12
@@ -3002,65 +3037,398 @@ dispatch_command:
     pop rbp
     ret
 
-; ============================================================================
-; expand_env_vars - Replace $VAR and ${VAR} in input_buf with values
-; Linux uses $VAR instead of Windows %VAR%
-; ============================================================================
-expand_env_vars:
+; ----------------------------------------------------------------------------
+; dc_find_builtin(rdi = line) -> rax = handler or 0, rdx = argument text or 0
+; Exact-match table first, then the prefix table (name followed by a blank
+; or the end of the line).
+; ----------------------------------------------------------------------------
+dc_find_builtin:
     push rbp
     mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov r14, rdi
+    lea r12, [cmd_table_exact]
+.fb_exact:
+    mov rsi, [r12]
+    test rsi, rsi
+    jz .fb_prefix
+    mov rdi, r14
+    call str_icompare
+    test eax, eax
+    jz .fb_exact_hit
+    add r12, 16
+    jmp .fb_exact
+.fb_exact_hit:
+    mov rax, [r12 + 8]
+    xor edx, edx
+    jmp .fb_ret
+
+.fb_prefix:
+    lea r12, [cmd_table_prefix]
+.fb_pfx:
+    mov rsi, [r12]
+    test rsi, rsi
+    jz .fb_none
+    mov r13d, [r12 + 16]
+    mov rdi, r14
+    mov edx, r13d
+    call str_icompare_n
+    test eax, eax
+    jnz .fb_pfx_next
+    movzx eax, byte [r14 + r13]
+    cmp al, ' '
+    je .fb_args
+    test al, al
+    jz .fb_noargs
+.fb_pfx_next:
+    add r12, 24
+    jmp .fb_pfx
+.fb_args:
+    lea rdi, [r14 + r13 + 1]
+    call skip_spaces
+    mov rdx, rax
+    mov rax, [r12 + 8]
+    jmp .fb_ret
+.fb_noargs:
+    mov rax, [r12 + 8]
+    xor edx, edx
+    jmp .fb_ret
+.fb_none:
+    xor eax, eax
+    xor edx, edx
+.fb_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; dc_wants_raw(rdi = handler) -> eax = 1 if it parses its own arguments
+dc_wants_raw:
+    lea rsi, [dc_raw_handlers]
+.wr_loop:
+    mov rax, [rsi]
+    test rax, rax
+    jz .wr_no
+    cmp rax, rdi
+    je .wr_yes
+    add rsi, 8
+    jmp .wr_loop
+.wr_yes:
+    mov eax, 1
+    ret
+.wr_no:
+    xor eax, eax
+    ret
+
+; ----------------------------------------------------------------------------
+; dc_has_pipe(rdi = text) -> eax = 1 if there is a '|' outside quotes that is
+; neither escaped nor marked as data.
+; ----------------------------------------------------------------------------
+dc_has_pipe:
+    xor ecx, ecx                    ; 0 plain, 1 '...', 2 "..."
+.hp_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .hp_no
+    cmp al, EV_MARK
+    je .hp_skip2
+    cmp ecx, 1
+    je .hp_in_sq
+    cmp al, '\'
+    je .hp_skip2
+    cmp ecx, 2
+    je .hp_in_dq
+    cmp al, 0x27
+    je .hp_open_sq
+    cmp al, '"'
+    je .hp_open_dq
+    cmp al, '|'
+    je .hp_yes
+.hp_next:
+    inc rdi
+    jmp .hp_loop
+.hp_skip2:
+    cmp byte [rdi + 1], 0
+    je .hp_no
+    add rdi, 2
+    jmp .hp_loop
+.hp_open_sq:
+    mov ecx, 1
+    jmp .hp_next
+.hp_open_dq:
+    mov ecx, 2
+    jmp .hp_next
+.hp_in_sq:
+    cmp al, 0x27
+    jne .hp_next
+    xor ecx, ecx
+    jmp .hp_next
+.hp_in_dq:
+    cmp al, '"'
+    jne .hp_next
+    xor ecx, ecx
+    jmp .hp_next
+.hp_yes:
+    mov eax, 1
+    ret
+.hp_no:
+    xor eax, eax
+    ret
+
+; ----------------------------------------------------------------------------
+; dc_trailing_amp(rdi = text) -> rax = address of a final unquoted '&' (only
+; blanks after it) or 0. Escaped, quoted and marked '&' do not count.
+; ----------------------------------------------------------------------------
+dc_trailing_amp:
+    xor ecx, ecx                    ; quote state
+    xor r8d, r8d                    ; last '&' seen
+    xor r9d, r9d                    ; last byte that is not a blank
+.ta_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .ta_end
+    cmp al, EV_MARK
+    je .ta_pair
+    cmp ecx, 1
+    je .ta_in_sq
+    cmp al, '\'
+    je .ta_pair
+    cmp ecx, 2
+    je .ta_in_dq
+    cmp al, 0x27
+    je .ta_open_sq
+    cmp al, '"'
+    je .ta_open_dq
+    cmp al, ' '
+    je .ta_next
+    cmp al, 9
+    je .ta_next
+    mov r9, rdi
+    cmp al, '&'
+    jne .ta_next
+    mov r8, rdi
+.ta_next:
+    inc rdi
+    jmp .ta_loop
+.ta_pair:
+    mov r9, rdi
+    cmp byte [rdi + 1], 0
+    je .ta_end
+    add rdi, 2
+    jmp .ta_loop
+.ta_open_sq:
+    mov ecx, 1
+    mov r9, rdi
+    jmp .ta_next
+.ta_open_dq:
+    mov ecx, 2
+    mov r9, rdi
+    jmp .ta_next
+.ta_in_sq:
+    mov r9, rdi
+    cmp al, 0x27
+    jne .ta_next
+    xor ecx, ecx
+    jmp .ta_next
+.ta_in_dq:
+    mov r9, rdi
+    cmp al, '"'
+    jne .ta_next
+    xor ecx, ecx
+    jmp .ta_next
+.ta_end:
+    xor eax, eax
+    test r8, r8
+    jz .ta_ret
+    cmp r8, r9
+    jne .ta_ret
+    mov rax, r8
+.ta_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; ash_sh_decode(rdi = text) -> rax = sh_line_buf
+; Turns the marked bytes of an expanded line back into plain data for
+; /bin/sh: backslash-escaped when unquoted, escaped only where needed inside
+; "..." and '...'. The quoting state follows the text as /bin/sh will read it.
+; ----------------------------------------------------------------------------
+ash_sh_decode:
+    lea rsi, [sh_line_buf]
+    lea r8, [sh_line_buf + 1090]
+    xor ecx, ecx                    ; 0 plain, 1 '...', 2 "..."
+.sd_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .sd_done
+    cmp rsi, r8
+    jae .sd_done
+    cmp al, EV_MARK
+    je .sd_mark
+    cmp ecx, 1
+    je .sd_in_sq
+    cmp al, '\'
+    jne .sd_not_bs
+    mov [rsi], al                   ; copy the backslash and what it escapes
+    inc rsi
+    inc rdi
+    movzx eax, byte [rdi]
+    test al, al
+    jz .sd_done
+    jmp .sd_store
+.sd_not_bs:
+    cmp ecx, 2
+    je .sd_in_dq
+    cmp al, 0x27
+    jne .sd_chk_dq
+    mov ecx, 1
+    jmp .sd_store
+.sd_chk_dq:
+    cmp al, '"'
+    jne .sd_store
+    mov ecx, 2
+    jmp .sd_store
+.sd_in_sq:
+    cmp al, 0x27
+    jne .sd_store
+    xor ecx, ecx
+    jmp .sd_store
+.sd_in_dq:
+    cmp al, '"'
+    jne .sd_store
+    xor ecx, ecx
+.sd_store:
+    mov [rsi], al
+    inc rsi
+    inc rdi
+    jmp .sd_loop
+
+.sd_mark:
+    movzx edx, byte [rdi + 1]
+    test dl, dl
+    jz .sd_done
+    add rdi, 2
+    cmp dl, EV_MARK
+    jne .sd_mark_c
+    mov [rsi], dl                   ; a literal marker byte
+    inc rsi
+    jmp .sd_loop
+.sd_mark_c:
+    cmp ecx, 1
+    je .sd_m_sq
+    cmp ecx, 2
+    je .sd_m_dq
+    cmp dl, 10                      ; a newline would end the command
+    jne .sd_m_bs
+    mov byte [rsi], 0x27
+    mov byte [rsi + 1], 10
+    mov byte [rsi + 2], 0x27
+    add rsi, 3
+    jmp .sd_loop
+.sd_m_bs:
+    mov byte [rsi], '\'
+    mov [rsi + 1], dl
+    add rsi, 2
+    jmp .sd_loop
+.sd_m_dq:
+    cmp dl, '$'
+    je .sd_m_bs
+    cmp dl, '`'
+    je .sd_m_bs
+    cmp dl, '"'
+    je .sd_m_bs
+    cmp dl, '\'
+    je .sd_m_bs
+    jmp .sd_m_plain
+.sd_m_sq:
+    cmp dl, 0x27                    ; close the quote, escape it, reopen
+    jne .sd_m_plain
+    mov byte [rsi], 0x27
+    mov byte [rsi + 1], '\'
+    mov byte [rsi + 2], 0x27
+    mov byte [rsi + 3], 0x27
+    add rsi, 4
+    jmp .sd_loop
+.sd_m_plain:
+    mov [rsi], dl
+    inc rsi
+    jmp .sd_loop
+.sd_done:
+    mov byte [rsi], 0
+    lea rax, [sh_line_buf]
+    ret
+
+; ============================================================================
+; expand_env_vars - Replace $VAR, ${VAR}, $?, $$, $#, $@, $((expr)),
+; $(cmd) and `cmd` in input_buf with their values.
+; Linux uses $VAR instead of Windows %VAR%.
+;
+; The text is rewritten into env_expand_buf and copied back. A value is data:
+; spaces and tabs stay (an unquoted value splits into words), a newline
+; becomes a blank outside quotes, and every byte listed in ev_special_chars
+; (and the marker itself) gets EV_MARK in front. A backslash keeps the next
+; character literal, text inside '...' is copied untouched, and EV_MARK pairs
+; already in the text pass through, so expanding twice changes nothing more.
+; Returns eax = 0, or 1 after printing why (too long, unterminated $( ).
+; expand_env_vars_sh leaves $( ) and `` unexpanded for a later /bin/sh run.
+; ============================================================================
+expand_env_vars_sh:
+    mov byte [ev_mode], 1
+    jmp expand_env_vars.body
+expand_env_vars:
+    mov byte [ev_mode], 0
+.body:
+    push rbp
+    mov rbp, rsp
+    push rbx
     push r12
     push r13
     push r14
     push r15
-    sub rsp, 16
+    sub rsp, 24
 
+    mov byte [ev_overflow], 0
+    mov dword [ev_subst_status], -1
     lea r12, [input_buf]           ; source pointer
     lea r13, [env_expand_buf]      ; destination pointer
     lea r14, [env_expand_buf + MAX_INPUT - 1] ; result goes back to input_buf
-    mov byte [rbp - 40], 1          ; at-word-start flag
-    mov byte [rbp - 48], 0          ; inside "..."
+    mov r15d, 1                     ; at-word-start flag
+    xor ebx, ebx                    ; inside "..."
 
 .ev_loop:
     movzx eax, byte [r12]
     test al, al
     jz .ev_done
-
+    cmp al, EV_MARK
+    je .ev_pair
+    cmp al, '\'
+    je .ev_bs
     cmp al, '"'
     jne .ev_not_dq
-    xor byte [rbp - 48], 1
+    xor ebx, 1
     jmp .ev_regular
 .ev_not_dq:
     cmp al, 0x27                    ; '...' is copied as-is (no expansion)
     jne .ev_not_sq
-    cmp byte [rbp - 48], 0
-    jne .ev_regular
-.ev_sq_copy:
-    cmp r13, r14
-    jae .ev_done
-    mov [r13], al
-    inc r13
-    inc r12
-    movzx eax, byte [r12]
-    test al, al
-    jz .ev_done
-    cmp al, 0x27
-    jne .ev_sq_copy
-    cmp r13, r14
-    jae .ev_done
-    mov [r13], al
-    inc r13
-    inc r12
-    mov byte [rbp - 40], 0
-    jmp .ev_loop
+    test ebx, ebx
+    jnz .ev_regular
+    jmp .ev_sq
 .ev_not_sq:
     cmp al, '$'
     je .ev_dollar
-
+    cmp al, '`'
+    je .ev_btick
     cmp al, '~'
     jne .ev_regular
-    cmp byte [rbp - 40], 0          ; only expand at word start
-    je .ev_regular
+    test r15d, r15d                 ; only expand at word start
+    jz .ev_regular
+    test ebx, ebx
+    jnz .ev_regular
     movzx ecx, byte [r12 + 1]
     test cl, cl
     jz .ev_tilde
@@ -3068,19 +3436,91 @@ expand_env_vars:
     je .ev_tilde
     cmp cl, ' '
     je .ev_tilde
-    jmp .ev_regular
+    cmp cl, 9
+    je .ev_tilde
 
 .ev_regular:
     ; Regular character -- copy through (bounded)
     cmp r13, r14
-    jae .ev_done
+    jae .ev_over
     mov [r13], al
     inc r12
     inc r13
-    mov byte [rbp - 40], 0
+    xor r15d, r15d
     cmp al, ' '
+    je .ev_ws
+    cmp al, 9
     jne .ev_loop
-    mov byte [rbp - 40], 1
+.ev_ws:
+    mov r15d, 1
+    jmp .ev_loop
+
+.ev_pair:
+    ; An EV_MARK pair already in the text: keep both bytes
+    lea rax, [r13 + 1]
+    cmp rax, r14
+    jae .ev_over
+    mov byte [r13], EV_MARK
+    inc r12
+    inc r13
+    movzx eax, byte [r12]
+    test al, al
+    jz .ev_loop
+    mov [r13], al
+    inc r12
+    inc r13
+    xor r15d, r15d
+    jmp .ev_loop
+
+.ev_bs:
+    ; A backslash and the character after it are copied without looking at it
+    movzx ecx, byte [r12 + 1]
+    test cl, cl
+    jz .ev_regular                  ; trailing backslash
+    lea rax, [r13 + 3]
+    cmp rax, r14
+    jae .ev_over
+    mov byte [r13], '\'
+    inc r13
+    cmp cl, EV_MARK
+    jne .ev_bs_put
+    mov byte [r13], EV_MARK
+    inc r13
+    mov cl, EV_MARK
+.ev_bs_put:
+    mov [r13], cl
+    inc r13
+    add r12, 2
+    xor r15d, r15d
+    jmp .ev_loop
+
+.ev_sq:
+    ; '...' copied untouched (EV_MARK is doubled so it stays literal)
+    cmp r13, r14
+    jae .ev_over
+    mov byte [r13], 0x27
+    inc r13
+    inc r12
+.ev_sq_loop:
+    movzx eax, byte [r12]
+    test al, al
+    jz .ev_done
+    cmp al, EV_MARK
+    jne .ev_sq_put
+    lea rcx, [r13 + 1]
+    cmp rcx, r14
+    jae .ev_over
+    mov byte [r13], EV_MARK
+    inc r13
+.ev_sq_put:
+    cmp r13, r14
+    jae .ev_over
+    mov [r13], al
+    inc r13
+    inc r12
+    cmp al, 0x27
+    jne .ev_sq_loop
+    xor r15d, r15d
     jmp .ev_loop
 
 .ev_tilde:
@@ -3090,26 +3530,13 @@ expand_env_vars:
     test rax, rax
     jz .ev_tilde_literal
     mov rcx, rax
-.ev_tilde_cp:
-    movzx eax, byte [rcx]
-    test al, al
-    jz .ev_tilde_done
-    cmp r13, r14
-    jae .ev_done
-    mov [r13], al
-    inc r13
-    inc rcx
-    jmp .ev_tilde_cp
-.ev_tilde_done:
-    mov byte [rbp - 40], 0
-    jmp .ev_loop
-
+    jmp .ev_cpval
 .ev_tilde_literal:
     cmp r13, r14
-    jae .ev_done
+    jae .ev_over
     mov byte [r13], '~'
     inc r13
-    mov byte [rbp - 40], 0
+    xor r15d, r15d
     jmp .ev_loop
 
 .ev_dollar:
@@ -3135,9 +3562,9 @@ expand_env_vars:
     jmp .ev_lookup
 .ev_not_special:
     cmp al, '('
-    jne .ev_not_arith
+    jne .ev_not_paren
     cmp byte [r12 + 1], '('
-    jne .ev_not_arith
+    jne .ev_subst
     lea rdi, [r12 + 2]
     call ash_expand_arith           ; result in ash_num_buf
     test rax, rax
@@ -3159,7 +3586,84 @@ expand_env_vars:
     call ash_fmt_int
     lea rcx, [ash_num_buf]
     jmp .ev_cpval
-.ev_not_arith:
+
+.ev_subst:
+    ; $( ... ): r12 is at the '('
+    lea rdi, [r12 + 1]
+    call ev_find_close
+    test rax, rax
+    jz .ev_bad_subst
+    mov [rbp - 48], rax             ; the closing ')'
+    cmp byte [ev_mode], 0
+    jne .ev_subst_verbatim
+    lea rsi, [r12 + 1]
+    mov rdx, rax
+    xor ecx, ecx
+    call ev_copy_inner
+    lea rdi, [ev_inner_buf]
+    call ev_capture
+    mov rcx, rax
+    mov r12, [rbp - 48]
+    inc r12
+    jmp .ev_cpval
+.ev_subst_verbatim:
+    lea rsi, [r12 - 1]              ; from the '$'
+    mov rdx, [rbp - 48]
+    inc rdx
+    mov r12, rdx
+    jmp .ev_verbatim
+
+.ev_btick:
+    ; `...`: r12 is at the opening backtick
+    lea rdi, [r12 + 1]
+    call ev_find_btick
+    test rax, rax
+    jz .ev_bad_subst
+    mov [rbp - 48], rax
+    cmp byte [ev_mode], 0
+    jne .ev_btick_verbatim
+    lea rsi, [r12 + 1]
+    mov rdx, rax
+    mov ecx, 1
+    call ev_copy_inner
+    lea rdi, [ev_inner_buf]
+    call ev_capture
+    mov rcx, rax
+    mov r12, [rbp - 48]
+    inc r12
+    jmp .ev_cpval
+.ev_btick_verbatim:
+    mov rsi, r12
+    mov rdx, [rbp - 48]
+    inc rdx
+    mov r12, rdx
+    ; falls through
+
+.ev_verbatim:
+    ; copy [rsi, rdx) as it is, doubling EV_MARK
+.ev_vb_loop:
+    cmp rsi, rdx
+    jae .ev_vb_done
+    movzx eax, byte [rsi]
+    cmp al, EV_MARK
+    jne .ev_vb_put
+    lea rcx, [r13 + 1]
+    cmp rcx, r14
+    jae .ev_over
+    mov byte [r13], EV_MARK
+    inc r13
+.ev_vb_put:
+    cmp r13, r14
+    jae .ev_over
+    mov [r13], al
+    inc r13
+    inc rsi
+    jmp .ev_vb_loop
+.ev_vb_done:
+    xor r15d, r15d
+    jmp .ev_loop
+
+.ev_not_paren:
     ; Check for ${VAR} form
     cmp al, '{'
     je .ev_brace
@@ -3167,8 +3671,9 @@ expand_env_vars:
     ; $VAR form: read alphanumeric/underscore chars
     lea rdi, [env_var_name]
     xor r15d, r15d                  ; length of var name
+    xor edx, edx                    ; characters taken from the source
 .ev_read_name:
-    movzx eax, byte [r12 + r15]
+    movzx eax, byte [r12 + rdx]
     ; Check if alphanumeric or underscore
     cmp al, '_'
     je .ev_name_ok
@@ -3187,37 +3692,76 @@ expand_env_vars:
     cmp al, '9'
     ja .ev_name_end
 .ev_name_ok:
+    cmp r15d, 255                   ; longer names cannot exist: read the rest, keep nothing
+    jae .ev_name_skip
     mov [rdi + r15], al
     inc r15d
+.ev_name_skip:
+    inc edx
     jmp .ev_read_name
 
 .ev_name_end:
-    test r15d, r15d
+    test edx, edx
     jz .ev_literal_dollar           ; no name chars after $, copy literal $
+    cmp r15d, 255
+    jb .ev_name_term
+    mov r15d, 0                     ; over-long name: look up the empty name
+.ev_name_term:
     mov byte [rdi + r15], 0
-    add r12, r15                    ; advance source past the name
+    add r12, rdx                    ; advance source past the name
+    xor r15d, r15d
     jmp .ev_lookup
 
 .ev_brace:
     inc r12                         ; skip '{'
-    lea rdi, [env_var_name]
-    xor r15d, r15d
-.ev_brace_loop:
-    movzx eax, byte [r12 + r15]
+    xor edx, edx
+.ev_brace_find:
+    movzx eax, byte [r12 + rdx]
     test al, al
     jz .ev_literal_dollar_brace     ; unterminated ${
     cmp al, '}'
-    je .ev_brace_end
-    mov [rdi + r15], al
-    inc r15d
-    jmp .ev_brace_loop
-
-.ev_brace_end:
-    test r15d, r15d
+    je .ev_brace_found
+    inc edx
+    jmp .ev_brace_find
+.ev_brace_found:
+    test edx, edx
     jz .ev_brace_empty
-    mov byte [rdi + r15], 0
-    add r12, r15
-    inc r12                         ; skip '}'
+    ; only plain names are supported
+    lea rdi, [env_var_name]
+    xor ecx, ecx
+.ev_brace_chk:
+    cmp ecx, edx
+    jae .ev_brace_ok
+    movzx eax, byte [r12 + rcx]
+    cmp al, '_'
+    je .ev_brace_char
+    cmp al, '0'
+    jb .ev_bad_brace
+    cmp al, '9'
+    jbe .ev_brace_char
+    cmp al, 'A'
+    jb .ev_bad_brace
+    cmp al, 'Z'
+    jbe .ev_brace_char
+    cmp al, 'a'
+    jb .ev_bad_brace
+    cmp al, 'z'
+    ja .ev_bad_brace
+.ev_brace_char:
+    cmp ecx, 255
+    jae .ev_brace_next
+    mov [rdi + rcx], al
+.ev_brace_next:
+    inc ecx
+    jmp .ev_brace_chk
+.ev_brace_ok:
+    mov ecx, edx
+    cmp ecx, 255
+    jb .ev_brace_term
+    xor ecx, ecx
+.ev_brace_term:
+    mov byte [rdi + rcx], 0
+    lea r12, [r12 + rdx + 1]        ; past the '}'
     jmp .ev_lookup
 
 .ev_brace_empty:
@@ -3225,63 +3769,430 @@ expand_env_vars:
     inc r12                         ; skip '}'
     jmp .ev_loop
 
+.ev_bad_brace:
+    lea rdi, [ev_e_brace]
+    call ash_write_err
+    mov byte [ev_overflow], 2
+    jmp .ev_fail
+
+.ev_bad_subst:
+    lea rdi, [ev_e_subst]
+    call ash_write_err
+    mov byte [ev_overflow], 2
+    jmp .ev_fail
+
 .ev_literal_dollar:
     cmp r13, r14
-    jae .ev_done
+    jae .ev_over
     mov byte [r13], '$'
     inc r13
+    xor r15d, r15d
     jmp .ev_loop
 
 .ev_literal_dollar_brace:
     ; Unterminated ${ -- copy literal "${" and continue
-    cmp r13, r14
-    jae .ev_done
+    lea rax, [r13 + 1]
+    cmp rax, r14
+    jae .ev_over
     mov byte [r13], '$'
-    inc r13
-    cmp r13, r14
-    jae .ev_done
-    mov byte [r13], '{'
-    inc r13
+    mov byte [r13 + 1], '{'
+    add r13, 2
+    xor r15d, r15d
     jmp .ev_loop
 
 .ev_lookup:
     ; env_var_name holds the variable name, look it up
     lea rdi, [env_var_name]
     call getenv_internal
+    xor r15d, r15d
     test rax, rax
     jz .ev_loop                     ; variable not found, output nothing
-
-    ; Copy value to output (bounded)
     mov rcx, rax
+
 .ev_cpval:
+    ; rcx = value. It is data: mark whatever could read as syntax.
     movzx eax, byte [rcx]
     test al, al
-    jz .ev_loop
+    jz .ev_cpval_end
+    cmp al, ' '
+    je .ev_cp_plain
+    cmp al, 9
+    je .ev_cp_plain
+    cmp al, 10
+    jne .ev_cp_chk
+    test ebx, ebx
+    jnz .ev_cp_mark                 ; inside quotes a newline is data
+    mov al, ' '                     ; otherwise it separates words
+    jmp .ev_cp_plain
+.ev_cp_chk:
+    cmp al, EV_MARK
+    je .ev_cp_mark
+    call ev_is_special
+    test edx, edx
+    jz .ev_cp_plain
+.ev_cp_mark:
+    lea rdx, [r13 + 1]
+    cmp rdx, r14
+    jae .ev_over
+    mov byte [r13], EV_MARK
+    mov [r13 + 1], al
+    add r13, 2
+    inc rcx
+    jmp .ev_cpval
+.ev_cp_plain:
     cmp r13, r14
-    jae .ev_done
+    jae .ev_over
     mov [r13], al
     inc r13
     inc rcx
     jmp .ev_cpval
+.ev_cpval_end:
+    xor r15d, r15d
+    jmp .ev_loop
+
+.ev_over:
+    mov byte [ev_overflow], 1
 
 .ev_done:
     mov byte [r13], 0
+    cmp byte [ev_overflow], 0
+    jne .ev_fail
 
     ; Copy result back to input_buf
     lea rdi, [input_buf]
     lea rsi, [env_expand_buf]
     call str_copy
+    xor eax, eax
+    jmp .ev_ret
 
-    add rsp, 16
+.ev_fail:
+    cmp byte [ev_overflow], 1
+    jne .ev_fail_status
+    lea rdi, [ev_e_long]
+    call ash_write_err
+.ev_fail_status:
+    mov dword [last_exit_status], 1
+    mov eax, 1
+.ev_ret:
+    add rsp, 24
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
     pop rbp
     ret
 
+; ev_is_special(al) -> edx = 1 if the byte is in ev_special_chars.
+; Clobbers rsi and r8b only.
+ev_is_special:
+    lea rsi, [ev_special_chars]
+.is_loop:
+    mov r8b, [rsi]
+    test r8b, r8b
+    jz .is_no
+    cmp r8b, al
+    je .is_yes
+    inc rsi
+    jmp .is_loop
+.is_yes:
+    mov edx, 1
+    ret
+.is_no:
+    xor edx, edx
+    ret
+
+; ev_find_close(rdi = text after "$(") -> rax = the matching ')' or 0.
+; Quotes and nested parentheses are skipped.
+ev_find_close:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+    xor ebx, ebx                    ; open parentheses
+.fc_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .fc_fail
+    cmp al, '\'
+    je .fc_bs
+    cmp al, 0x27
+    je .fc_sq
+    cmp al, '"'
+    je .fc_dq
+    cmp al, '('
+    je .fc_lp
+    cmp al, ')'
+    je .fc_rp
+.fc_next:
+    inc rdi
+    jmp .fc_loop
+.fc_bs:
+    cmp byte [rdi + 1], 0
+    je .fc_fail
+    add rdi, 2
+    jmp .fc_loop
+.fc_sq:
+    inc rdi
+.fc_sq_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .fc_fail
+    cmp al, 0x27
+    je .fc_next
+    inc rdi
+    jmp .fc_sq_loop
+.fc_dq:
+    inc rdi
+.fc_dq_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .fc_fail
+    cmp al, '"'
+    je .fc_next
+    cmp al, '\'
+    jne .fc_dq_dollar
+    cmp byte [rdi + 1], 0
+    je .fc_fail
+    add rdi, 2
+    jmp .fc_dq_loop
+.fc_dq_dollar:
+    cmp al, '$'
+    jne .fc_dq_next
+    cmp byte [rdi + 1], '('
+    jne .fc_dq_next
+    add rdi, 2                      ; a nested $( ) inside the quotes
+    call ev_find_close
+    test rax, rax
+    jz .fc_fail
+    lea rdi, [rax + 1]
+    jmp .fc_dq_loop
+.fc_dq_next:
+    inc rdi
+    jmp .fc_dq_loop
+.fc_lp:
+    inc ebx
+    jmp .fc_next
+.fc_rp:
+    test ebx, ebx
+    jz .fc_found
+    dec ebx
+    jmp .fc_next
+.fc_found:
+    mov rax, rdi
+    jmp .fc_ret
+.fc_fail:
+    xor eax, eax
+.fc_ret:
+    add rsp, 8
+    pop rbx
+    pop rbp
+    ret
+
+; ev_find_btick(rdi = text after a backtick) -> rax = the closing backtick or 0
+ev_find_btick:
+.fb_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .fb_fail
+    cmp al, '`'
+    je .fb_found
+    cmp al, '\'
+    jne .fb_next
+    cmp byte [rdi + 1], 0
+    je .fb_fail
+    inc rdi
+.fb_next:
+    inc rdi
+    jmp .fb_loop
+.fb_found:
+    mov rax, rdi
+    ret
+.fb_fail:
+    xor eax, eax
+    ret
+
+; ev_copy_inner(rsi = start, rdx = end, ecx = 1 to drop the backslash of
+; \` \\ \$) copies the command text into ev_inner_buf.
+ev_copy_inner:
+    lea rdi, [ev_inner_buf]
+    lea r8, [ev_inner_buf + MAX_INPUT - 1]
+.ci_loop:
+    cmp rsi, rdx
+    jae .ci_done
+    mov al, [rsi]
+    test ecx, ecx
+    jz .ci_store
+    cmp al, '\'
+    jne .ci_store
+    mov r9b, [rsi + 1]
+    cmp r9b, '`'
+    je .ci_esc
+    cmp r9b, '\'
+    je .ci_esc
+    cmp r9b, '$'
+    jne .ci_store
+.ci_esc:
+    inc rsi
+    mov al, r9b
+.ci_store:
+    cmp rdi, r8
+    jae .ci_done
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .ci_loop
+.ci_done:
+    mov byte [rdi], 0
+    ret
+
+; ----------------------------------------------------------------------------
+; ev_capture(rdi = command text) -> rax = its output in ev_cap_buf with the
+; trailing newlines removed. Runs the text through the script engine in a
+; forked child (so builtins, functions and pipelines all work and nothing it
+; changes leaks back); stdout is a pipe, stdin is /dev/null. The status goes
+; to ev_subst_status.
+; ----------------------------------------------------------------------------
+ev_capture:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 24                     ; [rsp] wait status, [rsp+8] pipe fds
+
+    mov r12, rdi
+    mov byte [ev_cap_buf], 0
+    mov dword [ev_subst_status], 1
+
+    lea rdi, [rsp + 8]
+    mov esi, EV_O_CLOEXEC
+    mov eax, EV_SYS_PIPE2
+    syscall
+    test rax, rax
+    js .cap_ret
+
+    mov eax, SYS_FORK
+    syscall
+    test rax, rax
+    js .cap_fork_error
+    jz .cap_child
+    mov ebx, eax                    ; child pid
+
+    mov edi, [rsp + 12]             ; the parent keeps only the read end
+    mov eax, SYS_CLOSE
+    syscall
+
+    xor r13d, r13d                  ; bytes stored
+.cap_read:
+    mov edx, EV_CAP_SIZE - 1
+    sub edx, r13d
+    jz .cap_drain
+    mov edi, [rsp + 8]
+    lea rsi, [ev_cap_buf + r13]
+    xor eax, eax                    ; SYS_READ
+    syscall
+    cmp rax, -4                     ; EINTR
+    je .cap_read
+    test rax, rax
+    jle .cap_read_done
+    add r13d, eax
+    jmp .cap_read
+.cap_drain:
+    mov edi, [rsp + 8]
+    lea rsi, [ev_inner_buf]         ; the command text is no longer needed
+    mov edx, MAX_INPUT
+    xor eax, eax
+    syscall
+    cmp rax, -4
+    je .cap_drain
+    test rax, rax
+    jg .cap_drain
+.cap_read_done:
+    mov byte [ev_cap_buf + r13], 0
+    mov edi, [rsp + 8]
+    mov eax, SYS_CLOSE
+    syscall
+
+.cap_wait:
+    mov dword [rsp], 0
+    mov edi, ebx
+    mov rsi, rsp
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -4
+    je .cap_wait
+    mov eax, [rsp]
+    mov edx, eax
+    and edx, 0x7F
+    jz .cap_exited
+    lea eax, [rdx + 128]
+    jmp .cap_status
+.cap_exited:
+    shr eax, 8
+    and eax, 0xFF
+.cap_status:
+    mov [ev_subst_status], eax
+.cap_strip:                         ; trailing newlines are not part of the value
+    test r13d, r13d
+    jz .cap_ret
+    cmp byte [ev_cap_buf + r13 - 1], 10
+    jne .cap_ret
+    dec r13d
+    mov byte [ev_cap_buf + r13], 0
+    jmp .cap_strip
+
+.cap_fork_error:
+    mov edi, [rsp + 8]
+    mov eax, SYS_CLOSE
+    syscall
+    mov edi, [rsp + 12]
+    mov eax, SYS_CLOSE
+    syscall
+.cap_ret:
+    lea rax, [ev_cap_buf]
+    add rsp, 24
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+.cap_child:
+    mov edi, [rsp + 12]
+    mov esi, 1
+    mov eax, SYS_DUP2
+    syscall
+    lea rdi, [ev_dev_null]
+    xor esi, esi
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .cap_child_run
+    mov edi, eax
+    xor esi, esi
+    mov eax, SYS_DUP2
+    syscall
+.cap_child_run:
+    ; Output goes to a pipe: no terminal handling, no colour, and no
+    ; redirection of the shell's own (it would bypass the pipe).
+    mov byte [interactive_mode], 0
+    mov byte [color_enabled], 0
+    mov byte [redir_stdout_active], 0
+    mov byte [redir_stdin_active], 0
+    mov rdi, r12
+    mov esi, 1
+    call ash_eval
+    mov edi, [last_exit_status]
+    mov eax, SYS_EXIT
+    syscall
+
 ; ============================================================================
-; check_alias - If first word matches an alias, expand it
+; check_alias - If first word matches an alias, expand it.
+; Returns eax = 1 (after a message) if the expanded line would not fit.
 ; ============================================================================
 check_alias:
     push rbp
@@ -3329,6 +4240,16 @@ check_alias:
     jmp .ca_loop
 
 .ca_match:
+    ; The expansion must fit in a command line
+    lea rdi, [rbx + ALIAS_NAME_SIZE]
+    call str_len
+    mov r12d, eax
+    lea rdi, [input_buf + r13]
+    call str_len
+    add eax, r12d
+    cmp eax, MAX_INPUT - 1
+    jae .ca_too_long
+
     ; Build expanded command: alias_value + rest of input
     lea rdi, [env_expand_buf]
     lea rsi, [rbx + ALIAS_NAME_SIZE]   ; alias value
@@ -3349,6 +4270,14 @@ check_alias:
     call str_copy
 
 .ca_done:
+    xor eax, eax
+    jmp .ca_ret
+.ca_too_long:
+    lea rdi, [ev_e_alias]
+    call ash_write_err
+    mov dword [last_exit_status], 1
+    mov eax, 1
+.ca_ret:
     add rsp, 24
     pop r13
     pop r12
@@ -3357,249 +4286,610 @@ check_alias:
     ret
 
 ; ============================================================================
-; parse_redirection - Scan input_buf for > >> <, open files, clean command
-; Uses Linux open() syscall instead of CreateFileA.
+; parse_redirection - Find redirections in input_buf without opening anything.
+; Writes the line without them to cleaned_cmd_buf and the operations to
+; redir_ops (16 bytes each: dword kind, dword fd, qword target). Kinds:
+; 1 > file, 2 >> file, 3 < file, 4 duplicate (target = the fd number).
+; Quotes, backslashes and marked bytes are respected; "N>" is recognised when
+; the digits start a word, "&>file" means > file plus 2>&1.
+; Returns eax = 1 if a redirection is malformed.
 ; ============================================================================
 parse_redirection:
     push rbp
     mov rbp, rsp
+    push rbx
     push r12
     push r13
     push r14
-    sub rsp, 24
+    push r15
+    sub rsp, 40
 
-    mov byte [redir_stdout_active], 0
-    mov byte [redir_stdin_active], 0
-    mov byte [redir_append], 0
-    mov dword [redir_stdout_fd], -1
-    mov dword [redir_stdin_fd], -1
-
+    mov dword [redir_nops], 0
     lea r12, [input_buf]           ; source pointer
     lea r13, [cleaned_cmd_buf]     ; destination (cleaned command)
+    lea r14, [redir_pool]          ; next free byte for targets
+    xor ebx, ebx                   ; quote state: 0 plain, 1 '...', 2 "..."
+    xor r15d, r15d                 ; malformed flag
+    mov [rbp - 48], r13            ; where the current word starts
+    mov dword [rbp - 52], 0        ; digits so far, -1 once the word has anything else
 
 .pr_loop:
     movzx eax, byte [r12]
     test al, al
     jz .pr_finish
-
-    ; Detect '2>' / '2>>' / '2>&1' / '&>' (stderr redirect) — these are
-    ; passed through unchanged so /bin/sh interprets them for external
-    ; commands. Builtins don't support stderr redirect.
-    cmp al, '2'
-    jne .pr_check_amp
-    cmp byte [r12 + 1], '>'
-    jne .pr_normal
-    jmp .pr_passthrough_redir
-
-.pr_check_amp:
-    cmp al, '&'
-    jne .pr_normal
-    cmp byte [r12 + 1], '>'
-    jne .pr_normal
-    jmp .pr_passthrough_redir
-
-.pr_normal:
+    cmp al, EV_MARK
+    je .pr_pair
+    cmp ebx, 1
+    je .pr_in_sq
+    cmp al, '\'
+    je .pr_pair
+    cmp ebx, 2
+    je .pr_in_dq
+    cmp al, 0x27
+    je .pr_open_sq
+    cmp al, '"'
+    je .pr_open_dq
+    cmp al, ' '
+    je .pr_blank
+    cmp al, 9
+    je .pr_blank
     cmp al, '>'
-    je .pr_out
+    je .pr_op
     cmp al, '<'
-    je .pr_in
-
-    ; Regular char -- copy to cleaned buf
-    mov [r13], al
+    je .pr_op
+    cmp al, '&'
+    jne .pr_char
+    cmp byte [r12 + 1], '>'
+    jne .pr_char
+    cmp dword [rbp - 52], 0
+    jne .pr_char
+    ; "&>" and "&>>" at the start of a word
     inc r12
+    mov dword [rbp - 56], 1         ; fd: stdout
+    mov dword [rbp - 60], 1         ; also send stderr along
+    jmp .pr_op_kind
+
+.pr_char:
+    mov ecx, [rbp - 52]
+    cmp al, '0'
+    jb .pr_not_digit
+    cmp al, '9'
+    ja .pr_not_digit
+    test ecx, ecx
+    js .pr_store
+    inc ecx
+    mov [rbp - 52], ecx
+    jmp .pr_store
+.pr_not_digit:
+    mov dword [rbp - 52], -1
+.pr_store:
+    mov [r13], al
     inc r13
+    inc r12
     jmp .pr_loop
 
-.pr_passthrough_redir:
-    ; Copy the fd digit ('2' or '&'), the '>' (and maybe second '>'),
-    ; then whatever comes until whitespace/EOL (could be '&1', filename, etc.)
-    mov [r13], al                   ; copy fd digit or '&'
-    inc r12
+.pr_pair:
+    mov [r13], al
     inc r13
-    mov [r13], byte '>'
     inc r12
+    movzx eax, byte [r12]
+    test al, al
+    jz .pr_finish
+    mov [r13], al
     inc r13
-    cmp byte [r12], '>'
-    jne .pr_pt_after_op
-    mov [r13], byte '>'
     inc r12
+    mov dword [rbp - 52], -1
+    jmp .pr_loop
+
+.pr_open_sq:
+    mov ebx, 1
+    mov dword [rbp - 52], -1
+    jmp .pr_store
+.pr_open_dq:
+    mov ebx, 2
+    mov dword [rbp - 52], -1
+    jmp .pr_store
+.pr_in_sq:
+    cmp al, 0x27
+    jne .pr_store
+    xor ebx, ebx
+    jmp .pr_store
+.pr_in_dq:
+    cmp al, '"'
+    jne .pr_store
+    xor ebx, ebx
+    jmp .pr_store
+
+.pr_blank:
+    mov [r13], al
     inc r13
-.pr_pt_after_op:
-    ; Optional spaces
-.pr_pt_sp:
-    cmp byte [r12], ' '
-    jne .pr_pt_copy_target
-    mov [r13], byte ' '
     inc r12
-    inc r13
-    jmp .pr_pt_sp
-.pr_pt_copy_target:
-    ; Copy target bytes up to next whitespace or EOL or '>' / '<'
-.pr_pt_tgt:
+    mov [rbp - 48], r13
+    mov dword [rbp - 52], 0
+    jmp .pr_loop
+
+.pr_op:
+    ; fd: the digits that start this word, else 1 for '>' and 0 for '<'
+    mov dword [rbp - 60], 0
+    mov ecx, [rbp - 52]
+    test ecx, ecx
+    jle .pr_default_fd
+    cmp ecx, 2
+    ja .pr_fd_big
+    mov rdx, [rbp - 48]
+    movzx esi, byte [rdx]
+    sub esi, '0'
+    cmp ecx, 2
+    jne .pr_fd_set
+    imul esi, esi, 10
+    movzx edi, byte [rdx + 1]
+    sub edi, '0'
+    add esi, edi
+    jmp .pr_fd_set
+.pr_fd_big:
+    mov esi, 99                     ; a descriptor we do not handle
+.pr_fd_set:
+    mov [rbp - 56], esi
+    mov r13, [rbp - 48]             ; the digits are not an argument
+    jmp .pr_op_kind
+.pr_default_fd:
+    mov dword [rbp - 56], 1
+    cmp al, '>'
+    je .pr_op_kind
+    mov dword [rbp - 56], 0
+
+.pr_op_kind:
+    ; r12 is at the '>' or '<'. [rbp-64]: kind 1 trunc, 2 append, 3 in, 4 dup
+    movzx eax, byte [r12]
+    inc r12
+    cmp al, '<'
+    je .pr_lt
+    mov dword [rbp - 64], 1
+    movzx eax, byte [r12]
+    cmp al, '>'
+    jne .pr_gt_2
+    inc r12
+    mov dword [rbp - 64], 2
+    jmp .pr_after_op
+.pr_gt_2:
+    cmp al, '|'                     ; ">|" is just ">" here
+    jne .pr_after_op
+    inc r12
+    jmp .pr_after_op
+.pr_lt:
+    mov dword [rbp - 64], 3
+    movzx eax, byte [r12]
+    cmp al, '<'                     ; here-documents are not supported
+    je .pr_bad
+    cmp al, '>'
+    je .pr_bad
+.pr_after_op:
+    cmp byte [r12], '&'
+    jne .pr_target
+    cmp dword [rbp - 60], 0
+    jne .pr_bad
+    ; ">&N" / "<&N": duplicate a descriptor
+    inc r12
+    movzx eax, byte [r12]
+    cmp al, '0'
+    jb .pr_bad
+    cmp al, '9'
+    ja .pr_bad
+    sub eax, '0'
+    movzx ecx, byte [r12 + 1]
+    cmp cl, '0'
+    jb .pr_dup_end
+    cmp cl, '9'
+    ja .pr_dup_end
+    imul eax, eax, 10               ; two digits: not one of ours
+    sub ecx, '0'
+    add eax, ecx
+    inc r12
+.pr_dup_end:
+    inc r12
+    movzx ecx, byte [r12]           ; the number must end the word
+    test cl, cl
+    jz .pr_dup_rec
+    cmp cl, ' '
+    je .pr_dup_rec
+    cmp cl, 9
+    je .pr_dup_rec
+    jmp .pr_bad
+.pr_dup_rec:
+    mov [rbp - 72], rax
+    mov dword [rbp - 64], 4
+    call .pr_record_prep
+    test rdx, rdx
+    jz .pr_bad
+    mov dword [rdx], 4
+    mov eax, [rbp - 56]
+    mov [rdx + 4], eax
+    mov rax, [rbp - 72]
+    mov [rdx + 8], rax
+    jmp .pr_loop
+
+.pr_target:
+    ; Read the target word (quotes removed) into the pool
+    mov rdi, r12
+    call ash_skip_blanks
+    mov r12, rax
+    movzx eax, byte [r12]
+    test al, al
+    jz .pr_bad
+    cmp al, '<'
+    je .pr_bad
+    cmp al, '>'
+    je .pr_bad
+    cmp al, '|'
+    je .pr_bad
+    cmp al, '&'
+    je .pr_bad
+    cmp al, ';'
+    je .pr_bad
+    lea rax, [redir_pool + 4096 - MAX_INPUT]
+    cmp r14, rax
+    ja .pr_bad
+    mov rdi, r12
+    mov rsi, r14
+    mov edx, 1
+    call ash_next_word
+    test rax, rax
+    jz .pr_bad
+    mov r12, rax
+    mov [rbp - 72], r14             ; the word
+    mov r14, rdx
+    call .pr_record_prep
+    test rdx, rdx
+    jz .pr_bad
+    mov eax, [rbp - 64]
+    mov [rdx], eax
+    mov eax, [rbp - 56]
+    mov [rdx + 4], eax
+    mov rax, [rbp - 72]
+    mov [rdx + 8], rax
+    cmp dword [rbp - 60], 0
+    je .pr_loop
+    ; "&>file" also sends stderr to the same place
+    call .pr_record_prep
+    test rdx, rdx
+    jz .pr_bad
+    mov dword [rdx], 4
+    mov dword [rdx + 4], 2
+    mov qword [rdx + 8], 1
+    jmp .pr_loop
+
+.pr_bad:
+    mov r15d, 1
+    ; skip the rest of this word so the scan keeps moving
+.pr_bad_skip:
     movzx eax, byte [r12]
     test al, al
     jz .pr_loop
     cmp al, ' '
     je .pr_loop
-    cmp al, '>'
-    je .pr_loop
-    cmp al, '<'
-    je .pr_loop
-    mov [r13], al
     inc r12
-    inc r13
-    jmp .pr_pt_tgt
+    jmp .pr_bad_skip
 
-.pr_out:
-    inc r12
-    ; Check for >> (append)
-    cmp byte [r12], '>'
-    jne .pr_out_create
-    inc r12
-    mov byte [redir_append], 1
-
-.pr_out_create:
-    ; Skip spaces after > or >>
-.pr_skip1:
-    cmp byte [r12], ' '
-    jne .pr_fname_out
-    inc r12
-    jmp .pr_skip1
-
-.pr_fname_out:
-    ; Copy filename
-    lea r14, [redir_filename]
-.pr_cpfn1:
-    movzx eax, byte [r12]
-    test al, al
-    jz .pr_cpfn1_done
-    cmp al, ' '
-    je .pr_cpfn1_done
-    cmp al, '>'
-    je .pr_cpfn1_done
-    cmp al, '<'
-    je .pr_cpfn1_done
-    mov [r14], al
-    inc r12
-    inc r14
-    jmp .pr_cpfn1
-.pr_cpfn1_done:
-    mov byte [r14], 0
-
-    ; Open file for writing
-    lea rdi, [redir_filename]
-    cmp byte [redir_append], 0
-    jne .pr_open_append
-
-    ; Truncate mode: O_WRONLY | O_CREAT | O_TRUNC
-    mov esi, O_WRONLY | O_CREAT | O_TRUNC
-    jmp .pr_do_open_out
-.pr_open_append:
-    ; Append mode: O_WRONLY | O_CREAT | O_APPEND
-    mov esi, O_WRONLY | O_CREAT | O_APPEND
-.pr_do_open_out:
-    mov edx, PERM_0644
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .pr_loop                     ; open failed, skip
-    mov [redir_stdout_fd], eax
-    mov byte [redir_stdout_active], 1
-    jmp .pr_loop
-
-.pr_in:
-    inc r12
-    ; Skip spaces after <
-.pr_skip2:
-    cmp byte [r12], ' '
-    jne .pr_fname_in
-    inc r12
-    jmp .pr_skip2
-
-.pr_fname_in:
-    lea r14, [redir_filename]
-.pr_cpfn2:
-    movzx eax, byte [r12]
-    test al, al
-    jz .pr_cpfn2_done
-    cmp al, ' '
-    je .pr_cpfn2_done
-    cmp al, '>'
-    je .pr_cpfn2_done
-    cmp al, '<'
-    je .pr_cpfn2_done
-    mov [r14], al
-    inc r12
-    inc r14
-    jmp .pr_cpfn2
-.pr_cpfn2_done:
-    mov byte [r14], 0
-
-    ; Open file for reading: O_RDONLY
-    lea rdi, [redir_filename]
-    mov esi, O_RDONLY
+; next free slot of redir_ops in rdx (0 when full); counts it
+.pr_record_prep:
+    mov eax, [redir_nops]
     xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
-    test rax, rax
-    js .pr_loop                     ; open failed, skip
-    mov [redir_stdin_fd], eax
-    mov byte [redir_stdin_active], 1
-    jmp .pr_loop
+    cmp eax, 8
+    jae .pr_rp_ret
+    inc dword [redir_nops]
+    shl eax, 4
+    lea rdx, [redir_ops]
+    add rdx, rax
+.pr_rp_ret:
+    ret
 
 .pr_finish:
-    ; Strip trailing spaces from cleaned command
+    ; Strip trailing blanks from the cleaned command
     lea rax, [cleaned_cmd_buf]
 .pr_strip:
     cmp r13, rax
     je .pr_strip_done
     cmp byte [r13 - 1], ' '
+    je .pr_strip_one
+    cmp byte [r13 - 1], 9
     jne .pr_strip_done
+.pr_strip_one:
     dec r13
     jmp .pr_strip
 .pr_strip_done:
     mov byte [r13], 0
+    mov eax, r15d
 
-    ; Copy cleaned command back to input_buf
-    lea rdi, [input_buf]
-    lea rsi, [cleaned_cmd_buf]
-    call str_copy
-
-    add rsp, 24
+    add rsp, 40
+    pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
     pop rbp
     ret
 
 ; ============================================================================
-; restore_redirection - Close redirect file descriptors
+; apply_redirections(rdi = caller state block) -> eax = 0, or 1 after an error
+; Carries out the operations of parse_redirection for a builtin, in order.
+; stdout and stdin use the redir_* variables read by print_string_len; stderr
+; is moved onto fd 2 itself, with the old fd 2 kept in redir_err_saved.
+; The block (from dispatch_command) says which descriptors the caller owns.
+; ============================================================================
+apply_redirections:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    mov r15, rdi
+    xor ebx, ebx
+.ap_next:
+    cmp ebx, [redir_nops]
+    jae .ap_ok
+    mov eax, ebx
+    shl eax, 4
+    lea r12, [redir_ops]
+    add r12, rax
+    mov r13d, [r12 + 4]             ; fd being redirected
+    mov eax, [r12]
+    cmp eax, 4
+    je .ap_dup
+
+    mov rdi, [r12 + 8]
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC | EV_O_CLOEXEC
+    cmp eax, 1
+    je .ap_open
+    mov esi, O_WRONLY | O_CREAT | O_APPEND | EV_O_CLOEXEC
+    cmp eax, 2
+    je .ap_open
+    mov esi, O_RDONLY | EV_O_CLOEXEC
+.ap_open:
+    mov edx, PERM_0644
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .ap_open_err
+    mov r14d, eax
+    cmp r13d, 1
+    je .ap_set_out
+    test r13d, r13d
+    jz .ap_set_in
+    cmp r13d, 2
+    je .ap_set_err
+    mov edi, r14d                   ; another descriptor: the file is only created
+    mov eax, SYS_CLOSE
+    syscall
+    jmp .ap_adv
+
+.ap_set_out:
+    call .ap_close_out
+    mov [redir_stdout_fd], r14d
+    mov byte [redir_stdout_active], 1
+    jmp .ap_adv
+.ap_set_in:
+    call .ap_close_in
+    mov [redir_stdin_fd], r14d
+    mov byte [redir_stdin_active], 1
+    jmp .ap_adv
+.ap_set_err:
+    call .ap_save_err
+    mov edi, r14d
+    mov esi, 2
+    mov eax, SYS_DUP2
+    syscall
+    mov edi, r14d
+    mov eax, SYS_CLOSE
+    syscall
+    jmp .ap_adv
+
+.ap_dup:
+    mov r14d, [r12 + 8]             ; descriptor to copy
+    cmp r13d, 1
+    je .ap_dup_out
+    cmp r13d, 2
+    je .ap_dup_err
+    jmp .ap_adv
+.ap_dup_out:
+    cmp r14d, 2                     ; ">&2": stdout becomes a copy of stderr
+    jne .ap_adv
+    mov edi, 2
+    mov esi, EV_F_DUPFD_CLOEXEC
+    mov edx, 10
+    mov eax, EV_SYS_FCNTL
+    syscall
+    test rax, rax
+    js .ap_adv
+    mov r14d, eax
+    jmp .ap_set_out
+.ap_dup_err:
+    cmp r14d, 1                     ; "2>&1": stderr follows stdout
+    jne .ap_adv
+    call .ap_save_err
+    mov edi, 1
+    cmp byte [redir_stdout_active], 0
+    je .ap_dup_err_do
+    mov edi, [redir_stdout_fd]
+.ap_dup_err_do:
+    mov esi, 2
+    mov eax, SYS_DUP2
+    syscall
+
+.ap_adv:
+    inc ebx
+    jmp .ap_next
+
+.ap_open_err:
+    neg eax
+    mov edi, eax
+    mov rsi, [r12 + 8]
+    call dc_redir_error
+    mov dword [last_exit_status], 1
+    mov eax, 1
+    jmp .ap_ret
+.ap_ok:
+    xor eax, eax
+.ap_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; Close the current stdout redirect when this command opened it (the caller's
+; own is left for the caller to close).
+.ap_close_out:
+    cmp byte [redir_stdout_active], 0
+    je .ap_co_ret
+    mov eax, [redir_stdout_fd]
+    cmp dword [r15 + 16], 0
+    je .ap_co_close
+    cmp eax, [r15 + 12]
+    je .ap_co_ret
+.ap_co_close:
+    mov edi, eax
+    mov eax, SYS_CLOSE
+    syscall
+.ap_co_ret:
+    ret
+.ap_close_in:
+    cmp byte [redir_stdin_active], 0
+    je .ap_ci_ret
+    mov eax, [redir_stdin_fd]
+    cmp dword [r15 + 8], 0
+    je .ap_ci_close
+    cmp eax, [r15 + 4]
+    je .ap_ci_ret
+.ap_ci_close:
+    mov edi, eax
+    mov eax, SYS_CLOSE
+    syscall
+.ap_ci_ret:
+    ret
+; Keep the real stderr (once per command) before it is replaced
+.ap_save_err:
+    cmp dword [redir_err_saved], 0
+    jne .ap_se_ret
+    mov edi, 2
+    mov esi, EV_F_DUPFD_CLOEXEC
+    mov edx, 10
+    mov eax, EV_SYS_FCNTL
+    syscall
+    test rax, rax
+    js .ap_se_ret
+    inc eax
+    mov [redir_err_saved], eax
+.ap_se_ret:
+    ret
+
+; dc_redir_error(edi = errno, rsi = file name) - "ash: FILE: reason" on stderr
+dc_redir_error:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    mov ebx, edi
+    mov r12, rsi
+    lea rdi, [ev_msg_ash]
+    call ash_write_err
+    mov rdi, r12
+    call ash_write_err
+    lea rdi, [ev_msg_colon]
+    call ash_write_err
+    lea rsi, [errno_table]
+.re_find:
+    mov eax, [rsi]
+    test eax, eax
+    jz .re_generic
+    cmp eax, ebx
+    je .re_found
+    add rsi, 12
+    jmp .re_find
+.re_found:
+    mov rdi, [rsi + 4]
+    jmp .re_print
+.re_generic:
+    lea rdi, [ev_msg_generic]
+.re_print:
+    call ash_write_err
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
+; restore_redirection(rdi = block saved by dispatch_command)
+; Closes what this command opened and puts the caller's state back.
 ; ============================================================================
 restore_redirection:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
+    push rbx
+    sub rsp, 8
+    mov rbx, rdi
 
     cmp byte [redir_stdout_active], 0
     je .rr_stdin
-    mov edi, [redir_stdout_fd]
+    mov eax, [redir_stdout_fd]
+    cmp dword [rbx + 16], 0
+    je .rr_close_out
+    cmp eax, [rbx + 12]
+    je .rr_stdin
+.rr_close_out:
+    mov edi, eax
     mov eax, SYS_CLOSE
     syscall
-    mov byte [redir_stdout_active], 0
-    mov dword [redir_stdout_fd], -1
-
 .rr_stdin:
     cmp byte [redir_stdin_active], 0
-    je .rr_done
-    mov edi, [redir_stdin_fd]
+    je .rr_restore
+    mov eax, [redir_stdin_fd]
+    cmp dword [rbx + 8], 0
+    je .rr_close_in
+    cmp eax, [rbx + 4]
+    je .rr_restore
+.rr_close_in:
+    mov edi, eax
     mov eax, SYS_CLOSE
     syscall
-    mov byte [redir_stdin_active], 0
-    mov dword [redir_stdin_fd], -1
 
-.rr_done:
-    leave
+.rr_restore:
+    mov eax, [rbx + 16]
+    mov [redir_stdout_active], al
+    mov eax, [rbx + 12]
+    mov [redir_stdout_fd], eax
+    mov eax, [rbx + 8]
+    mov [redir_stdin_active], al
+    mov eax, [rbx + 4]
+    mov [redir_stdin_fd], eax
+
+    mov edi, [redir_err_saved]
+    test edi, edi
+    jz .rr_err_done
+    dec edi                         ; put the real stderr back on fd 2
+    mov esi, 2
+    mov eax, SYS_DUP2
+    syscall
+    mov eax, [redir_err_saved]
+    dec eax
+    mov edi, eax
+    mov eax, SYS_CLOSE
+    syscall
+.rr_err_done:
+    mov eax, [rbx]
+    mov [redir_err_saved], eax
+
+    add rsp, 8
+    pop rbx
+    pop rbp
     ret
+
 
 ; ============================================================================
 ; Command Handlers - Each takes rdi = args pointer (or NULL/0)
@@ -5324,7 +6614,6 @@ execute_external:
     ; r14b = 1 if background, 0 if foreground
     xor r14d, r14d                  ; assume foreground
 
-    ; Find end of input_buf
     lea rdi, [input_buf]
     call str_len
     mov r13d, eax                   ; r13d = length
@@ -5332,34 +6621,26 @@ execute_external:
     test r13d, r13d
     jz .ee_error                    ; empty command
 
-    ; Walk backwards from end, skip trailing spaces
-    lea rbx, [input_buf]
-    mov ecx, r13d
-
-.ee_trim_end:
-    dec ecx
-    js .ee_no_bg                    ; reached start without finding non-space
-    cmp byte [rbx + rcx], ' '
-    je .ee_trim_end
-
-    ; Check if this last non-space char is '&'
-    cmp byte [rbx + rcx], '&'
-    jne .ee_no_bg
+    ; A final '&' that is not quoted, escaped or marked as data
+    lea rdi, [input_buf]
+    call dc_trailing_amp
+    test rax, rax
+    jz .ee_no_bg
 
     ; Found '&' - enable background mode
     mov r14d, 1
 
     ; Remove the '&' and any trailing spaces before it
-    mov byte [rbx + rcx], 0        ; null-terminate at '&'
-
-    ; Trim more trailing spaces before the & was
-    dec ecx
+    lea rbx, [input_buf]
+    mov byte [rax], 0
+    mov rcx, rax
+    sub rcx, rbx
 .ee_trim_before_amp:
+    dec ecx
     js .ee_bg_trimmed
     cmp byte [rbx + rcx], ' '
     jne .ee_bg_trimmed
     mov byte [rbx + rcx], 0
-    dec ecx
     jmp .ee_trim_before_amp
 
 .ee_bg_trimmed:
@@ -5414,9 +6695,11 @@ execute_external:
     mov [rax], rcx                  ; argv[0] = "/bin/sh"
     lea rcx, [sh_dash_c]
     mov [rax + 8], rcx              ; argv[1] = "-c"
-    lea rcx, [input_buf]
-    mov [rax + 16], rcx             ; argv[2] = command string
-    mov qword [rax + 24], 0         ; argv[3] = NULL
+    lea rdi, [input_buf]            ; marked data bytes become plain text for sh
+    call ash_sh_decode
+    lea rcx, [exec_argv]
+    mov [rcx + 16], rax             ; argv[2] = command string
+    mov qword [rcx + 24], 0         ; argv[3] = NULL
 
     ; Build merged envp = overlay entries first, then inherited envp.
     ; Ensures 'set NAME=VAL' is visible to child processes (POSIX export).

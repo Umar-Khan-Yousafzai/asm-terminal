@@ -50,6 +50,7 @@
 %define RW_GLOB             1           ; unquoted * ? [
 %define RW_EQUALS           2           ; unquoted =
 %define RW_CONSUMED         4           ; at least one char or quote read
+%define RW_MARKED           8           ; contains a byte marked as data (EV_MARK)
 
 section .data
     ash_s_path          db "PATH", 0
@@ -253,10 +254,13 @@ ash_parse:
     test ecx, RW_EQUALS
     jnz .ap_fail
     mov [rsp], rax
+    test ecx, RW_MARKED             ; a value is never a keyword
+    jnz .ap_store_cmd
     mov rdi, rax
     call .is_keyword
     test eax, eax
     jnz .ap_fail
+.ap_store_cmd:
     mov rax, [rsp]
 .ap_store:
     lea rdx, [ash_argv + (ASH_MAX_ARGS - 1) * 8]
@@ -320,6 +324,8 @@ ash_parse:
     movzx edx, byte [r12]
     test dl, dl
     jz .rw_end
+    cmp dl, EV_MARK                 ; marked byte: the next one is plain data
+    je .rw_mark
     cmp dl, ' '
     je .rw_end
     cmp dl, 9
@@ -374,6 +380,14 @@ ash_parse:
     or ecx, RW_CONSUMED
     jmp .rw_loop
 
+.rw_mark:
+    movzx edx, byte [r12 + 1]
+    test dl, dl
+    jz .rw_fail
+    inc r12
+    or ecx, RW_MARKED
+    jmp .rw_emit
+
 .rw_backslash:
     movzx edx, byte [r12 + 1]
     test dl, dl
@@ -388,8 +402,18 @@ ash_parse:
     movzx edx, byte [r12]
     test dl, dl
     jz .rw_fail                     ; unterminated quote
+    cmp dl, EV_MARK
+    jne .rw_sq_plain
+    movzx edx, byte [r12 + 1]
+    test dl, dl
+    jz .rw_fail
+    inc r12
+    or ecx, RW_MARKED
+    jmp .rw_sq_store
+.rw_sq_plain:
     cmp dl, 0x27
     je .rw_sq_end
+.rw_sq_store:
     cmp r13, r8
     jae .rw_fail
     mov [r13], dl
@@ -407,6 +431,15 @@ ash_parse:
     movzx edx, byte [r12]
     test dl, dl
     jz .rw_fail                     ; unterminated quote
+    cmp dl, EV_MARK
+    jne .rw_dq_plain
+    movzx edx, byte [r12 + 1]
+    test dl, dl
+    jz .rw_fail
+    inc r12
+    or ecx, RW_MARKED
+    jmp .rw_dq_put
+.rw_dq_plain:
     cmp dl, '"'
     je .rw_dq_end
     cmp dl, '$'
