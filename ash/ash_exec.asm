@@ -27,24 +27,22 @@
 
 ; One record per pipeline stage
 %define STG_ARGV            0           ; qword: pointer into ash_argv
-%define STG_IN              8           ; qword: '<' file name or 0
-%define STG_OUT             16          ; qword: '>' / '>>' file name or 0
-%define STG_ERR             24          ; qword: '2>' / '2>>' file name or 0
-%define STG_FLAGS           32          ; dword: STGF_*
+%define STG_SRC             8           ; qword: first byte of the stage in the line
+%define STG_SEND            16          ; qword: end of the stage in the line
+%define STG_NOPS            32          ; dword: redirections below
 %define STG_ARGC            36          ; dword
 %define STG_PID             40          ; qword
-%define STG_SIZE            48
+%define STG_OPS             48          ; STG_MAXOPS redirection records
+%define STG_MAXOPS          4
+%define STG_SIZE            (STG_OPS + STG_MAXOPS * 16)
 
-%define STGF_OUT_APPEND     1
-%define STGF_ERR_APPEND     2
-%define STGF_ERR_TO_OUT     4
-
-; Redirection kinds while parsing
-%define RK_IN               1
-%define RK_OUT              2
-%define RK_OUT_APP          3
-%define RK_ERR              4
-%define RK_ERR_APP          5
+; Redirection record: dword kind, dword descriptor to redirect, qword file
+; name (RO_IN/RO_OUT/RO_APP) or descriptor to copy (RO_DUP). They run in the
+; order they were written, as in sh ("2>&1 >f" differs from ">f 2>&1").
+%define RO_IN               1
+%define RO_OUT              2
+%define RO_APP              3
+%define RO_DUP              4
 
 ; read_word result flags (ecx)
 %define RW_GLOB             1           ; unquoted * ? [
@@ -74,6 +72,8 @@ section .bss
     ash_pool            resb ASH_POOL_SIZE
     ash_pipes           resd ASH_MAX_STAGES * 2
     ash_nstages         resd 1
+    alignb 8
+    ash_child_stage     resq 1          ; set in a pipeline child: its stage record
     ash_exec_path       resb MAX_PATH_BUF
     ash_sh_argv         resq ASH_MAX_ARGS + 2
 
@@ -91,7 +91,7 @@ ash_parse:
     push r13
     push r14
     push r15
-    sub rsp, 8
+    sub rsp, 24                     ; [rsp] kind, [rsp+8] fd, [rsp+16] "&>" flag
 
     mov r12, rdi                    ; r12 = source cursor
     lea r13, [ash_pool]             ; r13 = pool write cursor
@@ -104,11 +104,10 @@ ash_parse:
     imul eax, ebx, STG_SIZE
     lea r15, [ash_stages + rax]     ; r15 = current stage
     mov [r15 + STG_ARGV], r14
+    mov [r15 + STG_SRC], r12
     xor eax, eax
-    mov [r15 + STG_IN], rax
-    mov [r15 + STG_OUT], rax
-    mov [r15 + STG_ERR], rax
-    mov [r15 + STG_FLAGS], eax
+    mov [r15 + STG_SEND], rax
+    mov [r15 + STG_NOPS], eax
     mov [r15 + STG_ARGC], eax
     mov [r15 + STG_PID], rax
 
@@ -126,77 +125,111 @@ ash_parse:
     je .ap_lt
     cmp al, '>'
     je .ap_gt
-    cmp al, '2'
-    jne .ap_word
-    cmp byte [r12 + 1], '>'
-    jne .ap_word
+    cmp al, '&'
+    je .ap_amp
+    cmp al, '0'
+    jb .ap_word
+    cmp al, '9'
+    ja .ap_word
 
-    ; "2>..." at the start of a word
-    cmp byte [r12 + 2], '&'
-    jne .ap_err_file
-    cmp byte [r12 + 3], '1'
+    ; Digits straight in front of < or > name the descriptor: "2>f", "0<f"
+    mov rcx, r12
+.ap_digits:
+    inc rcx
+    movzx edx, byte [rcx]
+    cmp dl, '0'
+    jb .ap_digits_end
+    cmp dl, '9'
+    jbe .ap_digits
+.ap_digits_end:
+    cmp dl, '<'
+    je .ap_fd_redir
+    cmp dl, '>'
+    jne .ap_word                    ; just a word that starts with a number
+.ap_fd_redir:
+    lea rdx, [r12 + 1]
+    cmp rcx, rdx                    ; "10>f" and the like: leave to /bin/sh
     jne .ap_fail
-    movzx eax, byte [r12 + 4]       ; "2>&1" must end the word
-    test al, al
-    jz .ap_err_to_out
-    cmp al, ' '
-    je .ap_err_to_out
-    cmp al, 9
-    je .ap_err_to_out
-    cmp al, '|'
-    jne .ap_fail
-.ap_err_to_out:
-    mov eax, [r15 + STG_FLAGS]
-    and eax, ~STGF_ERR_APPEND
-    or eax, STGF_ERR_TO_OUT
-    mov [r15 + STG_FLAGS], eax
-    mov qword [r15 + STG_ERR], 0
-    add r12, 4
-    jmp .ap_next
-
-.ap_err_file:
-    cmp byte [r12 + 2], '>'
-    je .ap_err_app
-    add r12, 2
-    mov edx, RK_ERR
-    jmp .ap_redir
-.ap_err_app:
-    add r12, 3
-    mov edx, RK_ERR_APP
-    jmp .ap_redir
-
-.ap_skip:
-    inc r12
-    jmp .ap_next
+    movzx esi, byte [r12]
+    sub esi, '0'
+    cmp esi, 2
+    ja .ap_fail
+    mov r12, rcx
+    mov [rsp + 8], esi
+    mov dword [rsp + 16], 0
+    jmp .ap_op
 
 .ap_lt:
-    cmp byte [r12 + 1], '<'         ; here-doc: not yet
-    je .ap_fail
-    inc r12
-    mov edx, RK_IN
-    jmp .ap_redir
-
+    mov dword [rsp + 8], 0
+    mov dword [rsp + 16], 0
+    jmp .ap_op
 .ap_gt:
-    cmp byte [r12 + 1], '>'
-    je .ap_gt_app
+    mov dword [rsp + 8], 1
+    mov dword [rsp + 16], 0
+    jmp .ap_op
+.ap_amp:
+    cmp byte [r12 + 1], '>'         ; "&>file": stdout and stderr to the file
+    jne .ap_fail
     inc r12
-    mov edx, RK_OUT
-    jmp .ap_redir
-.ap_gt_app:
-    add r12, 2
-    mov edx, RK_OUT_APP
+    mov dword [rsp + 8], 1
+    mov dword [rsp + 16], 1
 
-.ap_redir:
-    ; '>&', '>|', '<>', '>>>' and friends: leave to /bin/sh
+.ap_op:
     movzx eax, byte [r12]
-    cmp al, '&'
-    je .ap_fail
-    cmp al, '|'
-    je .ap_fail
+    inc r12
     cmp al, '<'
+    je .ap_op_in
+    mov edx, RO_OUT
+    movzx eax, byte [r12]
+    cmp al, '>'
+    jne .ap_op_gt_plain
+    inc r12
+    mov edx, RO_APP
+    jmp .ap_op_chk
+.ap_op_gt_plain:
+    cmp al, '|'                     ; ">|" is not supported here
+    je .ap_fail
+    jmp .ap_op_chk
+.ap_op_in:
+    mov edx, RO_IN
+    movzx eax, byte [r12]
+    cmp al, '<'                     ; here-doc, "<>" and "<&": not yet
     je .ap_fail
     cmp al, '>'
     je .ap_fail
+    cmp al, '&'
+    je .ap_fail
+.ap_op_chk:
+    cmp byte [r12], '&'
+    jne .ap_redir_skip
+    ; ">&N": copy descriptor N (0, 1 or 2)
+    cmp edx, RO_OUT
+    jne .ap_fail
+    cmp dword [rsp + 16], 0
+    jne .ap_fail
+    movzx eax, byte [r12 + 1]
+    sub eax, '0'
+    cmp eax, 2
+    ja .ap_fail
+    movzx ecx, byte [r12 + 2]       ; the number must end the word
+    test cl, cl
+    jz .ap_dup_ok
+    cmp cl, ' '
+    je .ap_dup_ok
+    cmp cl, 9
+    je .ap_dup_ok
+    cmp cl, '|'
+    jne .ap_fail
+.ap_dup_ok:
+    add r12, 2
+    mov edx, RO_DUP
+    mov r8d, [rsp + 8]
+    mov r9d, eax
+    call .add_op
+    test eax, eax
+    jz .ap_fail
+    jmp .ap_next
+
 .ap_redir_skip:
     movzx eax, byte [r12]
     cmp al, ' '
@@ -216,28 +249,23 @@ ash_parse:
     test ecx, RW_GLOB               ; globbed file name: not yet
     jnz .ap_fail
     mov edx, [rsp]
-    cmp edx, RK_IN
-    je .ap_set_in
-    cmp edx, RK_ERR
-    jae .ap_set_err
-
-    mov [r15 + STG_OUT], rax
-    and dword [r15 + STG_FLAGS], ~STGF_OUT_APPEND
-    cmp edx, RK_OUT_APP
-    jne .ap_next
-    or dword [r15 + STG_FLAGS], STGF_OUT_APPEND
+    mov r8d, [rsp + 8]
+    mov r9, rax
+    call .add_op
+    test eax, eax
+    jz .ap_fail
+    cmp dword [rsp + 16], 0
+    je .ap_next
+    mov edx, RO_DUP                 ; "&>file" also copies stdout onto stderr
+    mov r8d, 2
+    mov r9d, 1
+    call .add_op
+    test eax, eax
+    jz .ap_fail
     jmp .ap_next
 
-.ap_set_in:
-    mov [r15 + STG_IN], rax
-    jmp .ap_next
-
-.ap_set_err:
-    mov [r15 + STG_ERR], rax
-    and dword [r15 + STG_FLAGS], ~(STGF_ERR_APPEND | STGF_ERR_TO_OUT)
-    cmp edx, RK_ERR_APP
-    jne .ap_next
-    or dword [r15 + STG_FLAGS], STGF_ERR_APPEND
+.ap_skip:
+    inc r12
     jmp .ap_next
 
 .ap_word:
@@ -276,6 +304,7 @@ ash_parse:
     je .ap_fail
     cmp byte [r12 + 1], '&'         ; '|&'
     je .ap_fail
+    mov [r15 + STG_SEND], r12
     inc r12
     call .close_stage
     test eax, eax
@@ -283,6 +312,7 @@ ash_parse:
     jmp .ap_new_stage
 
 .ap_end:
+    mov [r15 + STG_SEND], r12
     call .close_stage
     test eax, eax
     jz .ap_fail
@@ -293,13 +323,31 @@ ash_parse:
     xor eax, eax
 .ap_ret:
     mov [ash_nstages], eax
-    add rsp, 8
+    add rsp, 24
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; Record a redirection on the current stage: edx = RO_* kind, r8d = descriptor
+; being redirected, r9 = file name or descriptor to copy. eax = 0 if full.
+.add_op:
+    mov ecx, [r15 + STG_NOPS]
+    cmp ecx, STG_MAXOPS
+    jae .ao_full
+    shl ecx, 4
+    lea rcx, [r15 + rcx + STG_OPS]
+    mov [rcx], edx
+    mov [rcx + 4], r8d
+    mov [rcx + 8], r9
+    inc dword [r15 + STG_NOPS]
+    mov eax, 1
+    ret
+.ao_full:
+    xor eax, eax
     ret
 
 ; Finish the current stage: NULL-terminate its argv. eax = 1 ok, 0 empty stage.
@@ -669,46 +717,40 @@ ash_run:
     syscall
 
 .ac_files:
-    mov rdi, [r13 + STG_IN]
-    test rdi, rdi
-    jz .ac_file_out
+    ; Redirections in the order they were written
+    xor r14d, r14d
+.ac_op_loop:
+    cmp r14d, [r13 + STG_NOPS]
+    jae .ac_exec
+    mov eax, r14d
+    shl eax, 4
+    lea r15, [r13 + rax + STG_OPS]
+    mov eax, [r15]
+    mov edx, [r15 + 4]              ; descriptor being redirected
+    cmp eax, RO_DUP
+    je .ac_dup
+    mov rdi, [r15 + 8]
     mov esi, O_RDONLY
-    xor edx, edx
-    call ash_child_open
-
-.ac_file_out:
-    mov rdi, [r13 + STG_OUT]
-    test rdi, rdi
-    jz .ac_file_err
+    cmp eax, RO_IN
+    je .ac_open
     mov esi, O_WRONLY | O_CREAT | O_TRUNC
-    test dword [r13 + STG_FLAGS], STGF_OUT_APPEND
-    jz .ac_open_out
+    cmp eax, RO_OUT
+    je .ac_open
     mov esi, O_WRONLY | O_CREAT | O_APPEND
-.ac_open_out:
-    mov edx, 1
+.ac_open:
     call ash_child_open
-
-.ac_file_err:
-    mov rdi, [r13 + STG_ERR]
-    test rdi, rdi
-    jz .ac_err_to_out
-    mov esi, O_WRONLY | O_CREAT | O_TRUNC
-    test dword [r13 + STG_FLAGS], STGF_ERR_APPEND
-    jz .ac_open_err
-    mov esi, O_WRONLY | O_CREAT | O_APPEND
-.ac_open_err:
-    mov edx, 2
-    call ash_child_open
-
-.ac_err_to_out:
-    test dword [r13 + STG_FLAGS], STGF_ERR_TO_OUT
-    jz .ac_exec
-    mov edi, 1
-    mov esi, 2
+    jmp .ac_op_next
+.ac_dup:
+    mov edi, [r15 + 8]
+    mov esi, edx
     mov eax, SYS_DUP2
     syscall
+.ac_op_next:
+    inc r14d
+    jmp .ac_op_loop
 
 .ac_exec:
+    mov [ash_child_stage], r13
     mov rdi, [r13 + STG_ARGV]
     call ash_exec_argv              ; does not return
 
@@ -814,6 +856,7 @@ ash_exec_argv:
     jmp .ax_segment
 
 .ax_failed:
+    call ash_child_builtin          ; a builtin used as a pipeline stage
     lea rdi, [ash_msg_prefix]
     call ash_write_err
     mov rdi, r13
@@ -863,6 +906,63 @@ ash_exec_argv:
     mov eax, SYS_EXECVE
     syscall
 .ax_try_ret:
+    ret
+
+; ----------------------------------------------------------------------------
+; ash_child_builtin - called in a forked pipeline stage whose command is not a
+; program on PATH: run it as a builtin ("history | grep x"), then exit. It
+; returns only when the command is not a builtin. The stage's own
+; redirections are already in place, so they are only stripped from the text.
+; ----------------------------------------------------------------------------
+ash_child_builtin:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+    mov rbx, [ash_child_stage]
+    test rbx, rbx
+    jz .cb_ret
+    mov rsi, [rbx + STG_SRC]
+    mov rdx, [rbx + STG_SEND]
+    lea rdi, [input_buf]
+    lea r8, [input_buf + MAX_INPUT - 1]
+.cb_copy:
+    cmp rsi, rdx
+    jae .cb_copied
+    cmp rdi, r8
+    jae .cb_copied
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .cb_copy
+.cb_copied:
+    mov byte [rdi], 0
+    call parse_redirection
+    test eax, eax
+    jnz .cb_ret
+    lea rdi, [cleaned_cmd_buf]
+    call skip_spaces
+    mov rbx, rax
+    mov rdi, rbx
+    call dc_find_builtin
+    test rax, rax
+    jz .cb_ret
+    lea rdi, [input_buf]
+    mov rsi, rbx
+    call str_copy
+    lea rdi, [input_buf]
+    call dc_find_builtin
+    mov rdi, rax
+    mov rsi, rdx
+    call dc_run_handler
+    mov edi, [last_exit_status]
+    mov eax, SYS_EXIT
+    syscall
+.cb_ret:
+    add rsp, 8
+    pop rbx
+    pop rbp
     ret
 
 ; ----------------------------------------------------------------------------
