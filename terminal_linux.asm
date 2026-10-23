@@ -347,6 +347,8 @@ section .data
                     db "    jobs            List background jobs", 10
                     db "    fg <n>          Bring job to foreground", 10
                     db "                    fg 1", 10
+                    db "    bg <n>          Resume a stopped job in the background", 10
+                    db "    Ctrl+Z          Stop the running command (then fg or bg)", 10
                     db 10
                     db "  SHELL FEATURES", 10
                     db "  ---------------------------------------------------", 10
