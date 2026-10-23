@@ -7,13 +7,14 @@
 [CmdletBinding()]
 param(
     [switch]$Silent,
+    # Normally read from terminal.exe, which carries the number from version.inc
+    [string]$Version,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ASM-Terminal')
 )
 
 $ErrorActionPreference = 'Stop'
 
 $AppName      = 'ASM Terminal'
-$AppVersion   = '2.0.0'
 $AppPublisher = 'Umar Khan Yousafzai'
 $AppUrl       = 'https://github.com/Umar-Khan-Yousafzai/asm-terminal'
 $ExeName      = 'terminal.exe'
@@ -26,6 +27,13 @@ if (-not (Test-Path $SrcExe)) {
     Write-Host "[ERROR] $ExeName not found next to install.ps1 ($SrcDir)." -ForegroundColor Red
     if (-not $Silent) { Read-Host 'Press Enter to exit' }
     exit 1
+}
+
+# The exe holds its own version in the window title text
+$AppVersion = $Version
+if (-not $AppVersion) {
+    $text = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($SrcExe))
+    if ($text -match 'ASM Terminal v(\d+\.\d+\.\d+)') { $AppVersion = $Matches[1] } else { $AppVersion = 'unknown' }
 }
 
 Write-Host ""
@@ -66,7 +74,7 @@ $icon   = Join-Path $InstallDir 'asm-terminal.ico'
 $wsh = New-Object -ComObject WScript.Shell
 $s   = $wsh.CreateShortcut($lnk)
 $s.TargetPath       = $target
-$s.WorkingDirectory = $InstallDir
+$s.WorkingDirectory = $env:USERPROFILE
 if (Test-Path $icon) { $s.IconLocation = $icon }
 $s.Description      = "$AppName - x86-64 assembly shell"
 $s.WindowStyle      = 1
