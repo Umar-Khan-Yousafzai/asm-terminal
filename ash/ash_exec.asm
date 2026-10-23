@@ -36,6 +36,7 @@
 %define JC_SYS_ACCESS       21
 %define JC_TIOCGPGRP        0x540F
 %define JC_TIOCSPGRP        0x5410
+%define JC_SIGTTIN          21
 %define JC_SIGTTOU          22
 %define JC_SIG_IGN          1
 %define JC_VQUIT            1
@@ -58,6 +59,7 @@
 %define STGF_OUT_APPEND     1
 %define STGF_ERR_APPEND     2
 %define STGF_ERR_TO_OUT     4
+%define STGF_ERR_FIRST      8           ; "2>&1" came before the stdout redirect
 
 ; Redirection kinds while parsing
 %define RK_IN               1
@@ -125,7 +127,6 @@ section .bss
     ash_argv            resq ASH_MAX_ARGS
     ash_pool            resb ASH_POOL_SIZE
     ash_pipes           resd ASH_MAX_STAGES * 2
-    ash_nstages         resd 1
     ash_exec_path       resb MAX_PATH_BUF
     ash_sh_argv         resq ASH_MAX_ARGS + 2
 
@@ -208,8 +209,12 @@ ash_parse:
     jne .ap_fail
 .ap_err_to_out:
     mov eax, [r15 + STG_FLAGS]
-    and eax, ~STGF_ERR_APPEND
+    and eax, ~(STGF_ERR_APPEND | STGF_ERR_FIRST)
     or eax, STGF_ERR_TO_OUT
+    cmp qword [r15 + STG_OUT], 0
+    jne .ap_err_flags
+    or eax, STGF_ERR_FIRST
+.ap_err_flags:
     mov [r15 + STG_FLAGS], eax
     mov qword [r15 + STG_ERR], 0
     add r12, 4
@@ -295,7 +300,7 @@ ash_parse:
 
 .ap_set_err:
     mov [r15 + STG_ERR], rax
-    and dword [r15 + STG_FLAGS], ~(STGF_ERR_APPEND | STGF_ERR_TO_OUT)
+    and dword [r15 + STG_FLAGS], ~(STGF_ERR_APPEND | STGF_ERR_TO_OUT | STGF_ERR_FIRST)
     cmp edx, RK_ERR_APP
     jne .ap_next
     or dword [r15 + STG_FLAGS], STGF_ERR_APPEND
@@ -350,7 +355,6 @@ ash_parse:
 .ap_fail:
     xor eax, eax
 .ap_ret:
-    mov [ash_nstages], eax
     add rsp, 8
     pop r15
     pop r14
@@ -550,8 +554,8 @@ ash_parse:
 ; ----------------------------------------------------------------------------
 
 ; jc_ensure() -> eax = 1 when job control is on. Probes once, on first use.
-; The shell ignores SIGTTOU from then on so it can hand the terminal back
-; from a background group; children restore the default (jc_child_setup).
+; The shell ignores SIGTTOU and SIGTTIN from then on so it can hand the terminal
+; back from a background group; children restore the default (jc_child_setup).
 jc_ensure:
     movzx eax, byte [jc_state]
     test eax, eax
@@ -572,16 +576,8 @@ jc_ensure:
     mov eax, [jc_tmp]
     cmp eax, [jc_shell_pgid]
     jne .jce_off                    ; started in the background
-    lea rsi, [jc_sa]
-    mov qword [rsi], JC_SIG_IGN
-    mov qword [rsi + 8], 0
-    mov qword [rsi + 16], 0
-    mov qword [rsi + 24], 0
-    mov eax, SYS_RT_SIGACTION
-    mov edi, JC_SIGTTOU
-    xor edx, edx
-    mov r10d, 8
-    syscall
+    mov edi, JC_SIG_IGN
+    call jc_tty_signals
     mov byte [jc_state], 1
     mov eax, 1
     ret
@@ -616,17 +612,34 @@ jc_child_setup:
     lea rdx, [jc_tmp]
     syscall
 .jcs_sig:
-    lea rsi, [jc_sa]                ; SIGTTOU back to the default action
-    mov qword [rsi], 0
+    xor edi, edi                    ; SIGTTOU and SIGTTIN back to the default action
+    call jc_tty_signals
+.jcs_ret:
+    ret
+
+; jc_tty_signals(rdi = JC_SIG_IGN or 0 for the default) - set the disposition
+; of SIGTTOU and SIGTTIN. The shell ignores both so it can hand the terminal
+; back from a background group; jobs must see the default.
+jc_tty_signals:
+    mov r8d, JC_SIGTTOU
+.jts_next:
+    lea rsi, [jc_sa]
+    mov [rsi], rdi
     mov qword [rsi + 8], 0
     mov qword [rsi + 16], 0
     mov qword [rsi + 24], 0
+    mov r9, rdi
     mov eax, SYS_RT_SIGACTION
-    mov edi, JC_SIGTTOU
+    mov edi, r8d
     xor edx, edx
     mov r10d, 8
     syscall
-.jcs_ret:
+    mov rdi, r9
+    cmp r8d, JC_SIGTTIN
+    je .jts_ret
+    mov r8d, JC_SIGTTIN
+    jmp .jts_next
+.jts_ret:
     ret
 
 ; jc_parent_after_fork(edi = child pid, esi = 1 for a foreground job)
@@ -1020,6 +1033,10 @@ ash_run:
     xor esi, esi
     mov eax, SYS_DUP2
     syscall
+    test edi, edi                   ; the original must not leak into the command
+    jz .ac_out
+    mov eax, SYS_CLOSE
+    syscall
 
 .ac_out:
     ; stdout: next pipe, or the '>' set up by parse_redirection
@@ -1038,8 +1055,20 @@ ash_run:
     mov esi, 1
     mov eax, SYS_DUP2
     syscall
+    cmp edi, 1
+    je .ac_files
+    mov eax, SYS_CLOSE
+    syscall
 
 .ac_files:
+    ; "2>&1 >file" sends stderr to where stdout pointed before the file
+    test dword [r13 + STG_FLAGS], STGF_ERR_FIRST
+    jz .ac_in_file
+    mov edi, 1
+    mov esi, 2
+    mov eax, SYS_DUP2
+    syscall
+.ac_in_file:
     mov rdi, [r13 + STG_IN]
     test rdi, rdi
     jz .ac_file_out
@@ -1074,6 +1103,8 @@ ash_run:
 .ac_err_to_out:
     test dword [r13 + STG_FLAGS], STGF_ERR_TO_OUT
     jz .ac_exec
+    test dword [r13 + STG_FLAGS], STGF_ERR_FIRST
+    jnz .ac_exec
     mov edi, 1
     mov esi, 2
     mov eax, SYS_DUP2

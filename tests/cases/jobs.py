@@ -178,4 +178,84 @@ T.check("full job table: shell stays interruptible", "back" in s.screen().replac
 reap(["78%d1" % i for i in range(8)] + ["7899"])
 s.close()
 
+# ---------------------------------------------------------------- piped: statuses
+import re
+
+
+def lines(out):
+    out = re.sub(r'\x1b\[[0-9;?]*[ ]*[@A-Za-z~]', '', out)
+    out = re.sub(r'\x1b\][^\x07]*\x07', '', out)
+    return out.replace('\r', '').split('\n')
+
+
+def sh(text, **kw):
+    out, err, st = T.run_script(text, **kw)
+    return lines(out), lines(err), st
+
+
+h = T.tmpdir()
+open(os.path.join(h, 'badint'), 'w').write('#!/nonexistent/interp\n')
+os.chmod(os.path.join(h, 'badint'), 0o755)
+open(os.path.join(h, 'noexec'), 'w').write('x')
+os.mkdir(os.path.join(h, 'adir'))
+
+o, e, st = sh("/bin/false\nexit\n")
+T.check("bare exit reports the previous status", st == 1, st)
+o, e, st = sh("/bin/sh -c 'exit 7'\nexit\n")
+T.check("bare exit reports status 7", st == 7, st)
+o, e, st = sh("exit abc\necho notreached\n")
+T.check("exit abc leaves with status 2", st == 2 and "notreached" not in o, (o, st))
+o, e, st = sh("exit -1\n")
+T.check("exit -1 leaves with status 255", st == 255, st)
+o, e, st = sh("exit 256\n")
+T.check("exit 256 wraps to 0", st == 0, st)
+o, e, st = sh("/bin/true | exit 4\necho st=$?\nexit\n")
+T.check("exit in a pipeline ends that stage only", "st=4" in o, o)
+o, e, st = sh("./missing\necho s1=$?\n./badint\necho s2=$?\n./noexec\necho s3=$?\n./adir\necho s4=$?\n"
+              "\"\"\necho s5=$?\nnosuchcmd\necho s6=$?\nexit\n", home=h)
+blob = "\n".join(o + e)
+T.check("missing path: No such file or directory, 127", "ash: ./missing: No such file or directory" in blob and "s1=127" in blob, blob)
+T.check("missing interpreter: bad interpreter, 126", "ash: ./badint: bad interpreter" in blob and "s2=126" in blob, blob)
+T.check("no x bit: Permission denied, 126", "ash: ./noexec: Permission denied" in blob and "s3=126" in blob, blob)
+T.check("directory: Is a directory, 126", "ash: ./adir: Is a directory" in blob and "s4=126" in blob, blob)
+T.check("empty command: command not found, 127", "ash: : command not found" in blob and "s5=127" in blob, blob)
+T.check("unknown command: command not found, 127", "ash: nosuchcmd: command not found" in blob and "s6=127" in blob, blob)
+o, e, st = sh("/bin/sh -c 'kill -9 $$'\necho n=$?\n/bin/sh -c 'kill -9 $$' x*\necho f=$?\nexit\n")
+T.check("signalled child: 128+signal on the native path", "n=137" in o, o)
+T.check("signalled child: 128+signal on the /bin/sh path", "f=137" in o, o)
+o, e, st = sh("which if break\nkill -l\nexit\n")
+T.check("which knows shell keywords", "if: shell keyword" in o and "break: shell keyword" in o, o)
+T.check("kill -l lists signal names", any(l.startswith("HUP INT QUIT") and "ALRM" in l for l in o), o)
+
+# ---------------------------------------------------------------- kill never wraps a pid
+kid = subprocess.Popen(["sleep", "7790"])
+for bad in (kid.pid + 2 ** 32, 99999999999, 4194305):
+    sh("kill %d\nexit\n" % bad)
+T.check("kill rejects pids that do not fit a pid_t", kid.poll() is None, kid.poll())
+o, e, st = sh("kill 0\nkill -9 0\nexit\n")
+T.check("kill 0 is refused", "\n".join(o + e).count("not a process id") >= 2, o)
+o, e, st = sh("kill -s TERM %d\nexit\n" % kid.pid)
+T.check("kill -s NAME works", kid.wait() == -signal.SIGTERM, kid.poll())
+kid = subprocess.Popen(["sleep", "7791"])
+sh("kill -ALRM %d\nexit\n" % kid.pid)
+T.check("kill -ALRM knows more signal names", kid.wait() == -signal.SIGALRM, kid.poll())
+
+# ---------------------------------------------------------------- redirects and descriptors
+d = T.tmpdir()
+o, e, st = sh("/bin/ls /nonexistent_xx 2>&1 >/dev/null | /bin/cat\nexit\n", cwd=d)
+T.check("2>&1 before > keeps stderr on the pipe", any("nonexistent_xx" in l for l in o), o)
+o, e, st = sh("/bin/ls /nonexistent_xx >/dev/null 2>&1 | /bin/cat\necho end\nexit\n", cwd=d)
+T.check("> before 2>&1 sends stderr to the file", not any("nonexistent_xx" in l for l in o), o)
+open(os.path.join(d, 'in.txt'), 'w').write('in')
+sh("/bin/ls -l /proc/self/fd > out.txt\n/bin/ls -l /proc/self/fd < in.txt > out2.txt\nexit\n", cwd=d)
+fds = open(os.path.join(d, 'out.txt')).read() + open(os.path.join(d, 'out2.txt')).read()
+T.check("redirect source descriptor is not inherited", 'out.txt' in fds and fds.count('out.txt') == 1 and 'out2.txt' in fds
+        and fds.count('out2.txt') == 1 and fds.count('in.txt') == 1, fds)
+
+# ---------------------------------------------------------------- environment size
+env = {'V%d' % i: 'x' for i in range(300)}
+o, e, st = sh("/usr/bin/env | /usr/bin/wc -l\nexit\n", env=env)
+n = [l for l in o if l.strip().isdigit()]
+T.check("children get more than 255 variables", n and int(n[0]) > 300, o)
+
 T.cleanup()
