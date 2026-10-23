@@ -160,8 +160,6 @@ section .data
     ash_e_count         db "ash: loop count must be a positive number", 10, 0
     ash_e_shift         db "ash: shift: shift count out of range", 10, 0
     ash_e_return        db "ash: return: can only return from a function or a sourced script", 10, 0
-    ash_pos_n0          db "0", 0
-    ash_s_shellname     db "asm", 0
     ash_pos_n1          db "1", 0
     ash_pos_n2          db "2", 0
     ash_pos_n3          db "3", 0
@@ -184,8 +182,6 @@ section .data
     ; /bin/sh helpers for $( ), backticks and globs in for-lists / values
     ash_shc_argv         dq sh_path, sh_dash_c, ash_sh_script, 0
     ash_sh_printf       db "printf '%s\n' ", 0
-    ash_sh_assign_pre   db "__ash_v=", 0
-    ash_sh_assign_post  db "; __ash_s=$?; printf '%s' ", '"', "$__ash_v", '"', "; exit $__ash_s", 0
 
     ash_e_syntax        db "ash: syntax error near '", 0
     ash_e_syntax_end    db "'", 10, 0
@@ -212,7 +208,6 @@ section .bss
     ash_sh_wstatus      resd 1
     ash_func_count      resd 1
     ash_ar_err          resb 1
-    ash_zero_set        resb 1              ; $0 has been stored
     ash_ar_skip         resb 1              ; 1 = parsing a branch that is not evaluated
     ash_arith_failed    resb 1              ; set by ash_expand_arith on an error
     alignb 8
@@ -227,7 +222,7 @@ section .bss
     ash_ar_buf          resb 512
     ash_word_buf        resb 1024
     ash_test_buf        resb 1024
-    ash_sh_script       resb 1024
+    ash_sh_script       resb 1280
     ash_pending         resb ASH_PENDING_MAX
     ash_frames          resb ASH_FRAMES_MAX * ASH_FRAME_SIZE
     ash_funcs           resb ASH_FUNC_MAX * ASH_FUNC_SIZE
@@ -402,13 +397,6 @@ ash_eval:
 
     mov r12, rdi
     mov r13d, esi
-    cmp byte [ash_zero_set], 0
-    jne .ae_zero_ok
-    mov byte [ash_zero_set], 1      ; $0 is the name of the shell
-    lea rdi, [ash_pos_n0]
-    lea rsi, [ash_s_shellname]
-    call setenv_internal
-.ae_zero_ok:
     mov rax, [ash_arena_used]
     mov [rbp - 56], rax
     mov eax, [ash_depth]
@@ -1798,6 +1786,7 @@ ash_sh_run:
     push r12
     push r13
     sub rsp, 8
+    mov [rsp], rdi                  ; the statement as written, for the job list
     mov r13, [ash_arena_used]
     call ash_ctx_script
     test rax, rax
@@ -1807,34 +1796,19 @@ ash_sh_run:
     je .sr_fork
     call restore_terminal
 .sr_fork:
+    call jc_prepare
     mov eax, SYS_FORK
     syscall
     test rax, rax
     js .sr_fail
     jz .sr_child
     mov ebx, eax
-.sr_wait:
     mov edi, ebx
-    lea rsi, [ash_sh_wstatus]
-    xor edx, edx
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
-    cmp rax, -EINTR
-    je .sr_wait
-    mov eax, [ash_sh_wstatus]
-    mov edx, eax
-    and edx, 0x7F
-    jz .sr_exited
-    cmp edx, SIGINT
-    jne .sr_sig
-    mov byte [ctrl_c_flag], 1       ; a child killed by Ctrl+C stops the script too
-.sr_sig:
-    lea eax, [rdx + 128]
-    jmp .sr_status
-.sr_exited:
-    shr eax, 8
-    and eax, 0xFF
+    mov esi, 1
+    call jc_parent_after_fork
+    mov edi, ebx
+    mov rsi, [rsp]
+    call jc_wait_fg                 ; 128 + signal when killed, job control aware
 .sr_status:
     mov [last_exit_status], eax
     jmp .sr_done
@@ -1858,6 +1832,8 @@ ash_sh_run:
     mov dword [last_exit_status], 2
     jmp .sr_ret
 .sr_child:
+    mov edi, 1
+    call jc_child_setup
     lea rdi, [ash_shc_argv]
     mov [rdi + 16], r12
     call ash_exec_argv              ; does not return
@@ -2206,12 +2182,6 @@ ash_capture:
 ; ash_capture for "/bin/sh -c SCRIPT", with the shell functions and positional
 ; parameters in front of the script (see ash_ctx_script).
 ; ----------------------------------------------------------------------------
-section .bss
-    ASH_VAL_MAX         equ 8192
-    ash_val_buf         resb ASH_VAL_MAX    ; output of $( ) for a variable
-    ash_sub_status      resd 1              ; status of the last $( ) in NAME=value
-section .text
-
 ash_capture_script:
     push rbp
     mov rbp, rsp
@@ -2260,66 +2230,18 @@ ash_capture_script:
 
 ; ----------------------------------------------------------------------------
 ; ash_setvar(rdi = name, rsi = value) -> eax = 0 stored, 1 refused
-; setenv_internal cuts long values and drops new names when its table is
-; full without saying so; this stores the value or reports why it cannot.
+; setenv_internal says why on its own when the name, the value or the table
+; do not fit; this turns that into the status the script engine wants.
 ; ----------------------------------------------------------------------------
-section .data
-    ash_e_pre           db "ash: ", 0
-    ash_e_vlong         db ": value too long", 10, 0
-    ash_e_vfull         db ": too many variables", 10, 0
-section .text
-
 ash_setvar:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    push r12
-    push r13
     sub rsp, 8
-
-    mov rbx, rdi
-    mov r12, rsi
-    call str_len
-    mov r13d, eax
-    mov rdi, r12
-    call str_len
-    lea eax, [rax + r13 + 1]        ; NAME=VALUE
-    cmp eax, ENV_OVERLAY_SIZE - 1
-    ja .sv_long
-    mov rdi, rbx
-    mov rsi, r12
     call setenv_internal
-    mov rdi, rbx
-    call getenv_internal
-    test rax, rax
-    jz .sv_full
-    mov rdi, rax
-    mov rsi, r12
-    call ash_strcmp
+    add rsp, 8
     test eax, eax
-    jnz .sv_full
-    xor eax, eax
-    jmp .sv_ret
-.sv_long:
-    lea r12, [ash_e_vlong]
-    jmp .sv_err
-.sv_full:
-    lea r12, [ash_e_vfull]
-.sv_err:
-    lea rdi, [ash_e_pre]
-    call ash_write_err
-    mov rdi, rbx
-    call ash_write_err
-    mov rdi, r12
-    call ash_write_err
+    jz .sv_ret
     mov dword [last_exit_status], 1
     mov eax, 1
 .sv_ret:
-    add rsp, 8
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
     ret
 
 ; ash_frame_push -> rdx = new frame, or 0 (message printed) when too deep
@@ -2402,17 +2324,26 @@ ash_for_setup:
     call str_len
     cmp eax, MAX_INPUT - 1
     jae .fs_toolong
+    ; Globs and $( ) are judged on the text as written: a variable's value
+    ; is data and never needs /bin/sh. When sh runs the list it expands the
+    ; command substitutions itself, everything else is expanded here first.
+    mov rdi, r12
+    call ash_needs_sh
+    mov [rsp], eax
     lea rdi, [input_buf]
     mov rsi, r12
     call str_copy
-    call ash_expand_checked
+    cmp dword [rsp], 0
+    jne .fs_expand_sh
+    call expand_env_vars
+    jmp .fs_expanded
+.fs_expand_sh:
+    call expand_env_vars_sh
+.fs_expanded:
     test eax, eax
-    jnz .fs_arith
-
-    lea rdi, [input_buf]
-    call ash_needs_sh
-    test eax, eax
-    jnz .fs_sh
+    jnz .fs_failed                  ; message printed
+    cmp dword [rsp], 0
+    jne .fs_sh
 
     ; Native split: one unquoted word per line
     lea r12, [input_buf]
@@ -2449,11 +2380,14 @@ ash_for_setup:
 
 .fs_sh:
     ; printf '%s\n' WORDS  -> one word per line from /bin/sh
+    lea rdi, [input_buf]
+    call ash_sh_decode              ; marked data bytes become plain text
+    mov r13, rax
     lea rdi, [ash_sh_script]
     lea rsi, [ash_sh_printf]
     call upd_stpcpy
     mov rdi, rax
-    lea rsi, [input_buf]
+    mov rsi, r13
     call upd_stpcpy
     lea rdi, [ash_sh_script]
     mov rsi, [rbx + F_WORDS]
@@ -2464,13 +2398,12 @@ ash_for_setup:
 .fs_ok:
     xor eax, eax
     jmp .fs_ret
+.fs_failed:
+    mov eax, 2
+    jmp .fs_ret
 .fs_toolong:
     lea rdi, [ash_e_line]
     call ash_write_err
-    mov eax, 2
-    jmp .fs_ret
-.fs_arith:                          ; the arithmetic already said what is wrong
-    mov dword [last_exit_status], 1
     mov eax, 2
     jmp .fs_ret
 .fs_listlong:
@@ -2500,6 +2433,8 @@ ash_needs_sh:
     movzx eax, byte [rdi]
     test al, al
     jz .ns_no
+    cmp al, EV_MARK
+    je .ns_mark
     cmp al, '`'
     je .ns_yes
     cmp al, '$'
@@ -2533,6 +2468,11 @@ ash_needs_sh:
     mov ecx, eax
     jmp .ns_next
 .ns_bs:
+    cmp byte [rdi + 1], 0
+    je .ns_no
+    add rdi, 2
+    jmp .ns_loop
+.ns_mark:
     cmp byte [rdi + 1], 0
     je .ns_no
     add rdi, 2
@@ -2650,21 +2590,6 @@ ash_run_cmd:
     call str_len
     cmp eax, MAX_INPUT - 1
     jae .rc_toolong
-    mov rdi, rbx
-    call ash_has_arith
-    test eax, eax
-    jz .rc_run
-    ; An expression that cannot be evaluated cancels the command: expand a
-    ; copy first to find out (the expansion has no side effects).
-    lea rdi, [input_buf]
-    mov rsi, rbx
-    call str_copy
-    call ash_expand_checked
-    test eax, eax
-    jz .rc_run
-    mov dword [last_exit_status], 1
-    jmp .rc_ok
-.rc_run:
     lea rdi, [input_buf]
     mov rsi, rbx
     call str_copy
@@ -2782,7 +2707,7 @@ ash_count_arg:
     lea rdi, [input_buf]
     mov rsi, r12
     call str_copy
-    call ash_expand_checked
+    call expand_env_vars
     test eax, eax
     jnz .ca_bad
     lea rdi, [input_buf]
@@ -2809,33 +2734,6 @@ ash_count_arg:
     ret
 
 ; ----------------------------------------------------------------------------
-; ash_expand_checked: expand_env_vars on input_buf -> eax = 1 when a $(( ))
-; in it could not be evaluated (an error message has been printed)
-ash_expand_checked:
-    sub rsp, 8
-    mov byte [ash_arith_failed], 0
-    call expand_env_vars
-    movzx eax, byte [ash_arith_failed]
-    add rsp, 8
-    ret
-
-; ash_has_arith(rdi = text) -> eax = 1 when it contains "$(("
-ash_has_arith:
-.ha_loop:
-    movzx eax, byte [rdi]
-    test al, al
-    jz .ha_no
-    inc rdi
-    cmp al, '$'
-    jne .ha_loop
-    cmp word [rdi], '(('
-    jne .ha_loop
-    mov eax, 1
-    ret
-.ha_no:
-    xor eax, eax
-    ret
-
 ; ash_has_shell_ops(rdi = text) -> eax = 1 when the text has an unquoted
 ; | < > & or a $( ) / backtick substitution (not $(( )) arithmetic): things
 ; only /bin/sh can do with a function call.
@@ -2975,6 +2873,8 @@ ash_try_assign:
     je .ta_val_open
     cmp al, '"'
     je .ta_val_open
+    cmp al, '`'
+    je .ta_val_open
     cmp al, '('
     je .ta_val_lp
     cmp al, ')'
@@ -3034,65 +2934,33 @@ ash_try_assign:
     lea rdi, [input_buf]
     mov rsi, rbx
     call str_copy
-    call ash_expand_checked
+    call expand_env_vars            ; $( ) and `` run here and come back as data
     test eax, eax
-    jnz .ta_arith
-
-    lea rdi, [input_buf]
-    call ash_needs_sh
-    test eax, eax
-    jnz .ta_sh
+    jnz .ta_expand_failed           ; message printed, status set
 
     lea rdi, [input_buf]
     lea rsi, [ash_word_buf]
     xor edx, edx
     call ash_next_word
     lea rsi, [ash_word_buf]
-    mov dword [ash_sub_status], 0
-    jmp .ta_set
 
-.ta_sh:
-    ; __ash_v=VALUE; __ash_s=$?; printf '%s' "$__ash_v"; exit $__ash_s
-    ; (keeps $( ) and ` working, and hands back the status of the command)
-    lea rdi, [ash_sh_script]
-    lea rsi, [ash_sh_assign_pre]
-    call upd_stpcpy
-    mov rdi, rax
-    lea rsi, [input_buf]
-    call upd_stpcpy
-    mov rdi, rax
-    lea rsi, [ash_sh_assign_post]
-    call upd_stpcpy
-    lea rdi, [ash_sh_script]
-    lea rsi, [ash_val_buf]
-    mov edx, ASH_VAL_MAX
-    call ash_capture_script
-    cmp byte [ash_cap_trunc], 0
-    jne .ta_long
-    mov eax, [ash_cap_status]
-    mov [ash_sub_status], eax
-    lea rsi, [ash_val_buf]
-
-.ta_set:
     lea rdi, [ash_name_buf]
     call ash_setvar
     test eax, eax
-    jnz .ta_done                    ; refused: the status says so
-    mov eax, [ash_sub_status]
+    jnz .ta_set_failed              ; refused: the message and status say so
+    ; "x=$(cmd)" has the status of cmd, like sh
+    mov eax, [ev_subst_status]
+    test eax, eax
+    jns .ta_status
+    xor eax, eax
+.ta_status:
     mov [last_exit_status], eax
-.ta_done:
+.ta_set_failed:
     mov eax, 1
     jmp .ta_ret
-.ta_arith:                          ; the arithmetic already said what is wrong
-    mov dword [last_exit_status], 1
-    jmp .ta_done
-.ta_long:
-    lea rdi, [ash_name_buf]
-    call ash_write_err
-    lea rdi, [ash_e_vlong]
-    call ash_write_err
-    mov dword [last_exit_status], 1
-    jmp .ta_done
+.ta_expand_failed:
+    mov eax, 1
+    jmp .ta_ret
 .ta_toolong:
     lea rdi, [ash_e_line]
     call ash_write_err
@@ -3271,9 +3139,9 @@ ash_call_func:
     lea rdi, [input_buf]
     mov rsi, r12
     call str_copy
-    call ash_expand_checked
+    call expand_env_vars
     test eax, eax
-    jnz .cf_arith
+    jnz .cf_expand_failed           ; message printed: do not call
     lea rdi, [input_buf]
     call str_len
     mov r13d, eax                   ; length of the expanded arguments
@@ -3324,8 +3192,7 @@ ash_call_func:
     xor ebx, ebx
     jmp .cf_restore
 
-.cf_arith:
-    mov dword [last_exit_status], 1
+.cf_expand_failed:
     mov ebx, 1
     jmp .cf_ret
 .cf_toolong:
@@ -3602,6 +3469,8 @@ ash_next_word:
     cmp al, 10
     je .nw_end
 .nw_noblank:
+    cmp al, EV_MARK
+    je .nw_mark
     cmp al, 0x27
     je .nw_sq
     cmp al, '"'
@@ -3612,6 +3481,14 @@ ash_next_word:
     mov [rsi], al
     inc rsi
     inc rdi
+    jmp .nw_loop
+.nw_mark:
+    movzx ecx, byte [rdi + 1]       ; "EV_MARK c" is the plain character c
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
     jmp .nw_loop
 .nw_bs:
     movzx ecx, byte [rdi + 1]
@@ -3628,6 +3505,16 @@ ash_next_word:
     movzx eax, byte [rdi]
     test al, al
     jz .nw_end
+    cmp al, EV_MARK
+    jne .nw_sq_plain
+    movzx ecx, byte [rdi + 1]
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
+    jmp .nw_sq_loop
+.nw_sq_plain:
     cmp al, 0x27
     je .nw_q_close
     mov [rsi], al
@@ -3640,6 +3527,16 @@ ash_next_word:
     movzx eax, byte [rdi]
     test al, al
     jz .nw_end
+    cmp al, EV_MARK
+    jne .nw_dq_plain
+    movzx ecx, byte [rdi + 1]
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
+    jmp .nw_dq_loop
+.nw_dq_plain:
     cmp al, '"'
     je .nw_q_close
     cmp al, '\'
@@ -4390,6 +4287,7 @@ ar_primary:
 ; result string in ash_num_buf ("" on error, message printed).
 ash_expand_arith:
     push rbx
+    mov byte [ash_arith_failed], 0
     mov rcx, rdi
     xor r8d, r8d                    ; ( depth
 .ea_scan:

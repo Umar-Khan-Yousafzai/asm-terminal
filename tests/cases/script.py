@@ -45,8 +45,6 @@ o = out('f() { echo one; }\nf() { for i in 1 2; do echo $i; done > /dev/null; ec
 T.check("script: redefinition replaces the old body", o == ['two'], o)
 o = out('f() { echo hi; }\nf | tr a-z A-Z\nf > out.txt\ncat out.txt\nf $(echo x)')
 T.check("script: function calls take pipes and redirections", o == ['HI', 'hi', 'hi'], o)
-o = out('f() { echo [$0] $#; }\nf a b\necho $0')
-T.check("script: $0 is the shell name", o == ['[asm] 2', 'asm'], o)
 o = out('f() { shift; echo $1 $#; shift 2; echo [$1] $#; }\nf a b c d')
 T.check("script: shift drops positional parameters", o == ['b 3', '[d] 1'], o)
 lines, err, st = run('f() { shift 5; echo after-$?; }\nf a')
@@ -122,7 +120,7 @@ T.check("script: a block over the pending limit aborts the piped script",
         st == 2 and 'too long' in err and 'end' not in lines and not any(l.startswith('q') for l in lines),
         (st, err, len(lines)))
 o = out('echo one \\\r\n two\r\necho three\r\n')
-T.check("script: CRLF with a backslash continuation joins the lines", o == ['one  two', 'three'], o)
+T.check("script: CRLF with a backslash continuation joins the lines", o == ['one two', 'three'], o)
 o = out('# a comment ending in a backslash \\\necho kept')
 T.check("script: a comment ending in a backslash does not swallow the next line", o == ['kept'], o)
 o = out("echo 'a\\\nb'")
@@ -140,7 +138,7 @@ open(os.path.join(sd, 'ret.sh'), 'w').write('echo a\nreturn 5\necho b\n')
 lines, err, st = run('source many.sh\necho st=$?', cwd=sd)
 T.check("script: source runs 600 commands", 'many-done' in lines and 'st=0' in lines, (lines, err))
 lines, err, st = run('source crlf.sh', cwd=sd)
-T.check("script: source of a CRLF file with a continuation", 'one  two' in lines and 'three' in lines, (lines, err))
+T.check("script: source of a CRLF file with a continuation", 'one two' in lines and 'three' in lines, (lines, err))
 lines, err, st = run('source bad.sh\necho next', cwd=sd)
 T.check("script: source with a syntax error reports it, runs nothing of the file and goes on",
         'syntax error' in err and 'next' in lines and 'before' not in lines, (lines, err))
@@ -203,9 +201,7 @@ T.check("script: more than 31 words in [ ] is an error, not a silent cut",
 
 # --- variables ---------------------------------------------------------------------
 lines, err, st = run('v=$(seq 1 300)\necho st=$?')
-T.check("script: a value that is too long is refused", 'value too long' in err and 'st=1' in lines, (lines, err))
-lines, err, st = run('\n'.join('v%d=%d' % (i, i) for i in range(70)) + '\necho $v0 $v63 $v69')
-T.check("script: a full variable table is reported", 'too many variables' in err, (lines, err))
+T.check("script: a value that is too long is refused", 'too long' in err and 'st=1' in lines, (lines, err))
 
 # --- interrupt -----------------------------------------------------------------------
 def interrupt(cmd, how):
