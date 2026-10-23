@@ -3080,6 +3080,11 @@ tab_complete:
     lea rax, [line_buf]
     cmp byte [rax + r12], ' '
     jne .tc_scan
+    test r12d, r12d
+    jz .tc_blank
+    cmp byte [rax + r12 - 1], 0x5C  ; "\ " is a blank inside the word
+    je .tc_scan
+.tc_blank:
     inc r12d                        ; don't include the space itself
 
 .tc_start:
@@ -3088,24 +3093,34 @@ tab_complete:
     mov [tab_base_pos], r12d
 
     ; Copy the word (from line_buf[r12d] .. line_buf[cursor-1]) to tab_name_prefix
+    ; The stored prefix is the name as the file system has it: a backslash
+    ; in the typed word only protects the next character.
     mov ebx, [line_cursor]
-    sub ebx, r12d                   ; ebx = prefix length
-    mov [tab_name_prefix_len], ebx
-
+    sub ebx, r12d                   ; ebx = typed length
     xor ecx, ecx
+    xor r13d, r13d                  ; r13d = length of the stored prefix
 .tc_cp_prefix:
     cmp ecx, ebx
     jge .tc_cp_prefix_done
     lea rax, [line_buf]
     add rax, r12
     movzx edx, byte [rax + rcx]
-    lea r8, [tab_name_prefix]
-    mov [r8 + rcx], dl
     inc ecx
+    cmp dl, 0x5C
+    jne .tc_cp_store
+    cmp ecx, ebx
+    jge .tc_cp_store
+    movzx edx, byte [rax + rcx]
+    inc ecx
+.tc_cp_store:
+    lea r8, [tab_name_prefix]
+    mov [r8 + r13], dl
+    inc r13d
     jmp .tc_cp_prefix
 .tc_cp_prefix_done:
     lea r8, [tab_name_prefix]
-    mov byte [r8 + rbx], 0
+    mov byte [r8 + r13], 0
+    mov [tab_name_prefix_len], r13d
 
     ; Keep the text behind the cursor: the completion goes in front of it
     mov ecx, [line_cursor]
@@ -3284,14 +3299,27 @@ tab_complete:
     jmp .tc_nlen
 .tc_nlen_done:
 
-    ; New cursor = word start + directory part + name (+ "/")
+    ; The directory part and the name go in with blanks and shell syntax
+    ; characters escaped, so Enter runs the command that was meant.
     xor edx, edx
     cmp r10b, DT_DIR
     sete dl                         ; edx = 1 when a '/' follows
+    mov [rsp], edx
+    mov [rsp + 4], ecx              ; length of d_name
+    lea rsi, [tab_name_prefix]
+    mov ecx, r15d
+    call tab_esc_len
+    mov r13d, eax                   ; escaped directory part
+    mov rsi, r9
+    mov ecx, [rsp + 4]
+    call tab_esc_len
+    mov r14d, eax                   ; escaped name
+
+    ; New cursor = word start + directory part + name (+ "/")
     mov r8d, [tab_base_pos]
-    add r8d, r15d
-    add r8d, ecx
-    add r8d, edx
+    add r8d, r13d
+    add r8d, r14d
+    add r8d, [rsp]
     mov eax, r8d
     add eax, [tab_tail_len]
     cmp eax, MAX_INPUT - 2
@@ -3301,31 +3329,13 @@ tab_complete:
     mov eax, [tab_base_pos]
     add rdi, rax
     lea rsi, [tab_name_prefix]
-    mov eax, r15d                   ; directory part
-.tc_w1:
-    test eax, eax
-    jz .tc_w2
-    mov r11b, [rsi]
-    mov [rdi], r11b
-    inc rsi
-    inc rdi
-    dec eax
-    jmp .tc_w1
-.tc_w2:
+    mov ecx, r15d
+    call tab_esc_copy
     mov rsi, r9
-    mov eax, ecx                    ; name
-.tc_w3:
-    test eax, eax
-    jz .tc_w4
-    mov r11b, [rsi]
-    mov [rdi], r11b
-    inc rsi
-    inc rdi
-    dec eax
-    jmp .tc_w3
-.tc_w4:
-    test edx, edx
-    jz .tc_w5
+    mov ecx, [rsp + 4]
+    call tab_esc_copy
+    cmp dword [rsp], 0
+    je .tc_w5
     mov byte [rdi], '/'
     inc rdi
 .tc_w5:
@@ -3362,6 +3372,69 @@ tab_complete:
     pop rbp
     ret
 
+section .data
+    tab_special         db ' ', 9, 0x27, '"', 0x5C, '$', '`', '|', '&', ';', '<', '>'
+                        db '(', ')', '*', '?', '[', ']', '{', '}', '#', '!', '~', 0
+section .text
+
+; tab_esc_len(rsi = name, ecx = bytes) -> eax = length once escaped
+tab_esc_len:
+    xor r10d, r10d
+.tel_loop:
+    test ecx, ecx
+    jz .tel_done
+    movzx r11d, byte [rsi]
+    inc rsi
+    dec ecx
+    call tab_is_special
+    lea r10d, [r10 + r11 + 1]
+    jmp .tel_loop
+.tel_done:
+    mov eax, r10d
+    ret
+
+; tab_esc_copy(rsi = name, rdi = dest, ecx = bytes) -> rdi after the copy
+; A backslash goes in front of every byte that is blank or shell syntax.
+tab_esc_copy:
+.tec_loop:
+    test ecx, ecx
+    jz .tec_done
+    movzx eax, byte [rsi]
+    inc rsi
+    dec ecx
+    mov r11d, eax
+    call tab_is_special
+    test r11d, r11d
+    jz .tec_put
+    mov byte [rdi], 0x5C
+    inc rdi
+.tec_put:
+    mov [rdi], al
+    inc rdi
+    jmp .tec_loop
+.tec_done:
+    ret
+
+; tab_is_special(r11d = byte) -> r11d = 1 if it needs a backslash, else 0
+tab_is_special:
+    push rdx
+    lea rdx, [tab_special]
+.tis_loop:
+    cmp byte [rdx], 0
+    je .tis_no
+    cmp r11b, [rdx]
+    je .tis_yes
+    inc rdx
+    jmp .tis_loop
+.tis_yes:
+    mov r11d, 1
+    pop rdx
+    ret
+.tis_no:
+    xor r11d, r11d
+    pop rdx
+    ret
+
 ; ============================================================================
 ; dispatch_command - Expand env, check alias, parse redir, dispatch
 ;
@@ -3395,10 +3468,11 @@ section .data
     dc_raw_handlers     dq handler_echo, handler_grep, handler_copy
                         dq handler_move, handler_copy_safe, handler_move_safe
                         dq handler_test, handler_bracket, handler_bench
-                        dq handler_trace, handler_sandbox, 0
+                        dq handler_trace, handler_sandbox, handler_ls, 0
 
 section .bss
     ev_mode             resb 1              ; 1 = leave $( ) and `` for /bin/sh
+    ev_keep_nl          resb 1              ; 1 = an unquoted newline in a value stays data
     ev_overflow         resb 1              ; 1 = too long, 2 = error reported
     alignb 4
     ev_subst_status     resd 1              ; status of the last $( ), -1 none
@@ -3410,6 +3484,8 @@ section .bss
     redir_nops          resd 1
     redir_err_saved     resd 1              ; saved stderr fd + 1, 0 = none
     redir_pool          resb 4096
+    dc_alias_line       resb MAX_INPUT
+    dc_in_alias         resb 1              ; depth of alias lists being run
 section .text
 
 %define EV_MARK             0x01
@@ -3465,12 +3541,34 @@ dispatch_command:
     call expand_env_vars
     test eax, eax
     jnz .dc_done
+
+    ; An alias such as 'echo one; echo two' is a list: let the script engine
+    ; split and run it. Its commands may be aliases too, to a fixed depth.
+    lea rdi, [input_buf]
+    call dc_has_list
+    test eax, eax
+    jz .dc_alias_done
+    lea rdi, [dc_alias_line]
+    lea rsi, [input_buf]
+    call str_copy
+    inc byte [dc_in_alias]
+    lea rdi, [dc_alias_line]
+    mov esi, 1
+    call ash_eval
+    dec byte [dc_in_alias]
+    jmp .dc_done
 .dc_alias_done:
 
     ; A pipeline goes to the native executor as a whole
     lea rdi, [input_buf]
     call dc_has_pipe
     test eax, eax
+    jnz .dc_external
+
+    ; A final '&' makes it a background job, builtin or not
+    lea rdi, [input_buf]
+    call dc_trailing_amp
+    test rax, rax
     jnz .dc_external
 
     ; Look for a builtin on the line without its redirections
@@ -3622,6 +3720,48 @@ dc_run_handler:
     pop rbp
     ret
 
+; ----------------------------------------------------------------------------
+; dc_bg_builtin - child of a background job: if the line (its final '&' already
+; removed) is a builtin, run it here with its redirections and exit. Returns
+; only when it is not a builtin, so the caller can hand the line to /bin/sh.
+; ----------------------------------------------------------------------------
+dc_bg_builtin:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 56                     ; caller state block for apply_redirections
+    mov qword [rsp], 0              ; nothing of the parent's is in use here
+    mov qword [rsp + 8], 0
+    mov dword [rsp + 16], 0
+    call parse_redirection
+    test eax, eax
+    jnz .bb_ret
+    lea rdi, [cleaned_cmd_buf]
+    call dc_find_builtin
+    test rax, rax
+    jz .bb_ret
+    mov rdi, rsp
+    call apply_redirections
+    test eax, eax
+    jnz .bb_exit
+    lea rdi, [input_buf]
+    lea rsi, [cleaned_cmd_buf]
+    call str_copy
+    lea rdi, [input_buf]
+    call dc_find_builtin
+    mov rdi, rax
+    mov rsi, rdx
+    call dc_run_handler
+.bb_exit:
+    mov edi, [last_exit_status]
+    mov eax, SYS_EXIT
+    syscall
+.bb_ret:
+    add rsp, 56
+    pop rbx
+    pop rbp
+    ret
+
 ; dc_wants_raw(rdi = handler) -> eax = 1 if it parses its own arguments
 dc_wants_raw:
     lea rsi, [dc_raw_handlers]
@@ -3692,6 +3832,71 @@ dc_has_pipe:
     mov eax, 1
     ret
 .hp_no:
+    xor eax, eax
+    ret
+
+; ----------------------------------------------------------------------------
+; dc_has_list(rdi = text) -> eax = 1 if there is a ';', a newline, "&&" or
+; "||" outside quotes that is neither escaped nor marked as data. The script
+; engine splits a typed line at these, so only alias text can still hold one.
+; ----------------------------------------------------------------------------
+dc_has_list:
+    xor ecx, ecx                    ; 0 plain, 1 '...', 2 "..."
+.hl_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .hl_no
+    cmp al, EV_MARK
+    je .hl_skip2
+    cmp ecx, 1
+    je .hl_in_sq
+    cmp al, '\'
+    je .hl_skip2
+    cmp ecx, 2
+    je .hl_in_dq
+    cmp al, 0x27
+    je .hl_open_sq
+    cmp al, '"'
+    je .hl_open_dq
+    cmp al, ';'
+    je .hl_yes
+    cmp al, 10
+    je .hl_yes
+    cmp al, '&'
+    je .hl_twice
+    cmp al, '|'
+    jne .hl_next
+.hl_twice:
+    cmp al, [rdi + 1]
+    je .hl_yes
+.hl_next:
+    inc rdi
+    jmp .hl_loop
+.hl_skip2:
+    cmp byte [rdi + 1], 0
+    je .hl_no
+    add rdi, 2
+    jmp .hl_loop
+.hl_open_sq:
+    mov ecx, 1
+    jmp .hl_next
+.hl_open_dq:
+    mov ecx, 2
+    jmp .hl_next
+.hl_in_sq:
+    cmp al, 0x27
+    jne .hl_next
+    xor ecx, ecx
+    jmp .hl_next
+.hl_in_dq:
+    cmp al, '"'
+    jne .hl_next
+    xor ecx, ecx
+    jmp .hl_next
+.hl_yes:
+    mov eax, 1
+    ret
+.hl_no:
     xor eax, eax
     ret
 
@@ -4366,6 +4571,8 @@ expand_env_vars:
     jne .ev_cp_chk
     test ebx, ebx
     jnz .ev_cp_mark                 ; inside quotes a newline is data
+    cmp byte [ev_keep_nl], 0
+    jne .ev_cp_mark                 ; an assignment is not split into words
     mov al, ' '                     ; otherwise it separates words
     jmp .ev_cp_plain
 .ev_cp_chk:
@@ -4731,6 +4938,8 @@ ev_capture:
     ; Output goes to a pipe: no terminal handling, no colour, and no
     ; redirection of the shell's own (it would bypass the pipe).
     mov byte [interactive_mode], 0
+    mov byte [raw_active], 0        ; the tty was already set by the parent
+    mov byte [ev_keep_nl], 0        ; the inner commands split words as usual
     mov byte [color_enabled], 0
     mov byte [redir_stdout_active], 0
     mov byte [redir_stdin_active], 0
@@ -4757,6 +4966,8 @@ check_alias:
     push r13
     sub rsp, 24
 
+    cmp byte [dc_in_alias], 4       ; an alias that names itself must end
+    jae .ca_done
     mov eax, [alias_count]
     test eax, eax
     jz .ca_done
@@ -7833,6 +8044,10 @@ execute_external:
     syscall
 
 .ee_child_exec:
+    test r14d, r14d                 ; a background builtin runs in this child
+    jz .ee_child_sh
+    call dc_bg_builtin
+.ee_child_sh:
     ; Build argv: ["/bin/sh", "-c", input_buf, NULL]
     lea rax, [exec_argv]
     lea rcx, [sh_path]
@@ -10166,6 +10381,9 @@ section .bss
     ls_pool         resb LS_POOL_SIZE   ; [d_type][name\0] for each entry
     ls_ptrs         resq LS_MAX_ENTRIES
     ls_paths        resq LS_MAX_PATHS
+    ls_args_pool    resb MAX_INPUT + 8  ; the unquoted words of the argument text
+    ls_args_next    resq 1
+    err_subject     resq 1              ; name for print_last_error to put in front
     ls_count        resd 1
     ls_pool_used    resd 1
     ls_name_buf     resb 4112
@@ -10190,25 +10408,19 @@ handler_ls:
     jz .ls_args_done
 
     ; --- Split the arguments into options and paths ---
+    ; The text is as typed; each word is copied out unquoted.
+    lea rax, [ls_args_pool]
+    mov [ls_args_next], rax
 .ls_tok:
-    cmp byte [rbx], ' '
-    jne .ls_tok_start
-    inc rbx
-    jmp .ls_tok
-.ls_tok_start:
-    cmp byte [rbx], 0
-    je .ls_args_done
-    mov r13, rbx                    ; r13 = start of this word
-.ls_tok_end:
-    cmp byte [rbx], 0
-    je .ls_tok_have
-    cmp byte [rbx], ' '
-    je .ls_tok_cut
-    inc rbx
-    jmp .ls_tok_end
-.ls_tok_cut:
-    mov byte [rbx], 0
-    inc rbx
+    mov rdi, rbx
+    mov rsi, [ls_args_next]
+    mov edx, 1
+    call ash_next_word
+    test rax, rax
+    jz .ls_args_done
+    mov rbx, rax
+    mov r13, [ls_args_next]         ; r13 = start of this word
+    mov [ls_args_next], rdx
 .ls_tok_have:
     cmp byte [r13], '-'
     jne .ls_operand
@@ -10279,6 +10491,7 @@ handler_ls:
     jns .ls_file_operand
     neg eax
     mov edi, eax
+    mov [err_subject], r13
     call print_last_error
     mov r15d, 1
     jmp .ls_path_done
@@ -10390,6 +10603,7 @@ ls_list_dir:
     syscall
     test rax, rax
     jns .lld_opened
+    mov [err_subject], rdi
     neg eax
     mov edi, eax
     call print_last_error
@@ -13329,6 +13543,16 @@ print_last_error:
     lea rdi, [.ple_prefix]
     call report_error_cstr
 
+    ; A caller that knows which name failed leaves it here for one message
+    mov rdi, [err_subject]
+    test rdi, rdi
+    jz .ple_lookup
+    mov qword [err_subject], 0
+    call report_error_cstr
+    lea rdi, [.ple_sep]
+    call report_error_cstr
+
+.ple_lookup:
     ; Look up errno in our small table
     cmp ebx, 2
     je .ple_enoent
@@ -13403,6 +13627,7 @@ print_last_error:
 align 1
 .ple_prefix:        db "Error: ", 0
 .ple_errno_str:     db "errno ", 0
+.ple_sep:           db ": ", 0
 .ple_msg_enoent:    db "No such file or directory", 0
 .ple_msg_eacces:    db "Permission denied", 0
 .ple_msg_eexist:    db "File exists", 0

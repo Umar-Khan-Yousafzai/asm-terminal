@@ -2934,7 +2934,9 @@ ash_try_assign:
     lea rdi, [input_buf]
     mov rsi, rbx
     call str_copy
+    mov byte [ev_keep_nl], 1        ; the value of an assignment is not word split
     call expand_env_vars            ; $( ) and `` run here and come back as data
+    mov byte [ev_keep_nl], 0
     test eax, eax
     jnz .ta_expand_failed           ; message printed, status set
 

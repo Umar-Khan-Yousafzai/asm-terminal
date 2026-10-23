@@ -244,4 +244,101 @@ o = lines_of(['x=5; echo $((x+1)) $((2*3))', '/bin/sleep 0 &', 'echo "a &"', "ec
 T.check("arithmetic after the change", o[0] == '6 6', o)
 T.check("a quoted or escaped & is not a background request", 'a &' in o and 'b &' in o and 'c&' in o, o)
 
+# ---------------------------------------------------------------- interactive capture
+# On a tty the helper process of $( ) and a builtin in a pipeline must not
+# write terminal mode switches into the pipe they feed.
+c = T.tmpdir()
+write(c, 'esc.bin', 'data')
+s = T.Sess(cwd=c)
+s.settle()
+for line in ['x=$(/usr/bin/printf %s hi); echo "$x" > cap1.txt',
+             'echo "$(/usr/bin/printf %s hi)" > cap2.txt',
+             'y=`/usr/bin/printf %s hi`; echo "$y" > cap3.txt',
+             'cd $(/usr/bin/dirname /tmp/x); pwd > ' + c + '/cap4.txt',
+             'cd ' + c,
+             'ls $(/usr/bin/printf %s ' + c + ') > cap5.txt',
+             'sandbox /usr/bin/printf sb | /usr/bin/cat > cap6.txt',
+             'echo piped | trace /usr/bin/cat > cap7.txt']:
+    s.run(line)
+s.close()
+T.check("tty: x=$(external) holds only the output", read(c, 'cap1.txt') == 'hi\n', repr(read(c, 'cap1.txt')))
+T.check("tty: $(external) in an argument holds only the output", read(c, 'cap2.txt') == 'hi\n', repr(read(c, 'cap2.txt')))
+T.check("tty: backticks hold only the output", read(c, 'cap3.txt') == 'hi\n', repr(read(c, 'cap3.txt')))
+T.check("tty: cd $(dirname) works", (read(c, 'cap4.txt') or '').strip() == '/tmp', repr(read(c, 'cap4.txt')))
+T.check("tty: ls $(printf dir) lists the directory", 'esc.bin' in (read(c, 'cap5.txt') or ''), repr(read(c, 'cap5.txt')))
+T.check("tty: a builtin stage leaves the pipe clean", read(c, 'cap6.txt') == 'sb', repr(read(c, 'cap6.txt')))
+T.check("tty: trace stage gets its stdin", 'piped' in (read(c, 'cap7.txt') or '') and '\x1b' not in (read(c, 'cap7.txt') or ''),
+        repr(read(c, 'cap7.txt')))
+
+# ---------------------------------------------------------------- assignments keep newlines
+c = T.tmpdir()
+o, e, st, _ = sh(['FOO=$(printf "l1\\nl2"); echo "$FOO"', 'BAR=$FOO; echo "$BAR"', 'echo $FOO',
+                  '/usr/bin/printf "[%s]" $BAR; echo', 'BAZ=a$FOO; echo "$BAZ"'], cwd=c)
+o = [x for x in o if x]
+T.check("assignment from $( ) keeps newlines", o[:2] == ['l1', 'l2'], o)
+T.check("assignment from a variable keeps newlines", o[2:4] == ['l1', 'l2'], o)
+T.check("arguments are still split into words", 'l1 l2' in o and '[l1][l2]' in o, o)
+T.check("assignment with a prefix keeps newlines", o[-2:] == ['al1', 'l2'], o)
+
+# ---------------------------------------------------------------- builtin stage closes the pipe fds
+c = T.tmpdir()
+with open(os.path.join(c, 'big.txt'), 'w') as f:
+    f.write(''.join('line %d some text\n' % i for i in range(90000)))
+try:
+    out, err, st = T.run_script('type big.txt | /usr/bin/head -1\necho after\nexit\n', cwd=c, timeout=10)
+except Exception as ex:
+    out = 'HANG %r' % ex
+T.check("builtin stage does not keep a pipe open (reader exits early)", 'line 0 some text' in out and 'after' in out, out[-200:])
+try:
+    out, err, st = T.run_script('echo piped | trace /usr/bin/cat\necho after\nexit\n', cwd=c, timeout=10)
+except Exception as ex:
+    out = 'HANG %r' % ex
+T.check("builtin stage feeding a builtin that runs a program", 'piped' in out and 'after' in out, out[-200:])
+
+# ---------------------------------------------------------------- ls and names with blanks
+c = T.tmpdir()
+os.mkdir(os.path.join(c, 'd e')); write(c, 'd e/f g'); write(c, 'b c.txt', 'x'); write(c, 'a1')
+o, e, st, _ = sh(['ls "d e"', "ls 'b c.txt'", 'ls -l "b c.txt"', 'ls d\\ e', 'ls -la "d e" a1', 'ls nonexist'], cwd=c)
+o = [x for x in o if x]
+T.check("ls takes a quoted directory with a blank", any('f g' in x for x in o[:1]), o)
+T.check("ls takes a single-quoted file", o[1].strip().startswith('b c.txt'), o)
+T.check("ls -l with a quoted name", any(x.rstrip().endswith('b c.txt') and x.startswith('-') for x in o), o)
+T.check("ls with an escaped blank", sum('f g' in x for x in o) >= 2, o)
+T.check("ls names the path that failed", 'nonexist' in e and 'No such file' in e, e)
+
+# ---------------------------------------------------------------- Tab inserts escaped names
+c = T.tmpdir()
+write(c, 'sp ace.txt', 'tab-one\n'); write(c, "it's.txt", 'tab-two\n'); write(c, 'plain.txt', 'tab-three\n')
+s = T.Sess(cwd=c)
+s.settle()
+s.send('/usr/bin/cat sp\t'); s.settle()
+s.send('\r'); s.settle()
+s.send('/usr/bin/cat it\t'); s.settle()
+s.send('\r'); s.settle()
+s.send('/usr/bin/cat pl\t'); s.settle()
+s.send('\r'); s.settle()
+scr = s.screen()
+s.close()
+T.check("Tab on a name with a blank runs the right command", 'tab-one' in scr, scr)
+T.check("Tab on a name with a quote runs the right command", 'tab-two' in scr, scr)
+T.check("Tab on a plain name is unchanged", 'tab-three' in scr and 'plain\\' not in scr, scr)
+
+# ---------------------------------------------------------------- aliases are syntax
+c = T.tmpdir()
+o, e, st, _ = sh(['alias both="echo one; echo two"', 'both', 'alias ands="echo x && echo y"', 'ands',
+                  'alias ors="false || echo z"', 'ors', 'alias q="echo qq"', 'alias chain="q; echo w"', 'chain',
+                  'alias ls="echo L; ls"', 'ls', 'echo "a;b"'], cwd=c)
+o = [x for x in o if x]
+T.check("alias with ; runs two commands", o[:2] == ['one', 'two'], o)
+T.check("alias with && runs two commands", o[2:4] == ['x', 'y'], o)
+T.check("alias with || runs the second", 'z' in o, o)
+T.check("an alias inside an alias list is expanded", 'qq' in o and 'w' in o, o)
+T.check("an alias that names itself terminates", o.count('L') >= 1 and 'a;b' in o, o)
+
+# ---------------------------------------------------------------- builtin in the background
+c = T.tmpdir()
+o, e, st, _ = sh(['echo bgtext > out.txt &', '/bin/sleep 0.5', 'cat out.txt', 'echo "a &"', "echo 'b &'", 'echo c\\&'], cwd=c)
+T.check("a builtin with a final & runs as a job", any('[bg]' in x for x in o) and 'bgtext' in o, o)
+T.check("a quoted & stays text", 'a &' in o and 'b &' in o and 'c&' in o, o)
+
 T.cleanup()
