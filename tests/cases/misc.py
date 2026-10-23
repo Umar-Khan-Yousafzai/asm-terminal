@@ -343,4 +343,17 @@ open(ax + "/autoexec.txt", "w").write("#" * 5000 + "\necho late-line\n")
 o, e = run_ax()
 T.check("autoexec: a file past 4095 bytes runs to the end", "late-line" in o, (o[-60:], e))
 
+# ---- very long HOME ---------------------------------------------------------
+longhome = "/" + "a" * 40000
+s = T.Sess(env={"HOME": longhome}, cwd="/tmp")
+s.settle()
+s.run("echo still-alive")
+T.check("startup: a 40 KB HOME does not corrupt the shell", "still-alive" in s.screen() and s.alive(), s.screen()[-200:])
+s.run("theme classic")
+s.run("echo and-again")
+T.check("startup: a 40 KB HOME leaves the theme and prompt usable", "and-again" in s.screen() and s.alive(), s.screen()[-200:])
+s.close()
+out, err, st = T.run_script("echo alive\nexit\n", env={"HOME": longhome}, cwd="/tmp")
+T.check("startup: a 40 KB HOME works non-interactively", "alive" in out and st == 0, (st, err))
+
 T.cleanup()
