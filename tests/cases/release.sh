@@ -260,3 +260,54 @@ if command -v dpkg-deb >/dev/null; then
     rel_ok "deb description has no stale size claim" '! dpkg-deb -I "$RT"/dist/*.deb | grep -q "73 KB"'
     rm -rf "$RT"
 fi
+
+# LICENSE and what ships it
+rel_root="$HERE/.."
+rel_ok "make dist does not hide a missing LICENSE" \
+    '! grep -E "^\s*-cp .*LICENSE" "$rel_root/Makefile"'
+
+# Release workflow: static checks that need no Actions runner
+WF="$rel_root/.github/workflows/release.yml"
+CI="$rel_root/.github/workflows/ci.yml"
+rel_ok "workflows: every action is pinned to a commit SHA" \
+    '! grep -hE "^\s*-? *uses: " "$WF" "$CI" | grep -vE "uses: [^@ ]+@[0-9a-f]{40}( |$)"'
+rel_ok "workflows: token is read-only by default" \
+    'grep -qE "^permissions:" "$WF" && sed -n "/^permissions:/{n;p;q}" "$WF" | grep -q "contents: read" && sed -n "/^permissions:/{n;p;q}" "$CI" | grep -q "contents: read"'
+rel_ok "release: only the publish job can write" \
+    '[[ "$(grep -c "contents: write" "$WF")" == 1 ]] && sed -n "/^  publish:/,\$p" "$WF" | grep -q "contents: write"'
+rel_ok "release: tag and dispatch input never expand inside a script" \
+    '! grep -nE "^\s+(run:|[A-Za-z_]+=|.*\") .*\\$\{\{ *(github\.event\.inputs|github\.ref_name|steps\.ver\.outputs|needs\.[a-z]+\.outputs)" "$WF" | grep -v "^\S*:\s*[A-Z_]*: "'
+rel_ok "release: smoke tests can block a release" \
+    '! grep -nE "run_tests.sh.*\|\| *true|if-no-files-found: warn" "$WF"'
+rel_ok "release: publishing is limited to main and v* tags" \
+    'sed -n "/^  publish:/,\$p" "$WF" | grep -qE "if: github.ref == .refs/heads/main. \|\| startsWith\(github.ref, .refs/tags/v.\)"'
+rel_ok "release notes state what the checksums do not prove" \
+    'grep -q "do not prove who built them" "$rel_root/packaging/release-notes.sh"'
+
+# The version check step of the workflow, run for real with a fake gh
+if python3 -c 'import yaml' 2>/dev/null; then
+    RT=$(mktemp -d); mkdir -p "$RT/bin"
+    printf '#!/bin/sh\n[ -n "$FAKE_EXISTS" ]\n' > "$RT/bin/gh"; chmod +x "$RT/bin/gh"
+    python3 - "$WF" > "$RT/check.sh" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+print([s for s in d["jobs"]["check"]["steps"] if s.get("id") == "ver"][0]["run"])
+PY
+    rel_chk() {   # rel_chk EVENT REFTYPE REFNAME INPUT [env...]; echoes status and outputs
+        : > "$RT/out"
+        env -i PATH="$RT/bin:/usr/bin:/bin" GITHUB_OUTPUT="$RT/out" GITHUB_REPOSITORY=x/y \
+            EVENT_NAME="$1" REF_TYPE="$2" REF_NAME="$3" INPUT_VERSION="$4" "${@:5}" \
+            bash -e "$RT/check.sh" >"$RT/log" 2>&1; echo "$?"
+    }
+    rel_ok "release check: dispatch v2.3.0 is accepted" \
+        '[[ "$(rel_chk workflow_dispatch branch main v2.3.0)" == 0 ]] && grep -q "^version=2.3.0$" "$RT/out" && grep -q "^release=true$" "$RT/out"'
+    rel_ok "release check: shell metacharacters in a dispatch version are rejected" \
+        '[[ "$(rel_chk workflow_dispatch branch main "v1\$(touch $RT/pwned)")" == 1 && ! -e "$RT/pwned" ]]'
+    rel_ok "release check: shell metacharacters in a tag name are rejected" \
+        '[[ "$(rel_chk push tag "v1\";touch $RT/pwned;\"" "")" == 1 && ! -e "$RT/pwned" ]]'
+    rel_ok "release check: an existing release is not replaced silently" \
+        '[[ "$(rel_chk workflow_dispatch branch main v2.3.0 FAKE_EXISTS=1)" == 1 && "$(cat "$RT/log")" == *replace_existing* ]]'
+    rel_ok "release check: replace_existing allows it" \
+        '[[ "$(rel_chk workflow_dispatch branch main v2.3.0 FAKE_EXISTS=1 REPLACE_EXISTING=true)" == 0 ]]'
+    rm -rf "$RT"
+fi
