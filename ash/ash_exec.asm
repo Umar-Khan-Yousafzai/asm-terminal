@@ -44,7 +44,7 @@
 
 %define ASH_MAX_STAGES      16
 %define ASH_MAX_ARGS        256         ; argv slots for all stages, NULLs included
-%define ASH_POOL_SIZE       4096        ; unquoted word text
+%define ASH_POOL_SIZE       (LINE_MAX + 4096) ; unquoted word text, one NUL per word
 
 ; One record per pipeline stage
 %define STG_ARGV            0           ; qword: pointer into ash_argv
@@ -1458,7 +1458,7 @@ ash_child_builtin:
     mov rsi, [rbx + STG_SRC]
     mov rdx, [rbx + STG_SEND]
     lea rdi, [input_buf]
-    lea r8, [input_buf + MAX_INPUT - 1]
+    lea r8, [input_buf + LINE_MAX - 1]
 .cb_copy:
     cmp rsi, rdx
     jae .cb_copied

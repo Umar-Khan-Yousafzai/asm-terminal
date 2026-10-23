@@ -32,11 +32,11 @@ h = T.tmpdir()
 T.run_script("echo secret\nexit\n", home=h)
 T.check("script run leaves no history file", not os.path.exists(h + "/.asm_history"))
 
-long_line = "echo " + "a" * 506 + " touch %s/INJ\nexit\n" % d
+long_line = "echo " + "a" * 70000 + " touch %s/INJ\nexit\n" % d
 out, err, st = T.run_script(long_line)
 T.check("overlong piped line is dropped, tail not run", not os.path.exists(d + "/INJ"), out[-200:])
 T.check("overlong piped line reports an error", "line too long" in err, err)
-out, err, st = T.run_script("echo " + "b" * 600 + "\necho after\nexit\n")
+out, err, st = T.run_script("echo " + "b" * 70000 + "\necho after\nexit\n")
 T.check("line after an overlong one still runs", "after" in out, out[-100:])
 
 out, err, st = T.run_script("head -1\nhello\necho after\nexit\n")
