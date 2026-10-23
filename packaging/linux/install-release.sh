@@ -13,6 +13,8 @@
 #   <prefix>/share/icons/hicolor/.../asm-terminal.{svg,png}
 #
 # <prefix> is ~/.local, or /usr/local when run as root.
+# `asm` is only created or replaced when it is absent or already ASM Terminal;
+# another program with that name (pwntools) is left alone.
 #
 # Options (environment variables):
 #   ASM_VERSION=v2.1.0   install that release instead of the latest
@@ -31,6 +33,17 @@ say()  { printf '%s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Is $1 (a path) free to take over: absent, a link to asm-terminal, or an
+# older ASM Terminal copy? Anything else is some other program named asm.
+asm_is_ours() {
+    if [ -L "$1" ]; then
+        case "$(readlink "$1")" in asm-terminal|*/asm-terminal) return 0 ;; *) return 1 ;; esac
+    fi
+    [ ! -e "$1" ] && return 0
+    [ -f "$1" ] && grep -aq 'ASM Terminal v' "$1"
+}
+
+main() {
 if [ "$(id -u)" = "0" ]; then PREFIX="${ASM_PREFIX:-/usr/local}"
 else                           PREFIX="${ASM_PREFIX:-$HOME/.local}"; fi
 BINDIR="$PREFIX/bin"
@@ -54,8 +67,8 @@ if [ "${1:-}" = "--uninstall" ]; then
              "$ICONROOT"/*x*/apps/asm-terminal.png; do
         if [ -e "$f" ] || [ -L "$f" ]; then rm -f "$f"; say "removed $f"; fi
     done
-    # Only remove `asm` if it is our symlink, never someone else's program.
-    if [ -L "$BINDIR/asm" ] && [ "$(readlink "$BINDIR/asm")" = "asm-terminal" ]; then
+    # Only remove `asm` if it is ours, never someone else's program.
+    if { [ -e "$BINDIR/asm" ] || [ -L "$BINDIR/asm" ]; } && asm_is_ours "$BINDIR/asm"; then
         rm -f "$BINDIR/asm"; say "removed $BINDIR/asm"
     fi
     refresh_caches
@@ -69,8 +82,33 @@ fi
 [ "$(uname -s)" = "Linux" ]   || die "this installer is for Linux (Windows: use the setup.exe from the release page)"
 [ "$(uname -m)" = "x86_64" ]  || die "ASM Terminal is x86-64 only (this machine is $(uname -m))"
 
-if have curl;   then fetch() { curl -fsSL -o "$2" "$1"; }
-elif have wget; then fetch() { wget -q -O "$2" "$1"; }
+if [ -n "${ASM_RELEASE_BASE:-}" ]; then
+    BASE="$ASM_RELEASE_BASE"            # mirror or local test server
+    PROTO=""
+elif [ -n "${ASM_VERSION:-}" ]; then
+    case "$ASM_VERSION" in v*) tag="$ASM_VERSION" ;; *) tag="v$ASM_VERSION" ;; esac
+    case "$tag" in
+        v[0-9]*.[0-9]*.[0-9]*) ;;
+        *) die "ASM_VERSION must look like v2.2.0" ;;
+    esac
+    case "$tag" in *[!A-Za-z0-9.v-]*) die "ASM_VERSION must look like v2.2.0" ;; esac
+    BASE="https://github.com/$REPO/releases/download/$tag"
+    PROTO="--proto =https --proto-redir =https"
+else
+    BASE="https://github.com/$REPO/releases/latest/download"
+    PROTO="--proto =https --proto-redir =https"
+fi
+
+# fetch URL FILE. With curl, FETCH_CODE is left holding the HTTP status.
+FETCH_CODE=""
+if have curl; then
+    fetch() {
+        rc=0
+        # $PROTO is two options on purpose; -q keeps ~/.curlrc out of it
+        FETCH_CODE="$(curl -q $PROTO -fsSL -o "$2" -w '%{http_code}' "$1")" || rc=$?
+        return "$rc"
+    }
+elif have wget; then fetch() { FETCH_CODE=""; wget -q -O "$2" "$1"; }
 else die "need curl or wget"; fi
 
 if have sha256sum;  then sha256() { sha256sum "$1" | cut -d' ' -f1; }
@@ -78,17 +116,11 @@ elif have shasum;   then sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 elif have openssl;  then sha256() { openssl dgst -sha256 -r "$1" | cut -d' ' -f1; }
 else die "need sha256sum, shasum or openssl to verify the download"; fi
 
-if [ -n "${ASM_RELEASE_BASE:-}" ]; then
-    BASE="$ASM_RELEASE_BASE"            # mirror or local test server
-elif [ -n "${ASM_VERSION:-}" ]; then
-    case "$ASM_VERSION" in v*) tag="$ASM_VERSION" ;; *) tag="v$ASM_VERSION" ;; esac
-    BASE="https://github.com/$REPO/releases/download/$tag"
-else
-    BASE="https://github.com/$REPO/releases/latest/download"
-fi
-
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT INT TERM
+# Clean up on any exit; a signal must also stop the script, not just clean up
+trap 'rm -rf "$TMP"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Download + verify
@@ -113,9 +145,11 @@ if [ "$DESKTOP" = 1 ]; then
         verify "$DESKTOP_ASSET"
         mkdir -p "$TMP/d"
         tar -xzf "$TMP/$DESKTOP_ASSET" -C "$TMP/d"
-    else
+    elif [ -z "$FETCH_CODE" ] || [ "$FETCH_CODE" = 404 ]; then
         say "note: this release has no $DESKTOP_ASSET; installing the binary only."
         DESKTOP=0
+    else
+        die "could not download $DESKTOP_ASSET (HTTP $FETCH_CODE); try again, or set ASM_NO_DESKTOP=1 for the binary only"
     fi
 fi
 
@@ -124,21 +158,27 @@ fi
 # ---------------------------------------------------------------------------
 mkdir -p "$BINDIR"
 install -m 0755 "$TMP/$BIN_ASSET" "$BINDIR/asm-terminal"
-if [ -e "$BINDIR/asm" ] && [ ! -L "$BINDIR/asm" ] && ! cmp -s "$BINDIR/asm" "$BINDIR/asm-terminal"; then
-    # An older ASM Terminal install copied the binary here as `asm`. Replace it.
-    rm -f "$BINDIR/asm"
+if asm_is_ours "$BINDIR/asm"; then
+    ln -sf asm-terminal "$BINDIR/asm"
+    say "Installed $BINDIR/asm-terminal (and $BINDIR/asm)"
+else
+    say "Installed $BINDIR/asm-terminal"
+    say "note: $BINDIR/asm is another program and was left alone. Run 'asm-terminal'."
 fi
-ln -sf asm-terminal "$BINDIR/asm"
-say "Installed $BINDIR/asm-terminal (and $BINDIR/asm)"
 
 if [ "$DESKTOP" = 1 ]; then
     D="$TMP/d"
     mkdir -p "$APPDIR" "$ICONROOT/scalable/apps"
     install -m 0755 "$D/asm-terminal-launch" "$BINDIR/asm-terminal-launch"
     # Absolute Exec path: the desktop session's PATH often lacks ~/.local/bin.
-    sed -e "s|^TryExec=.*|TryExec=$BINDIR/asm-terminal-launch|" \
-        -e "s|^Exec=.*|Exec=$BINDIR/asm-terminal-launch|" \
-        "$D/asm-terminal.desktop" > "$APPDIR/asm-terminal.desktop"
+    # Written line by line so a prefix with spaces, '&' or '|' stays intact.
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            TryExec=*) printf 'TryExec=%s\n' "$BINDIR/asm-terminal-launch" ;;
+            Exec=*)    printf 'Exec="%s"\n' "$BINDIR/asm-terminal-launch" ;;
+            *)         printf '%s\n' "$line" ;;
+        esac
+    done < "$D/asm-terminal.desktop" > "$APPDIR/asm-terminal.desktop"
     chmod 0644 "$APPDIR/asm-terminal.desktop"
     install -m 0644 "$D/asm-terminal.svg" "$ICONROOT/scalable/apps/asm-terminal.svg"
     for png in "$D"/icons/hicolor/*/apps/asm-terminal.png; do
@@ -176,3 +216,8 @@ elif [ -n "$found" ] && [ "$(readlink -f "$found")" != "$(readlink -f "$BINDIR/a
 else
     say "Run: asm"
 fi
+}
+
+# The whole script is one function, called here, so a download cut off half
+# way through is a syntax error instead of a half-run installer.
+main "$@"

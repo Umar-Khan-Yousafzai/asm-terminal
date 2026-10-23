@@ -18,6 +18,7 @@ mkdir -p "$TOP"/{SOURCES,SPECS,BUILD,RPMS,SRPMS} "$TOP/payload"
 cp "$REPO/terminal" "$HERE/../linux/asm-terminal-launch" \
    "$HERE/../linux/asm-terminal.desktop" "$HERE/../linux/asm-terminal.svg" "$TOP/payload/"
 cp -r "$HERE/../linux/icons" "$TOP/payload/"
+cp "$REPO/LICENSE" "$TOP/payload/"
 tar -C "$TOP/payload" -czf "$TOP/SOURCES/asm-terminal-$VERSION-payload.tar.gz" .
 
 rpmbuild -bb "$HERE/asm-terminal.spec" \

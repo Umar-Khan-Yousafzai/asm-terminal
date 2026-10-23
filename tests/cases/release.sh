@@ -139,3 +139,124 @@ rm -rf "$RU"
 rel_out=""
 rel_ok "LICENSE file exists (MIT)"       'head -n 3 "$HERE/../LICENSE" 2>/dev/null | grep -q "MIT License"'
 rel_ok "LICENSE names the author"        'grep -q "Copyright (c) 20[0-9][0-9] Umar Khan Yousafzai" "$HERE/../LICENSE" 2>/dev/null'
+
+# --- packaging scripts and the Makefile, on a throwaway copy of the tree ----
+REL_ROOT="$HERE/.."
+rel_tree() {   # rel_tree DIR: just what the install/packaging scripts need
+    mkdir -p "$1"
+    cp -r "$REL_ROOT/packaging/linux" "$REL_ROOT/packaging/debian" "$1/" 2>/dev/null
+    mkdir -p "$1/packaging"; mv "$1/linux" "$1/debian" "$1/packaging/"
+    cp "$REL_ROOT/Makefile" "$REL_ROOT/version.inc" "$REL_ROOT/README.md" "$1/"
+    [[ -f "$REL_ROOT/LICENSE" ]] && cp "$REL_ROOT/LICENSE" "$1/"
+    cp "$BIN" "$1/terminal"
+}
+rel_syntax_ok() {
+    local f ok=1
+    for f in "$REL_ROOT"/packaging/linux/*.sh "$REL_ROOT"/packaging/debian/*.sh "$REL_ROOT"/packaging/rpm/*.sh \
+             "$REL_ROOT"/packaging/appimage/*.sh "$REL_ROOT"/packaging/release-notes.sh \
+             "$REL_ROOT"/packaging/linux/asm-terminal-launch; do
+        bash -n "$f" 2>/dev/null || { ok=0; echo "bash -n failed: $f"; }
+    done
+    for f in "$REL_ROOT"/packaging/linux/install-release.sh "$REL_ROOT"/packaging/linux/asm-terminal-launch; do
+        sh -n "$f" 2>/dev/null || { ok=0; echo "sh -n failed: $f"; }
+    done
+    [[ $ok = 1 ]]
+}
+rel_ok "packaging scripts parse (bash -n, sh -n)" 'rel_syntax_ok'
+
+if command -v make >/dev/null; then
+    RT=$(mktemp -d); rel_tree "$RT"
+    make -s -C "$RT" -o terminal install-desktop PREFIX="$RT/prefix" DESTDIR="$RT/stage" >/dev/null 2>&1
+    rel_ok "make install honours DESTDIR"  '[[ -x "$RT/stage$RT/prefix/bin/asm-terminal" && ! -e "$RT/prefix" ]]'
+    rel_ok "make install: asm link created" '[[ "$(readlink "$RT/stage$RT/prefix/bin/asm")" == asm-terminal ]]'
+    rel_ok "make install: Exec is quoted"   'grep -q "^Exec=\"$RT/prefix/bin/asm-terminal-launch\"$" "$RT/stage$RT/prefix/share/applications/asm-terminal.desktop"'
+    make -s -C "$RT" -o terminal uninstall PREFIX="$RT/prefix" DESTDIR="$RT/stage" >/dev/null 2>&1
+    rel_ok "make uninstall honours DESTDIR" '[[ ! -e "$RT/stage$RT/prefix/bin/asm-terminal" && ! -L "$RT/stage$RT/prefix/bin/asm" ]]'
+
+    mkdir -p "$RT/p2/bin"; printf '#!/bin/sh\necho foreign\n' > "$RT/p2/bin/asm"
+    rel_out=$(make -s -C "$RT" -o terminal install PREFIX="$RT/p2" 2>&1)
+    rel_ok "make install keeps another program named asm" \
+        '[[ "$(sed -n 2p "$RT/p2/bin/asm")" == "echo foreign" && ! -L "$RT/p2/bin/asm" && -x "$RT/p2/bin/asm-terminal" && "$rel_out" == *"left alone"* ]]'
+    make -s -C "$RT" -o terminal uninstall PREFIX="$RT/p2" >/dev/null 2>&1
+    rel_ok "make uninstall keeps another program named asm" '[[ -f "$RT/p2/bin/asm" && ! -e "$RT/p2/bin/asm-terminal" ]]'
+    ln -s pwn-asm "$RT/p2/bin/asm2"
+    make -s -C "$RT" -o terminal install PREFIX="$RT/p2" INSTALL_NAME=asm2 >/dev/null 2>&1
+    rel_ok "make install keeps a foreign asm symlink" '[[ "$(readlink "$RT/p2/bin/asm2")" == pwn-asm ]]'
+    mkdir -p "$RT/p3/bin"; cp "$BIN" "$RT/p3/bin/asm"
+    make -s -C "$RT" -o terminal install PREFIX="$RT/p3" >/dev/null 2>&1
+    rel_ok "make install replaces an older ASM Terminal copy" '[[ "$(readlink "$RT/p3/bin/asm")" == asm-terminal ]]'
+
+    make -s -C "$RT" -o terminal dist VERSION=0.0.0 >/dev/null 2>&1
+    rel_ok "make dist ships LICENSE" 'tar tzf "$RT/dist/asm-terminal-0.0.0-linux-x86_64.tar.gz" | grep -q "/LICENSE$"'
+    rm -rf "$RT/dist" "$RT/LICENSE"
+    rel_ok "make dist fails without LICENSE" '! make -s -C "$RT" -o terminal dist VERSION=0.0.0 >/dev/null 2>&1'
+    rm -rf "$RT"
+fi
+
+# install.sh (GUI-less) and uninstall.sh
+RT=$(mktemp -d); rel_tree "$RT"
+rel_out=$(ASM_NOGUI=1 ASM_SCOPE=user ASM_PREFIX="$RT/pre fix" ASM_TERMINAL_BIN="$BIN" bash "$RT/packaging/linux/install.sh" 2>&1)
+rel_ok "install.sh text mode prints real newlines" '[[ "$rel_out" != *\\n* && "$(wc -l <<<"$rel_out")" -ge 5 ]]'
+rel_ok "install.sh quotes Exec for a prefix with a space" \
+    'grep -q "^Exec=\"$RT/pre fix/bin/asm-terminal-launch\"$" "$RT/pre fix/share/applications/asm-terminal.desktop"'
+rel_out=$(ASM_NOGUI=1 ASM_TERMINAL_BIN="$RT/missing" bash "$RT/packaging/linux/install.sh" 2>&1)
+rel_ok "install.sh error text has real newlines"  '[[ "$rel_out" == *"Binary not found"* && "$rel_out" != *\\n* ]]'
+mkdir -p "$RT/f/bin"; printf '#!/bin/sh\necho foreign\n' > "$RT/f/bin/asm"
+rel_out=$(ASM_NOGUI=1 ASM_SCOPE=user ASM_PREFIX="$RT/f" ASM_TERMINAL_BIN="$BIN" bash "$RT/packaging/linux/install.sh" 2>&1)
+rel_ok "install.sh keeps another program named asm" \
+    '[[ ! -L "$RT/f/bin/asm" && "$(sed -n 2p "$RT/f/bin/asm")" == "echo foreign" && -x "$RT/f/bin/asm-terminal" && "$rel_out" == *"left alone"* ]]'
+ASM_PREFIX="$RT/f" bash "$RT/packaging/linux/uninstall.sh" >/dev/null 2>&1
+rel_ok "uninstall.sh keeps another program named asm" '[[ -f "$RT/f/bin/asm" && ! -e "$RT/f/bin/asm-terminal" ]]'
+ASM_PREFIX="$RT/pre fix" bash "$RT/packaging/linux/uninstall.sh" >/dev/null 2>&1
+rel_ok "uninstall.sh removes our asm link" '[[ ! -L "$RT/pre fix/bin/asm" && ! -e "$RT/pre fix/bin/asm-terminal" ]]'
+rm -rf "$RT"
+
+# install-release.sh against a local file:// mirror
+if command -v curl >/dev/null; then
+    RT=$(mktemp -d); rel_tree "$RT"
+    mkdir -p "$RT/rel"
+    cp "$BIN" "$RT/rel/asm-terminal-linux-x86_64"
+    tar -C "$RT/packaging/linux" -czf "$RT/rel/asm-terminal-linux-desktop.tar.gz" \
+        asm-terminal-launch asm-terminal.desktop asm-terminal.svg icons
+    (cd "$RT/rel" && sha256sum asm-terminal-linux-x86_64 asm-terminal-linux-desktop.tar.gz > SHA256SUMS)
+    IR="$RT/packaging/linux/install-release.sh"
+    rel_out=$(ASM_PREFIX="$RT/pre fix" ASM_RELEASE_BASE="file://$RT/rel" sh "$IR" 2>&1)
+    rel_ok "install-release.sh installs from a mirror"  '[[ -x "$RT/pre fix/bin/asm-terminal" && "$(readlink "$RT/pre fix/bin/asm")" == asm-terminal ]]'
+    rel_ok "install-release.sh quotes Exec for a prefix with a space" \
+        'grep -q "^Exec=\"$RT/pre fix/bin/asm-terminal-launch\"$" "$RT/pre fix/share/applications/asm-terminal.desktop"'
+    ASM_PREFIX="$RT/pre fix" sh "$IR" --uninstall >/dev/null 2>&1
+    rel_ok "install-release.sh --uninstall removes everything" '[[ ! -e "$RT/pre fix/bin/asm-terminal" && ! -L "$RT/pre fix/bin/asm" ]]'
+
+    mkdir -p "$RT/f/bin"; printf '#!/bin/sh\necho foreign\n' > "$RT/f/bin/asm"
+    rel_out=$(ASM_PREFIX="$RT/f" ASM_RELEASE_BASE="file://$RT/rel" sh "$IR" 2>&1)
+    rel_ok "install-release.sh keeps another program named asm" \
+        '[[ ! -L "$RT/f/bin/asm" && "$(sed -n 2p "$RT/f/bin/asm")" == "echo foreign" && -x "$RT/f/bin/asm-terminal" && "$rel_out" == *"left alone"* ]]'
+    ASM_PREFIX="$RT/f" sh "$IR" --uninstall >/dev/null 2>&1
+    rel_ok "install-release.sh --uninstall keeps another program named asm" '[[ -f "$RT/f/bin/asm" && ! -e "$RT/f/bin/asm-terminal" ]]'
+
+    cp "$RT/rel/SHA256SUMS" "$RT/rel/SHA256SUMS.good"
+    printf '%064d  asm-terminal-linux-x86_64\n' 0 > "$RT/rel/SHA256SUMS"
+    rel_out=$(ASM_PREFIX="$RT/bad" ASM_RELEASE_BASE="file://$RT/rel" sh "$IR" 2>&1); rel_st=$?
+    rel_ok "install-release.sh refuses a wrong checksum" '[[ $rel_st -ne 0 && "$rel_out" == *"checksum mismatch"* && ! -e "$RT/bad/bin/asm-terminal" ]]'
+    mv "$RT/rel/SHA256SUMS.good" "$RT/rel/SHA256SUMS"
+
+    rel_out=$(ASM_PREFIX="$RT/bad" ASM_VERSION='v1/../../x' sh "$IR" 2>&1); rel_st=$?
+    rel_ok "install-release.sh rejects a malformed ASM_VERSION" '[[ $rel_st -ne 0 && "$rel_out" == *"ASM_VERSION must look like"* ]]'
+
+    # a download cut off half way must not run its first half
+    head -c $(( $(wc -c < "$IR") / 2 )) "$IR" | ASM_PREFIX="$RT/cut" ASM_RELEASE_BASE="file://$RT/rel" sh >/dev/null 2>&1
+    rel_ok "install-release.sh: truncated script installs nothing" '[[ ! -e "$RT/cut" ]]'
+    rm -rf "$RT"
+fi
+
+# build-deb.sh: restrictive umask, version from version.inc, copyright file
+if command -v dpkg-deb >/dev/null; then
+    RT=$(mktemp -d); rel_tree "$RT"
+    RVER=$(sed -n 's/.*ASM_VERSION "\(.*\)".*/\1/p' "$RT/version.inc")
+    rel_out=$( (umask 077; cd "$RT" && env -u APP_VERSION bash packaging/debian/build-deb.sh) 2>&1 )
+    rel_ok "build-deb.sh builds under umask 077, version from version.inc" '[[ -f "$RT/dist/asm-terminal_${RVER}_amd64.deb" ]]'
+    rel_ok "deb ships a copyright file with the MIT text" \
+        'dpkg-deb --fsys-tarfile "$RT"/dist/*.deb | tar -xO ./usr/share/doc/asm-terminal/copyright | grep -q "^License: MIT"'
+    rel_ok "deb description has no stale size claim" '! dpkg-deb -I "$RT"/dist/*.deb | grep -q "73 KB"'
+    rm -rf "$RT"
+fi
