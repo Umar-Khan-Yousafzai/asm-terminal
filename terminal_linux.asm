@@ -2996,22 +2996,9 @@ dispatch_command:
     call str_copy
     lea rdi, [input_buf]
     call dc_find_builtin
-    mov rbx, rax                    ; handler
-    mov r12, rdx                    ; argument text or 0
-    test r12, r12
-    jz .dc_call
-    mov rdi, rbx
-    call dc_wants_raw
-    test eax, eax
-    jnz .dc_call
-    mov rdi, r12                    ; unquote the argument text as one string
-    lea rsi, [dc_args_buf]
-    xor edx, edx
-    call ash_next_word
-    lea r12, [dc_args_buf]
-.dc_call:
-    mov rdi, r12
-    call rbx
+    mov rdi, rax
+    mov rsi, rdx
+    call dc_run_handler
     jmp .dc_done
 
 .dc_bad_redir:
@@ -3103,6 +3090,36 @@ dc_find_builtin:
 .fb_ret:
     pop r14
     pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; dc_run_handler(rdi = handler, rsi = argument text or 0)
+; Most builtins take their arguments as one unquoted string; the ones in
+; dc_raw_handlers get the text as typed and split it themselves.
+; ----------------------------------------------------------------------------
+dc_run_handler:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12, rsi
+    test r12, r12
+    jz .rh_call
+    call dc_wants_raw
+    test eax, eax
+    jnz .rh_call
+    mov rdi, r12
+    lea rsi, [dc_args_buf]
+    xor edx, edx
+    call ash_next_word
+    lea r12, [dc_args_buf]
+.rh_call:
+    mov rdi, r12
+    call rbx
     pop r12
     pop rbx
     pop rbp
@@ -5154,143 +5171,220 @@ handler_time:
     jmp handler_date
 
 ; ---------- handler_echo ----------
+section .bss
+    echo_word           resb MAX_INPUT
+section .text
 handler_echo:
+    ; The words are unquoted like a shell would (rdi is the raw argument
+    ; text) and joined with one blank. Flags: -n no newline, -e enable
+    ; backslash escapes, -E disable them; they may be combined (-ne).
     push rbp
     mov rbp, rsp
     push rbx
     push r12
-    sub rsp, 8
+    push r13
+    push r14
 
+    xor r12d, r12d                  ; bit 0 = -n, bit 1 = -e
     test rdi, rdi
-    jz .he_empty
-    cmp byte [rdi], 0
-    je .he_empty
+    jz .he_print_nl
+    mov rbx, rdi                    ; rbx = argument text
 
-    mov rbx, rdi                    ; rbx = current arg ptr
-    xor r12d, r12d                  ; r12 bit 0 = -n, bit 1 = -e
-
-    ; --- Parse leading flags ---
 .he_flag_loop:
-    ; skip spaces between flags
-.he_skip_sp:
-    cmp byte [rbx], ' '
-    jne .he_check_flag
-    inc rbx
-    jmp .he_skip_sp
-.he_check_flag:
-    cmp byte [rbx], '-'
-    jne .he_parse_done
-    cmp byte [rbx + 1], 'n'
-    jne .he_try_e
-    cmp byte [rbx + 2], 0
-    je .he_set_n
-    cmp byte [rbx + 2], ' '
-    jne .he_parse_done
-.he_set_n:
+    mov rdi, rbx
+    lea rsi, [echo_word]
+    mov edx, 1
+    call ash_next_word
+    test rax, rax
+    jz .he_print_nl                 ; no words
+    lea rsi, [echo_word]
+    cmp byte [rsi], '-'
+    jne .he_words
+    cmp byte [rsi + 1], 0
+    je .he_words
+    mov ecx, 1
+.he_flag_chk:                       ; is every letter n, e or E?
+    movzx edx, byte [rsi + rcx]
+    test dl, dl
+    jz .he_flag_apply
+    cmp dl, 'n'
+    je .he_flag_next
+    cmp dl, 'e'
+    je .he_flag_next
+    cmp dl, 'E'
+    jne .he_words
+.he_flag_next:
+    inc ecx
+    jmp .he_flag_chk
+.he_flag_apply:
+    mov ecx, 1
+.he_flag_set:
+    movzx edx, byte [rsi + rcx]
+    test dl, dl
+    jz .he_flag_done
+    cmp dl, 'n'
+    jne .he_flag_e
     or r12d, 1
-    add rbx, 2
-    jmp .he_flag_loop
-.he_try_e:
-    cmp byte [rbx + 1], 'e'
-    jne .he_parse_done
-    cmp byte [rbx + 2], 0
-    je .he_set_e
-    cmp byte [rbx + 2], ' '
-    jne .he_parse_done
-.he_set_e:
+    jmp .he_flag_step
+.he_flag_e:
+    cmp dl, 'e'
+    jne .he_flag_E
     or r12d, 2
-    add rbx, 2
+    jmp .he_flag_step
+.he_flag_E:
+    and r12d, ~2
+.he_flag_step:
+    inc ecx
+    jmp .he_flag_set
+.he_flag_done:
+    mov rbx, rax                    ; the flag word is consumed
     jmp .he_flag_loop
 
-.he_parse_done:
-    ; Skip one leading space after flags
-    cmp byte [rbx], ' '
-    jne .he_emit
-    inc rbx
-
-.he_emit:
-    ; Copy into a temp buffer: drop shell quote characters, and expand
-    ; backslash escapes only when -e was given.
-    lea rdi, [env_expand_buf]       ; reuse 1 KB scratch
-    mov rsi, rbx
-.he_exp_loop:
+.he_words:
+    lea r13, [env_expand_buf]       ; output cursor
+    xor r14d, r14d                  ; 1 once a word was written
+.he_word_loop:
+    mov rdi, rbx
+    lea rsi, [echo_word]
+    mov edx, 1
+    call ash_next_word
+    test rax, rax
+    jz .he_out_done
+    mov rbx, rax
+    test r14d, r14d
+    jz .he_first
+    mov byte [r13], ' '
+    inc r13
+.he_first:
+    mov r14d, 1
+    lea rsi, [echo_word]
+.he_cp:
     movzx eax, byte [rsi]
     test al, al
-    jz .he_exp_done
-    cmp al, 0x27                    ; ' quote
-    je .he_exp_skip
-    cmp al, '"'
-    je .he_exp_skip
+    jz .he_word_loop
     cmp al, '\'
-    jne .he_exp_copy
-    test r12d, 2                    ; no -e: keep backslashes literal
-    jz .he_exp_copy
-    movzx eax, byte [rsi + 1]
-    cmp al, 'n'
-    je .he_exp_newline
-    cmp al, 't'
-    je .he_exp_tab
-    cmp al, 'r'
-    je .he_exp_cr
-    cmp al, '\'
-    je .he_exp_back
-    cmp al, '0'
-    je .he_exp_nul
-    ; unknown escape -> keep literal backslash
-    mov byte [rdi], '\'
-    inc rdi
+    jne .he_put
+    test r12d, 2
+    jz .he_put
+    movzx ecx, byte [rsi + 1]
+    cmp cl, 'n'
+    mov al, 10
+    je .he_esc2
+    cmp cl, 't'
+    mov al, 9
+    je .he_esc2
+    cmp cl, 'r'
+    mov al, 13
+    je .he_esc2
+    cmp cl, 'a'
+    mov al, 7
+    je .he_esc2
+    cmp cl, 'b'
+    mov al, 8
+    je .he_esc2
+    cmp cl, 'e'
+    mov al, 27
+    je .he_esc2
+    cmp cl, 'f'
+    mov al, 12
+    je .he_esc2
+    cmp cl, 'v'
+    mov al, 11
+    je .he_esc2
+    cmp cl, '\'
+    mov al, '\'
+    je .he_esc2
+    cmp cl, 'c'                     ; \c stops all output, including the newline
+    je .he_stop
+    cmp cl, '0'
+    je .he_octal
+    cmp cl, 'x'
+    je .he_hex
+    mov al, '\'                     ; unknown escape: keep the backslash
+    jmp .he_put
+.he_esc2:
+    add rsi, 2
+    mov [r13], al
+    inc r13
+    jmp .he_cp
+.he_put:
+    mov [r13], al
+    inc r13
     inc rsi
-    jmp .he_exp_loop
+    jmp .he_cp
 
-.he_exp_newline:
-    mov byte [rdi], 10
-    inc rdi
+.he_octal:                          ; \0 and up to three more octal digits
     add rsi, 2
-    jmp .he_exp_loop
-.he_exp_tab:
-    mov byte [rdi], 9
-    inc rdi
-    add rsi, 2
-    jmp .he_exp_loop
-.he_exp_cr:
-    mov byte [rdi], 13
-    inc rdi
-    add rsi, 2
-    jmp .he_exp_loop
-.he_exp_back:
-    mov byte [rdi], '\'
-    inc rdi
-    add rsi, 2
-    jmp .he_exp_loop
-.he_exp_nul:
-    add rsi, 2
-    jmp .he_exp_loop                ; drop NULs silently (can't embed in cstring)
-
-.he_exp_copy:
-    mov byte [rdi], al
-    inc rdi
-.he_exp_skip:
+    xor eax, eax
+    xor ecx, ecx
+.he_oct_loop:
+    cmp ecx, 3
+    jae .he_num_store
+    movzx edx, byte [rsi]
+    sub edx, '0'
+    cmp edx, 7
+    ja .he_num_store
+    shl eax, 3
+    add eax, edx
     inc rsi
-    jmp .he_exp_loop
+    inc ecx
+    jmp .he_oct_loop
+.he_hex:                            ; \xH or \xHH
+    xor eax, eax
+    xor ecx, ecx
+    lea rdi, [rsi + 2]
+.he_hex_loop:
+    cmp ecx, 2
+    jae .he_hex_end
+    movzx edx, byte [rdi]
+    cmp dl, '0'
+    jb .he_hex_end
+    cmp dl, '9'
+    jbe .he_hex_dig
+    or dl, 0x20
+    cmp dl, 'a'
+    jb .he_hex_end
+    cmp dl, 'f'
+    ja .he_hex_end
+    sub dl, 'a' - 10 - '0'
+.he_hex_dig:
+    sub dl, '0'
+    shl eax, 4
+    add eax, edx
+    inc rdi
+    inc ecx
+    jmp .he_hex_loop
+.he_hex_end:
+    test ecx, ecx
+    jnz .he_hex_ok
+    mov al, '\'                     ; no digits: a plain "\x"
+    jmp .he_put
+.he_hex_ok:
+    mov rsi, rdi
+.he_num_store:
+    mov [r13], al
+    inc r13
+    jmp .he_cp
 
-.he_exp_done:
-    mov byte [rdi], 0
+.he_stop:
+    or r12d, 1                      ; no newline either
+.he_out_done:
     lea rdi, [env_expand_buf]
-    call print_cstring
-
-.he_terminator:
+    mov rsi, r13
+    sub rsi, rdi
+    call print_string_len
     test r12d, 1
-    jnz .he_done                    ; -n suppresses trailing newline
-    call print_newline
-    jmp .he_done
-
-.he_empty:
+    jnz .he_done
+.he_print_nl:
+    test r12d, 1
+    jnz .he_done
     call print_newline
 .he_done:
-    add rsp, 8
+    pop r14
+    pop r13
     pop r12
     pop rbx
-    leave
+    pop rbp
     ret
 
 ; ---------- handler_title ----------
@@ -7037,35 +7131,43 @@ skip_spaces:
     ret
 
 ; ---------- parse_two_args ----------
-; Split string at first space (modifies string in-place).
-; rdi = input. Returns: rax = arg1, rdx = arg2 (or both 0 on failure).
+; Split an argument string into exactly two words, honouring quotes and
+; backslashes (the one shared helper for builtins that take two names).
+; In: rdi = argument text. Out: rax = first word, rdx = second word, both
+; unquoted copies in static buffers (the text itself is left alone); rax =
+; rdx = 0 unless there are exactly two words.
+section .bss
+    pta_a               resb MAX_INPUT
+    pta_b               resb MAX_INPUT
+section .text
 parse_two_args:
-    mov rax, rdi
+    push rbp
+    mov rbp, rsp
+    test rdi, rdi
+    jz .pta_fail
+    lea rsi, [pta_a]
+    mov edx, 1
+    call ash_next_word
     test rax, rax
     jz .pta_fail
-.pta_find:
-    cmp byte [rdi], 0
-    je .pta_fail
-    cmp byte [rdi], ' '
-    je .pta_split
-    inc rdi
-    jmp .pta_find
-.pta_split:
-    mov byte [rdi], 0              ; null-terminate first arg
-    inc rdi
-.pta_skip:
-    cmp byte [rdi], ' '
-    jne .pta_check
-    inc rdi
-    jmp .pta_skip
-.pta_check:
-    cmp byte [rdi], 0
-    je .pta_fail
-    mov rdx, rdi                   ; second arg
+    mov rdi, rax
+    lea rsi, [pta_b]
+    mov edx, 1
+    call ash_next_word
+    test rax, rax
+    jz .pta_fail
+    mov rdi, rax
+    call ash_skip_blanks
+    cmp byte [rax], 0
+    jne .pta_fail                   ; a third word
+    lea rax, [pta_a]
+    lea rdx, [pta_b]
+    pop rbp
     ret
 .pta_fail:
     xor eax, eax
     xor edx, edx
+    pop rbp
     ret
 
 ; ---------- hex_to_int ----------
