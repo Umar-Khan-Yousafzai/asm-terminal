@@ -16,6 +16,7 @@ asm-terminal/
   ash/tools.asm         # bench, undo/trash (+ safe del/move/copy, ~/.asm_trash with .journal), trace, sandbox
   ash/highlight.asm     # live command colors (Dark+ palette, danger list for Linux + Windows)
   ash/help.asm          # `help` table: HSEC/HROW rows (Command | Usage | random Example)
+  ash/smart.asm         # grey history suggestions, Tab match list, history folder/status notes (#asm: lines)
   ash/update.asm        # update / update install, background update check (curl + sha256sum)
   version.inc           # the one place the version is written
   CHANGELOG.md          # release notes source (the release workflow requires an entry)

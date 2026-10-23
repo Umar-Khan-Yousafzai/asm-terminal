@@ -1008,6 +1008,7 @@ main:
     lea rdi, [input_buf]
     call history_save_entry
 .main_no_save:
+    call sm_before_run              ; remember the folder for the history note
 
 .main_run:
     ; OSC 133 C — output region begins (only for a terminal that asked for
@@ -1024,6 +1025,7 @@ main:
     call script_isig_on
     call ash_feed_line
     call script_isig_off
+    call sm_after_run               ; note folder and exit status in history
 
     ; OSC 133 D;<exit_status> — end of command + exit code
     cmp byte [osc_enabled], 0
@@ -1884,6 +1886,7 @@ read_line:
 
     ; A ^C that interrupted a child is not meant for this line
     mov byte [ctrl_c_flag], 0
+    call sm_line_start              ; suggestions, Tab menu (ash/smart.asm)
 
 .rl_loop:
     ; Check for pending Ctrl+C
@@ -1923,6 +1926,7 @@ read_line:
     je .rl_dispatch
     ; Tab was active but non-tab pressed - cancel tab state
     mov byte [tab_active], 0
+    call sm_close_menu              ; erase the list of matches
 
 .rl_dispatch:
     cmp bx, VK_RETURN
@@ -2017,6 +2021,7 @@ read_line:
     jmp .rl_loop
 
 .rl_enter:
+    call sm_clear_extras            ; no grey suggestion left on the screen
     ; Park the cursor behind the last character so the newline lands below
     ; the whole (possibly wrapped) line
     mov eax, [line_len]
@@ -2101,7 +2106,7 @@ read_line:
     mov ecx, [line_cursor]
     mov edx, [line_len]
     cmp ecx, edx
-    jge .rl_loop
+    jge .rl_accept                  ; at the end: take the suggestion
     lea rdi, [line_buf]
 .rl_right_fwd:
     inc ecx
@@ -2123,8 +2128,14 @@ read_line:
 
 .rl_end:
     mov eax, [line_len]
+    cmp eax, [line_cursor]
+    je .rl_accept                   ; already at the end: take the suggestion
     mov [line_cursor], eax
     call update_cursor_pos
+    jmp .rl_loop
+
+.rl_accept:
+    call sm_accept
     jmp .rl_loop
 
 .rl_up:
@@ -2301,6 +2312,7 @@ read_line:
 
 .rl_ctrlc:
     mov byte [ctrl_c_flag], 0
+    call sm_clear_extras
     ; ^C goes behind the text, not into the middle of a wrapped line
     mov eax, [line_len]
     cmp eax, [line_cursor]
@@ -2456,12 +2468,15 @@ redraw_line:
 
     ; --- Syntax highlighting for line content (ash/highlight.asm) ---
     call hl_draw_line
+    call sm_draw_suggestion     ; grey rest of a history entry (ash/smart.asm)
+    mov r13d, eax               ; its columns
 
-    ; r12d = cells used by prompt + text = where the cursor is now
+    ; r12d = cells used by prompt + text + suggestion = where the cursor is now
     lea rdi, [line_buf]
     mov esi, [line_len]
     call utf8_cols
     add eax, [prompt_total_len]
+    add eax, r13d
     mov r12d, eax
     call cur_cols
     mov ecx, eax
@@ -2469,6 +2484,7 @@ redraw_line:
     xor edx, edx
     div ecx                     ; eax = end row, edx = end column
     mov r14d, eax
+    mov [rd_end_row], eax
     test edx, edx
     jnz .rd_erase
     test r12d, r12d
@@ -2663,6 +2679,8 @@ history_add:
     jz .ha_done                 ; duplicate, skip
 
 .ha_add:
+    mov eax, [history_write_idx]
+    call sm_note_clear              ; folder and status are not known yet
     ; Copy string to history buffer at write_idx
     mov eax, [history_write_idx]
     imul eax, HISTORY_ENTRY_SIZE
@@ -2983,6 +3001,7 @@ tab_complete:
     jne .tc_find_slash
     lea r15d, [rcx + 1]
 .tc_slash_done:
+    mov [tab_name_off], r15d        ; for the menu (ash/smart.asm)
 
     ; The directory to read goes to find_pattern: "." or the part before the name
     lea rdi, [find_pattern]
@@ -3184,6 +3203,7 @@ tab_complete:
     add eax, [tab_tail_len]
     mov [line_len], eax
     call redraw_line
+    call sm_tab_menu                ; list all matches under the line
     jmp .tc_done
 
 .tc_giveup:
@@ -9413,6 +9433,10 @@ load_history:
     test ecx, ecx
     jz .lh_line
     lea rdi, [cmd_line_buf]
+    call sm_load_meta               ; "#asm:HASH:STATUS" notes the entry before
+    test eax, eax
+    jnz .lh_line
+    lea rdi, [cmd_line_buf]
     call history_add
     jmp .lh_line
 
@@ -9457,12 +9481,16 @@ history_rewrite:
 .hr_loop:
     cmp r13d, [history_count]
     jae .hr_write
+    lea rax, [history_read_buf + 262144 - HISTORY_ENTRY_SIZE - 32]
+    cmp r12, rax
+    jae .hr_write                   ; no room for another entry and its note
     mov eax, [history_write_idx]
     sub eax, [history_count]
     add eax, r13d
     jge .hr_idx
     add eax, HISTORY_COUNT
 .hr_idx:
+    mov ebx, eax                    ; slot, for the note
     imul eax, HISTORY_ENTRY_SIZE
     lea rsi, [history_buf]
     add rsi, rax
@@ -9478,6 +9506,14 @@ history_rewrite:
     mov byte [r12], 10
     inc r12
     inc r13d
+    mov eax, ebx
+    call sm_has_meta
+    test eax, eax
+    jz .hr_loop
+    mov rdi, r12
+    mov eax, ebx
+    call sm_fmt_meta
+    mov r12, rax
     jmp .hr_loop
 
 .hr_write:
@@ -13462,3 +13498,4 @@ align 1
 %include "ash/tools.asm"
 %include "ash/highlight.asm"
 %include "ash/help.asm"
+%include "ash/smart.asm"

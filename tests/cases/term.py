@@ -273,7 +273,10 @@ for _ in range(5):
 fds_after = len(os.listdir("/proc/%d/fd" % s.p.pid))
 T.check("abandoned Tab cycles leak no fd", fds_after == fds_before, (fds_before, fds_after))
 s.send("al\t\t"); s.settle(0.4)
-T.check("Tab cycles through matches", re.search(r"cat al(pha|pine)$|\$ al(pha|pine)$", s.screen().rstrip()) is not None, s.screen())
+T.check("Tab cycles through matches", re.search(r"(cat |\$ )al(pha|pine)$", s.screen().rstrip(), re.M) is not None, s.screen())
+T.check("Tab lists every match under the line", re.search(r"^  .*alpha.*alpine|^  .*alpine.*alpha", s.screen(), re.M) is not None, s.screen())
+s.send("x"); s.settle(0.3)
+T.check("another key closes the Tab list", "alpha  " not in s.screen() and "alpine  " not in s.screen(), s.screen())
 s.close()
 
 # big directory: the entry past the first 8 KB of dirents completes
