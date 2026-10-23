@@ -43,7 +43,7 @@ There is no "free instant fix". Your options rank from *most polished* to *free*
 - Makes the Publisher field show your name instead of "Unknown".
 - Not recommended unless you're installing on machines you control.
 
-## 6. Ship unsigned (free, current state)
+## 6. Ship unsigned (free, current state unless the PFX secrets are set)
 
 - SmartScreen shows the blue warning. User clicks *More info → Run anyway*
 - Document this in the README so users know what to expect
@@ -55,41 +55,37 @@ There is no "free instant fix". Your options rank from *most polished* to *free*
 
 ## How the build gets signed in CI
 
-The release workflow has a signing step that runs if the repo has the right
-secrets configured. No secrets ⇒ step is skipped and unsigned binaries ship.
+The release workflow has one signing step, and it only supports a `.pfx`
+code-signing certificate. If the secrets below are not set the step is
+skipped and unsigned files ship. It signs the NSIS `setup.exe` only:
+`terminal.exe`, the standalone `asm-terminal-windows-x86_64.exe` and the zip
+are not signed.
 
-### If you go with Azure Trusted Signing
+Add these GitHub Actions secrets (Settings, Secrets and variables, Actions):
 
-Add these GitHub Actions secrets (Settings → Secrets and variables → Actions):
+- `CODE_SIGN_PFX_BASE64`    the `.pfx` file, base64 encoded
+- `CODE_SIGN_PFX_PASSWORD`  its password
 
-- `AZURE_TENANT_ID`
-- `AZURE_CLIENT_ID`
-- `AZURE_CLIENT_SECRET`
-- `AZURE_TRUSTED_SIGNING_ENDPOINT`  e.g. `https://eus.codesigning.azure.net`
-- `AZURE_TRUSTED_SIGNING_ACCOUNT`   your account name
-- `AZURE_TRUSTED_SIGNING_PROFILE`   your certificate profile name
-
-The workflow picks them up and runs `AzureSignTool` against the NSIS output.
-
-### If you go with SignPath
-
-The SignPath GitHub Action uploads the unsigned installer to SignPath, which
-signs it server-side and pushes the signed artifact back. One secret:
-
-- `SIGNPATH_API_TOKEN`
-
-Plus repo configuration in SignPath itself (project slug, signing policy).
+Azure Trusted Signing and SignPath (options 2 and 3 above) are not wired into
+the workflow. Using either one means adding a signing step to
+`.github/workflows/release.yml` (their GitHub Actions, with their own
+secrets); setting `AZURE_*` or `SIGNPATH_*` secrets alone does nothing.
 
 ### Local signing with a .pfx you already own
 
+`signtool` takes the password as plain text, so read it into a variable first
+(or import the certificate into your store and select it with `/sha1`
+instead of `/f` and `/p`):
+
 ```powershell
-# signtool path on Win11:
+# signtool path on Win11 (the version folder differs per SDK install):
 $ST = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe"
+$pw = Read-Host "Cert password"
 & $ST sign `
     /fd SHA256 `
     /tr http://timestamp.digicert.com /td SHA256 `
-    /f my-cert.pfx /p (Read-Host -AsSecureString "Cert password") `
-    asm-terminal-2.0.0-windows-x86_64-setup.exe
+    /f my-cert.pfx /p $pw `
+    asm-terminal-<version>-windows-x86_64-setup.exe
 ```
 
 On Linux, use `osslsigncode` (apt install osslsigncode):
@@ -99,8 +95,8 @@ osslsigncode sign \
     -certs my-cert.crt -key my-cert.key \
     -n "ASM Terminal" -i https://github.com/Umar-Khan-Yousafzai/asm-terminal \
     -t http://timestamp.digicert.com \
-    -in  asm-terminal-2.0.0-windows-x86_64-setup.exe \
-    -out asm-terminal-2.0.0-windows-x86_64-setup.signed.exe
+    -in  asm-terminal-<version>-windows-x86_64-setup.exe \
+    -out asm-terminal-<version>-windows-x86_64-setup.signed.exe
 ```
 
 ## Recommendation for this project
@@ -111,3 +107,15 @@ osslsigncode sign \
    signed binaries start earning SmartScreen reputation from day 1.
 3. **Long term**: if downloads pick up and you want zero-warning from the
    first install, move to EV cert ($250–$600/yr) or Azure Trusted Signing.
+
+## What signing does not cover
+
+Authenticode signing is for Windows files only. The Linux assets (the
+`asm-terminal-linux-x86_64` binary that `update install` downloads, the
+`install.sh` script, the packages) are not signed, and `SHA256SUMS` is
+published next to them from the same release. That file detects a corrupted
+download. It cannot detect a release that was replaced by someone who can
+publish to the repository, because they can replace the checksums too. A
+signature made with a key kept outside GitHub (minisign, cosign or GPG, with
+the public key shipped in the binary or documented in the README) would close
+that gap; none is set up yet.

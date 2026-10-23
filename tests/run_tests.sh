@@ -14,6 +14,13 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
+# Hermetic: a throwaway HOME so tests never read or write the real
+# ~/.asm_history, ~/.asm_trash or ~/.asmrc, and no update check goes online.
+TEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/asm-tests.XXXXXX")"
+trap 'rm -rf -- "$TEST_HOME"' EXIT
+export HOME="$TEST_HOME"
+export ASM_NO_UPDATE_CHECK=1
+
 pass=0
 fail=0
 failures=()
@@ -31,7 +38,7 @@ strip_ansi() {
 run_case() {
     local name="$1" input="$2" pattern="$3"
     local out
-    out=$(printf '%s\nexit\n' "$input" | "$BIN" 2>&1 | strip_ansi)
+    out=$(printf '%s\nexit\n' "$input" | timeout 20 "$BIN" 2>&1 | strip_ansi)
     if grep -qE "$pattern" <<<"$out"; then
         pass=$((pass + 1))
         printf "  [pass] %s\n" "$name"
@@ -263,6 +270,38 @@ if command -v python3 >/dev/null; then
         fail=$((fail + 1)); failures+=("typing after a failed command stays on one line")
         printf "  [FAIL] typing after a failed command stays on one line\n    got: %s\n" "$out"
     fi
+fi
+
+# --- Per-area case files (tests/cases/*.sh use the helpers above; *.py go
+# through tests/ptytest.py) ---
+py_cases() {
+    local file="$1" line st=0
+    local tmp; tmp=$(mktemp)
+    PYTHONPATH="$HERE" BIN="$BIN" timeout 180 python3 "$file" >"$tmp" 2>&1 || st=$?
+    while IFS= read -r line; do
+        case "$line" in
+            ok$'\t'*)
+                pass=$((pass + 1)); printf "  [pass] %s\n" "${line#ok$'\t'}" ;;
+            "not ok"$'\t'*)
+                fail=$((fail + 1)); failures+=("${line#not ok$'\t'}")
+                printf "  [FAIL] %s\n" "${line#not ok$'\t'}" ;;
+        esac
+    done <"$tmp"
+    if (( st != 0 )); then
+        fail=$((fail + 1)); failures+=("$(basename "$file") exited $st")
+        printf "  [FAIL] %s exited %s\n" "$(basename "$file")" "$st"
+        tail -n 15 "$tmp" | sed 's/^/    /'
+    fi
+    rm -f "$tmp"
+}
+
+for f in "$HERE"/cases/*.sh; do
+    [[ -e "$f" ]] && . "$f"
+done
+if command -v python3 >/dev/null; then
+    for f in "$HERE"/cases/*.py; do
+        [[ -e "$f" ]] && py_cases "$f"
+    done
 fi
 
 echo
