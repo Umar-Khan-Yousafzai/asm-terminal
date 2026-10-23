@@ -127,6 +127,7 @@ section .bss
     ash_pipes           resd ASH_MAX_STAGES * 2
     alignb 8
     ash_child_stage     resq 1          ; set in a pipeline child: its stage record
+    ash_child_npipes    resd 1          ; ... and how many pipes the pipeline has
     ash_exec_path       resb MAX_PATH_BUF
     ash_sh_argv         resq ASH_MAX_ARGS + 2
 
@@ -1173,6 +1174,8 @@ ash_run:
 
 .ac_exec:
     mov [ash_child_stage], r13
+    lea eax, [r12d - 1]
+    mov [ash_child_npipes], eax
     mov rdi, [r13 + STG_ARGV]
     call ash_exec_argv              ; does not return
 
@@ -1447,6 +1450,11 @@ ash_child_builtin:
     mov rbx, [ash_child_stage]
     test rbx, rbx
     jz .cb_ret
+    mov byte [interactive_mode], 0  ; stdout may be a pipe: handlers that switch
+    mov byte [raw_active], 0        ; the terminal mode must stay silent here
+    mov edi, [ash_child_npipes]     ; the pipe ends were duplicated onto 0 and 1;
+    call ash_close_pipes            ; the originals would keep the other stages
+                                    ; from ever seeing end of file
     mov rsi, [rbx + STG_SRC]
     mov rdx, [rbx + STG_SEND]
     lea rdi, [input_buf]
