@@ -11,6 +11,119 @@ The version lives in one place: `version.inc`.
   picks a random example per command. Commands that destroy data show in red. On terminals
   narrower than 95 columns the example moves to its own line.
 
+## [2.3.0] - 2026-10-23
+
+A full code review of the shell found about a hundred defects. This release fixes them: command
+injection through variable values, a sandbox that did not contain much, data loss in `copy`/`del`,
+a terminal left in a broken state, job control that did not exist, and many smaller bugs.
+
+### Highlights
+- **Security**: variable values, loop variables and file names are data. They are never run or
+  re-parsed as shell syntax, so `for f in *; do echo $f; done` is safe in a folder with hostile
+  file names.
+- **Job control**: every foreground command and background job gets its own process group.
+  Ctrl+C reaches only the foreground job and Ctrl+Z stops it; `fg` and `bg` resume it.
+- **No more data loss**: `copy a a` no longer destroys the file, trash names no longer collide, and
+  `del`/`move`/`copy` refuse instead of deleting for good when the trash cannot be used.
+- **A sandbox that holds**: `sandbox` now blocks sockets, `io_uring`, `ptrace`, `TIOCSTI` and file
+  attribute changes, and refuses to run when it cannot be applied.
+- **A terminal that recovers**: your terminal is restored after `SIGTERM`, `SIGHUP`, a crash or a
+  vanished terminal, and long lines wrap and redraw correctly.
+
+### Added
+- Job control: process groups, Ctrl+Z, `fg`/`bg` for stopped jobs, `kill %N`, `kill -s NAME`,
+  `kill -l`, and 31 signal names.
+- `trash` lists the trash and `trash empty` empties it. The trash keeps original names, has a
+  persistent journal (so `undo` works after a restart) and is capped at 512 MiB and 30 days.
+- `del`, `move` and `copy` take `-f` to continue when the trash cannot be used.
+- `sandbox -n` (allow IPv4/IPv6 sockets), `-b` (best effort when Landlock/seccomp are missing)
+  and combined flags with `--` to end them.
+- Builtins (`history`, `set`, `alias`, ...) work in pipelines, `$(...)` and backticks.
+- Redirections: `N>`, `N<`, `>&N`, `&>` and ordered forms such as `2>&1 >file`; a redirect to a
+  file that cannot be opened stops the command with status 1.
+- Scripts: `break N`, `continue N`, `shift`, `-a`/`-o`/`!`/`( )` in `test`, and
+  `& | ^ << >> ?:` plus hex and octal literals in `$(( ))`; function calls accept pipes and
+  redirections; recursion allows 200 levels.
+- `ls` sorts, shows symlinks, takes several paths and options anywhere. `cat`/`type` pass
+  options and several files to `/bin/cat`.
+- `date`/`time` show the zone in use: `ASM_TZ`, a simple POSIX `TZ` such as `EST5`, else the build
+  default.
+- MIT `LICENSE` file, shipped in every package.
+- Word-boundary command colors, `NO_COLOR`/`TERM=dumb` support, aliases and functions count as
+  known commands.
+- Windows: `exit N`, `copy /y`, copy/move into a folder, `dir` wildcards and large sizes, `cd /d`,
+  `mkdir` with parents, and `install.bat /S`.
+
+### Changed
+- Builtin error messages go to stderr and set `$?`, so `&&`, `||` and `if` work after a failing
+  `cd`, `mkdir`, `cat`, `grep`, `copy` and friends.
+- `exit` with no number exits with the last command's status; `exit abc` leaves with 2.
+- Environment names are case-sensitive: `path=...` no longer clobbers `PATH`.
+- Exec failures report the real reason with status 126 or 127; a signalled child gives 128+signal.
+- `~/.asmrc`, `autoexec.txt` and `source` files are read whole (up to 64 KiB). `autoexec.txt` is
+  ignored unless you or root own it and it is not world-writable.
+- `~/.asm_history` is created 0600, loads the newest 256 KiB and trims big files; scripts do not
+  write it.
+- Piped input lines over 511 bytes are rejected instead of run in pieces.
+- Release workflow: least-privilege token, pinned actions, validated versions, tests and missing
+  assets block a release, manual runs from other branches do not publish. AppImage builds use a
+  pinned, checksum-verified `appimagetool`.
+- Updater: https only, validated tags, no downgrade, private fsynced temp file;
+  `ASM_NO_UPDATE_CHECK` is honoured from `~/.asmrc`; package-manager and AppImage copies are left
+  alone.
+- Windows installers take the version from the build and quote the uninstall command.
+
+### Fixed
+- **Injection**: values from the environment, `set`, loop variables, function arguments and file
+  names were re-parsed after expansion, so `$(...)`, backticks, `|`, `>` and quotes in them ran.
+- **Terminal state**: escape sequences no longer end up in piped output or in the file of
+  `cmd > file`; a tty that is only stdin is no longer reset to all zero flags; the terminal is
+  restored on `SIGTERM`/`SIGHUP`/crash; a vanished terminal no longer makes the shell spin at 100%.
+- **Line editor**: Tab no longer hangs or leaks a file descriptor, keeps text after the cursor and
+  is bounded; the oldest history entry is reachable; function keys, Ctrl/Shift arrows and Alt keys
+  no longer insert garbage; bracketed paste never runs commands; UTF-8 can be typed and edited;
+  wrapped lines redraw correctly; the git branch is counted in the prompt width.
+- **Prompt**: one prompt build and one write per keystroke; directory names with control bytes are
+  sanitised and OSC 7 is percent-encoded; jobs and themes set in `.asmrc` survive startup.
+- **Highlighting**: no false reds for `cat mkfs.txt`, `df -h` or `dd ... of=/dev/null`.
+- **Files**: `copy` keeps permissions, refuses a file onto itself and folders, and reports every
+  error; `move` works across filesystems and for folders; failed `undo` keeps its entry.
+- **Sandbox/trace/bench**: `trace` waits only for its own command, escapes names and no longer hides
+  names containing `..`; nested `bench` no longer mutes the terminal.
+- **Scripts**: `x=$(cmd)` keeps the status of `cmd`; Ctrl+C stops loops that run only builtins and
+  `$(...)`; `for` lists are no longer cut at 4031 bytes; sourced scripts are no longer rejected
+  beyond 256 commands or 8 KB; functions containing `case` are defined; `$(( ))` short-circuits
+  `&&`/`||`, divides safely and has correct comparison precedence; CRLF line continuations work.
+- **Builtins**: `calc` no longer crashes on `INT64_MIN / -1`; `grep` no longer overflows on long
+  patterns and writes in bulk; `color` writes valid digits; `cd` keeps `cd -` after a failure and
+  maintains `PWD`/`OLDPWD`; alias and environment tables are bounded and reuse slots; `kill`
+  rejects pids that do not fit (`kill 4294967295` no longer means `-1`).
+- Background jobs no longer steal keystrokes; a full job table says so; `bg N` prints the right
+  job number; children get the whole environment (limit 8191 variables).
+- Quoted `>`, `<` and `&` are text; `echo` quoting, `\$` and tilde-after-variable behave like `sh`;
+  an over-long expanded line is an error, not a silent cut at 511 bytes.
+- Windows: Tab loops and a bad register, inheritable redirect handles, raw console mode left on while
+  programs ran, `%VAR%` overflow, history, line wrapping, `autoexec.txt` corruption, `cmd.exe`
+  quoting and Ctrl+C handling.
+- Documentation numbers (binary size, history size, line counts) match the build.
+- `$(...)` and backticks no longer capture terminal escape sequences when the shell runs on a
+  terminal; newlines in an assignment are kept; a builtin as a pipeline stage no longer hangs;
+  `ls` takes quoted paths and Tab escapes blanks; aliases may hold `;`, `&&` and `||`; a builtin
+  with a trailing `&` runs in the background.
+- `unset` takes several names; `export` and `set` reject names that are not identifiers; `fg` and
+  `bg` without an argument use the most recent job.
+- `sandbox`, `trace` and `bench` honour the shell's `>`, `>>` and `<` redirections.
+
+### Known limits
+- `case`/`esac` and loops with a redirected or piped `done` still run in `/bin/sh` and lose
+  assignments and `cd`. `local`, `read`, `${x:-d}`, here-docs and `$((x=1))` are not supported.
+- `"$@"` is one word, `. file` is not supported, builtins do not expand globs, and a line longer
+  than 511 bytes after expansion is an error (for example `cd ~` with a very long `HOME`).
+- `sandbox` cannot stop `kill()` of same-user processes on kernels older than 6.12 and cannot
+  restrict reading files; see `sandbox` for the full list.
+- Windows Unicode input and file names are not supported yet.
+- Releases are not signed yet; see `SIGNING.md`.
+
 ## [2.2.0] - 2026-10-20
 
 ### Highlights

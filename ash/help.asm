@@ -54,7 +54,7 @@ section .data
 
 hp_table:
     HSEC "NAVIGATION"
-    HROW "cd <path>",            "Change directory",               "cd /home", "cd ..", "cd -"
+    HROW "cd [path]",            "Change directory (alone: $HOME)", "cd /home", "cd ..", "cd -"
     HROW "pwd",                  "Print working directory",        "pwd"
     HROW "pushd <path>",         "Save current dir then cd",       "pushd /tmp", "pushd ~/projects"
     HROW "popd",                 "Go back to the saved dir",       "popd"
@@ -64,10 +64,11 @@ hp_table:
     HROW "dir [path]",           "List directory (classic look)",  "dir", "dir /home"
     HROW "cat <file>",           "Show file contents",             "cat README.md", "cat /etc/hostname"
     HROW "type <file>",          "Same as cat",                    "type config.txt"
-    HROW "copy <src> <dst>",     "Copy a file (undo-able)",        "copy file.txt backup.txt", "copy a.conf a.conf.bak"
-    HROW "move <src> <dst>",     "Move a file (undo-able)",        "move old.txt new.txt"
+    HROW "copy [-f] <src> <dst>", "Copy a file (undo-able)",        "copy file.txt backup.txt", "copy a.conf a.conf.bak"
+    HROW "move [-f] <src> <dst>", "Move a file (undo-able)",        "move old.txt new.txt"
     HROW "rename <src> <dst>",   "Rename a file",                  "rename data.csv old.csv"
-    HROW "del <file>",           "Delete (kept in ~/.asm_trash)",  "del temp.log", "del build.o"
+    HROW "del [-f] <file>",      "Delete (kept in ~/.asm_trash)",  "del temp.log", "del build.o"
+    HROW "trash [empty]",        "List the trash, or empty it",    "trash"
     HROW "undo",                 "Reverse last del/move/copy",     "undo"
     HROW "mkdir <dir>",          "Create a directory",             "mkdir projects", "mkdir -p a/b/c"
     HROW "rmdir <dir>",          "Remove an empty directory",      "rmdir old_folder"
@@ -77,6 +78,8 @@ hp_table:
     HROW "set",                  "List all variables",             "set"
     HROW "set <var>",            "Show one variable",              "set HOME", "set PATH"
     HROW "set <var>=<val>",      "Set a variable",                 "set EDITOR=vim", "set LANG=C"
+    HROW "export <var>=<val>",   "Same as set <var>=<val>",        "export EDITOR=nano"
+    HROW "unset <var>",          "Remove a variable",              "unset EDITOR"
     HROW "NAME=value",           "Set a variable (sh style)",      "n=5", "name=Umer"
     HROW "whoami",               "Current username",               "whoami"
 
@@ -91,10 +94,10 @@ hp_table:
     HROW "ver",                  "Version info",                   "ver"
     HROW "about",                "About ASM Terminal",             "about"
     HROW "update [install]",     "Check for or install updates",   "update", "update install"
-    HROW "date / time",          "Current date and time",          "date", "time"
+    HROW "date / time",          "Date and time (ASM_TZ or TZ)",          "date", "time"
     HROW "uptime",               "Time since boot",                "uptime"
     HROW "free",                 "Memory usage",                   "free"
-    HROW "calc <expr>",          "Integer math: + - * /",          "calc 10 + 5 * 2", "calc 100 / 3", "calc 6 * 7"
+    HROW "calc <expr>",          "Integer math, left to right",    "calc 10 + 5 * 2", "calc 100 / 3", "calc 6 * 7"
     HROW "source <file>",        "Run commands from a file",       "source setup.sh", "source ~/.asmrc"
     HROW "which <name>",         "Builtin / alias / program?",     "which ls", "which git"
     HROW "history [-c]",         "List history (-c clears it)",    "history", "history -c"
@@ -106,13 +109,15 @@ hp_table:
     HSEC "TOOLS"
     HROW "bench [-n N] <cmd>",   "Time a command over N runs",     "bench -n 20 ls -la", "bench sleep 0.1"
     HROW "trace [-a] <cmd>",     "Files/programs/net a cmd uses",  "trace cp a.txt /tmp/", "trace -a ls"
-    HROW "sandbox [-w] [-n] <cmd>", "No network; writes in /tmp", "sandbox ./install.sh", "sandbox -w make"
+    HROW "sandbox [opts] <cmd>",  "No sockets; writes only in /tmp", "sandbox ./install.sh", "sandbox -w make", "sandbox"
     HROW "alias <n>=<cmd>",      "Create an alias (alone: list)",  "alias ll=ls -la", "alias gs=git status"
+    HROW "unalias <name>",       "Remove an alias",                "unalias ll"
 
     HSEC "JOBS"
     HROW "<cmd> &",              "Run in the background",          "sleep 10 &"
     HROW "jobs",                 "List background jobs",           "jobs"
-    HROW "fg <n>",               "Bring a job to the foreground",  "fg 1"
+    HROW "fg [n]",               "Bring a job to the foreground",  "fg", "fg 1"
+    HROW "bg [n]",               "Resume a stopped job in background", "bg", "bg 1"
 
     HSEC "SHELL"
     HROW "a ; b",                "Run one after another",          "echo hi ; echo bye"
@@ -136,7 +141,8 @@ hp_table:
     HROW "Ctrl+R",               "Search history"
     HROW "Ctrl+L",               "Clear the screen"
     HROW "Ctrl+W / Ctrl+U",      "Delete word / line"
-    HROW "Ctrl+C",               "Cancel input"
+    HROW "Ctrl+C",               "Cancel input or stop a command"
+    HROW "Ctrl+Z",               "Pause a command (then fg / bg)"
     db 0
 
 section .text

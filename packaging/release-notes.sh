@@ -64,7 +64,7 @@ Package installs update through their package manager.
 
 ## Supported platforms
 
-- Linux x86-64: any distribution. Static binary, no dependencies.
+- Linux x86-64: any distribution. Static binary with no libc. The update check and \`update install\` use \`curl\` and \`sha256sum\`.
 - Windows 10/11 x64.
 - Not yet: ARM64, macOS, 32-bit.
 EOF
@@ -73,6 +73,7 @@ if [ -n "$SUMS" ] && [ -f "$SUMS" ]; then
     printf '\n## Checksums (SHA-256)\n\n```\n'
     cat "$SUMS"
     printf '```\n'
+    printf '\nThese catch a corrupted download. They are published with the files, so they do not prove who built them.\n'
 fi
 
 if [ -n "$PREV" ]; then

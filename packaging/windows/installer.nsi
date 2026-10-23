@@ -4,13 +4,17 @@
 ; Build on Windows: makensis installer.nsi
 ; Build on Linux:   apt-get install nsis && makensis installer.nsi
 ;
-; Produces: asm-terminal-2.0.0-windows-x86_64-setup.exe
+; Produces: asm-terminal-<version>-windows-x86_64-setup.exe
 ; Installs terminal.exe into %LOCALAPPDATA%\Programs\ASM-Terminal, creates
 ; a Start Menu shortcut that opens the shell, and wires up Add/Remove Programs.
 ; ===========================================================================
 
+; The version comes from version.inc unless /DAPP_VERSION=x.y.z is given
 !ifndef APP_VERSION
-    !define APP_VERSION "2.0.0"
+    !searchparse /file "${__FILEDIR__}\..\..\version.inc" `%define ASM_VERSION "` APP_VERSION `"`
+!endif
+!ifndef APP_VERSION
+    !error "APP_VERSION is not set and version.inc could not be read"
 !endif
 
 !define APP_NAME        "ASM Terminal"
@@ -54,8 +58,11 @@ Section "Install"
     File /nonfatal "asm-terminal.ico"
 
     ; Start Menu shortcut
+    ; The shell starts in the user profile, not in the program folder
     CreateDirectory "$SMPROGRAMS"
+    SetOutPath "$PROFILE"
     CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\asm-terminal.ico"
+    SetOutPath "$INSTDIR"
 
     ; Win+R: user can run 'asm' directly
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\App Paths\asm.exe" "" "$INSTDIR\${APP_EXE}"
@@ -68,7 +75,8 @@ Section "Install"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "URLInfoAbout"    "${APP_URL}"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "InstallLocation" "$INSTDIR"
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "DisplayIcon"     "$INSTDIR\asm-terminal.ico"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "UninstallString" "$INSTDIR\uninstall.exe"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "UninstallString" '"$INSTDIR\uninstall.exe"'
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "NoModify" 1
     WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ASM-Terminal" "NoRepair" 1
 
@@ -82,5 +90,9 @@ Section "Uninstall"
     Delete "$INSTDIR\${APP_EXE}"
     Delete "$INSTDIR\asm-terminal.ico"
     Delete "$INSTDIR\uninstall.exe"
+    ; Left by the batch or PowerShell installers, which use the same folder
+    Delete "$INSTDIR\uninstall.bat"
+    Delete "$INSTDIR\README.md"
+    Delete "$INSTDIR\INSTALL.md"
     RMDir "$INSTDIR"
 SectionEnd

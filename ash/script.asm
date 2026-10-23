@@ -28,13 +28,12 @@
 ; Included from terminal_linux.asm, after ash/builtins.asm.
 ; ============================================================================
 
-%define ASH_DEPTH_MAX       8           ; nested source / eval levels
-%define ASH_TEXT_MAX        8192        ; bytes of script per level
-%define ASH_NODES_MAX       256         ; commands + keywords per level
+%define ASH_DEPTH_MAX       200         ; nested source / eval levels (function calls)
+%define ASH_ARENA_SIZE      (16 * 1024 * 1024) ; script text, nodes, loop word lists
 %define ASH_NODE_SIZE       24
-%define ASH_FRAMES_MAX      16          ; nested loops
-%define ASH_FRAME_SIZE      4096
-%define ASH_PENDING_MAX     8192
+%define ASH_FRAMES_MAX      128         ; nested loops, over all call levels
+%define ASH_FRAME_SIZE      96
+%define ASH_PENDING_MAX     (512 * 1024) ; one unfinished block typed or piped in
 %define ASH_LINK_MAX        128
 
 ; node layout
@@ -62,8 +61,8 @@
 %define N_SH                16          ; statement handed to /bin/sh
 %define N_FUNC              17          ; "name()" - next node is "{"
 
-%define ASH_FUNC_MAX        32
-%define ASH_FUNC_SIZE       2048
+%define ASH_FUNC_MAX        64
+%define ASH_FUNC_SIZE       8192
 %define ASH_FUNC_NAME       32          ; name bytes, body follows
 %define ASH_POS_COUNT       11          ; 1..9, #, @
 %define ASH_POS_SLOT        128
@@ -74,7 +73,6 @@
 %define C_PIPE              3           ; same statement (only in N_SH)
 %define C_MASK              0xFF
 %define C_SH                0x100       ; node needs /bin/sh
-%define ASH_PRISTINE_OFF    (ASH_DEPTH_MAX * ASH_TEXT_MAX)
 
 ; loop frame layout
 %define F_TYPE              0
@@ -84,8 +82,9 @@
 %define F_STATUS            16
 %define F_CURSOR            20
 %define F_VAR               24          ; 40 bytes
-%define F_WORDS             64          ; newline-separated word list
-%define F_WORDS_MAX         (ASH_FRAME_SIZE - F_WORDS - 1)
+%define F_WORDS             64          ; qword: newline-separated word list (in the arena)
+%define F_WCAP              72          ; dword: bytes available for that list
+%define F_ARENA             80          ; qword: arena mark to release when the loop ends
 
 %define ASH_SYS_LSTAT       6
 %define ASH_SYS_ACCESS      21
@@ -157,6 +156,10 @@ section .data
     ash_s_lbracket      db "[", 0
     ash_s_colon         db ":", 0
     ash_s_return        db "return", 0
+    ash_s_shift         db "shift", 0
+    ash_e_count         db "ash: loop count must be a positive number", 10, 0
+    ash_e_shift         db "ash: shift: shift count out of range", 10, 0
+    ash_e_return        db "ash: return: can only return from a function or a sourced script", 10, 0
     ash_pos_n1          db "1", 0
     ash_pos_n2          db "2", 0
     ash_pos_n3          db "3", 0
@@ -179,8 +182,6 @@ section .data
     ; /bin/sh helpers for $( ), backticks and globs in for-lists / values
     ash_shc_argv         dq sh_path, sh_dash_c, ash_sh_script, 0
     ash_sh_printf       db "printf '%s\n' ", 0
-    ash_sh_assign_pre   db "__ash_v=", 0
-    ash_sh_assign_post  db "; printf '%s' ", '"', "$__ash_v", '"', 0
 
     ash_e_syntax        db "ash: syntax error near '", 0
     ash_e_syntax_end    db "'", 10, 0
@@ -192,6 +193,8 @@ section .data
     ash_e_arith         db "ash: arithmetic syntax error", 10, 0
     ash_e_divzero       db "ash: division by zero", 10, 0
     ash_e_forvar        db "ash: for: expected 'for NAME in WORDS'", 10, 0
+    ash_e_forlist       db "ash: for: word list too long", 10, 0
+    ash_e_forlong       db "ash: for: word too long", 10, 0
     ash_e_test_op       db "test: unknown operator", 10, 0
     ash_e_test_int      db "test: integer expected", 10, 0
     ash_e_test_args     db "test: too many arguments", 10, 0
@@ -205,6 +208,8 @@ section .bss
     ash_sh_wstatus      resd 1
     ash_func_count      resd 1
     ash_ar_err          resb 1
+    ash_ar_skip         resb 1              ; 1 = parsing a branch that is not evaluated
+    ash_arith_failed    resb 1              ; set by ash_expand_arith on an error
     alignb 8
     ash_ar_p            resq 1
     ash_test_argv       resq 32
@@ -217,14 +222,18 @@ section .bss
     ash_ar_buf          resb 512
     ash_word_buf        resb 1024
     ash_test_buf        resb 1024
-    ash_sh_script       resb 1024
+    ash_sh_script       resb 1280
     ash_pending         resb ASH_PENDING_MAX
     ash_frames          resb ASH_FRAMES_MAX * ASH_FRAME_SIZE
     ash_funcs           resb ASH_FUNC_MAX * ASH_FUNC_SIZE
-    ash_args_argv       resq 16
-    ash_args_buf        resb 1024
-    ash_text_bufs       resb 2 * ASH_DEPTH_MAX * ASH_TEXT_MAX  ; work + pristine copy
-    ash_node_bufs       resb ASH_DEPTH_MAX * ASH_NODES_MAX * ASH_NODE_SIZE
+    alignb 8
+    ash_arena_used      resq 1              ; bytes of ash_arena in use (a stack)
+    ash_node_cap        resd 1              ; node slots the tokenizer may fill
+    ash_abort           resb 1              ; 1 = unwind every level (runaway recursion)
+    alignb 4
+    ash_loop_n          resd 1              ; N of "break N" / "continue N"
+    alignb 16
+    ash_arena           resb ASH_ARENA_SIZE
 
 section .text
 
@@ -267,9 +276,16 @@ ash_feed_line:
     jmp .fl_ret
 
 .fl_overflow:
+    ; The head of the block is gone, so whatever follows must not run as
+    ; top-level commands. A piped script stops here; a typed one starts over.
     lea rdi, [ash_e_toolong]
     call ash_write_err
     mov dword [last_exit_status], 2
+    cmp byte [interactive_mode], 0
+    jne .fl_finish
+    mov edi, 2
+    mov eax, SYS_EXIT
+    syscall
 .fl_finish:
     mov byte [ash_cont], 0
     mov dword [ash_pending_len], 0
@@ -297,8 +313,76 @@ ash_feed_eof:
     ret
 
 ; ----------------------------------------------------------------------------
+; ash_alloc(rdi = bytes) -> rax = 16-aligned block from the arena, or 0 when
+; the arena is full. The arena is a stack: whoever allocates remembers
+; ash_arena_used beforehand and puts it back when done.
+; ----------------------------------------------------------------------------
+ash_alloc:
+    add rdi, 15
+    and rdi, -16
+    mov rax, [ash_arena_used]
+    lea rcx, [rax + rdi]
+    cmp rcx, ASH_ARENA_SIZE
+    ja .aa_full
+    mov [ash_arena_used], rcx
+    lea rdx, [ash_arena]
+    add rax, rdx
+    ret
+.aa_full:
+    xor eax, eax
+    ret
+
+; ----------------------------------------------------------------------------
+; ash_count_nodes(rdi = text) -> eax = upper bound for the number of nodes
+; the tokenizer can make from it: every node starts at a word or right
+; after one of ; & | ( ) or a newline.
+; ----------------------------------------------------------------------------
+ash_count_nodes:
+    mov r8d, 4
+    mov r9d, 1                      ; the previous character was a blank
+.cn_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .cn_done
+    inc rdi
+    cmp al, ' '
+    je .cn_blank
+    cmp al, 9
+    je .cn_blank
+    cmp al, 10
+    je .cn_nl
+    test r9d, r9d
+    jz .cn_sep
+    inc r8d
+    xor r9d, r9d
+.cn_sep:
+    cmp al, ';'
+    je .cn_bump
+    cmp al, '&'
+    je .cn_bump
+    cmp al, '|'
+    je .cn_bump
+    cmp al, '('
+    je .cn_bump
+    cmp al, ')'
+    jne .cn_loop
+.cn_bump:
+    inc r8d
+    jmp .cn_loop
+.cn_nl:
+    inc r8d
+.cn_blank:
+    mov r9d, 1
+    jmp .cn_loop
+.cn_done:
+    mov eax, r8d
+    ret
+
+; ----------------------------------------------------------------------------
 ; ash_eval(rdi = script text, esi = final) -> eax
 ;   0 = ran, 1 = incomplete (only when final = 0), 2 = syntax error
+; The text, its untouched copy and the node array live in the arena for the
+; duration of the call, so the script can be as large as the arena.
 ; ----------------------------------------------------------------------------
 ash_eval:
     push rbp
@@ -307,20 +391,39 @@ ash_eval:
     push r12
     push r13
     push r14
+    push r15
+    sub rsp, 24                     ; [rbp-48] untouched-copy offset,
+                                    ; [rbp-56] arena mark to restore
 
     mov r12, rdi
     mov r13d, esi
+    mov rax, [ash_arena_used]
+    mov [rbp - 56], rax
     mov eax, [ash_depth]
     cmp eax, ASH_DEPTH_MAX
     jae .ae_deep
     mov r14d, eax
 
-    ; Copy into this level's buffer: drop CR, join "\<newline>"
-    imul eax, r14d, ASH_TEXT_MAX
-    lea rbx, [ash_text_bufs]
-    add rbx, rax
+    ; Work buffer + untouched copy, each at least one byte longer than the text
+    mov rdi, r12
+    call str_len
+    add eax, 16
+    and eax, -16
+    mov [rbp - 48], rax
+    lea rdi, [rax + rax]
+    call ash_alloc
+    test rax, rax
+    jz .ae_toolong
+    mov rbx, rax
+
+    ; Copy into this level's buffer: drop CR, join "\<newline>" (but not in
+    ; a comment or in single quotes, where the backslash is just a character)
     mov rsi, r12
     xor ecx, ecx
+    xor r8d, r8d                    ; inside '...'
+    xor r9d, r9d                    ; inside "..."
+    xor r10d, r10d                  ; inside a # comment
+    xor r11d, r11d                  ; previous character stored
 .ae_cp:
     movzx eax, byte [rsi]
     test al, al
@@ -328,49 +431,133 @@ ash_eval:
     cmp al, 13
     je .ae_cp_skip
     cmp al, '\'
+    je .ae_cp_bs
+    test r10d, r10d
+    jnz .ae_cp_incm
+    test r8d, r8d
+    jnz .ae_cp_insq
+    test r9d, r9d
+    jnz .ae_cp_indq
+    cmp al, 0x27
+    je .ae_cp_open_sq
+    cmp al, '"'
+    je .ae_cp_open_dq
+    cmp al, '#'
     jne .ae_cp_store
-    movzx edx, byte [rsi + 1]
-    cmp dl, 10
-    je .ae_cp_join
-    test dl, dl
-    jz .ae_cp_trailing
-    cmp ecx, ASH_TEXT_MAX - 3
-    jae .ae_toolong
+    test r11d, r11d                 ; '#' starts a comment at a word start
+    jz .ae_cp_open_cm
+    cmp r11b, ' '
+    je .ae_cp_open_cm
+    cmp r11b, 9
+    je .ae_cp_open_cm
+    cmp r11b, 10
+    je .ae_cp_open_cm
+    cmp r11b, ';'
+    je .ae_cp_open_cm
+    cmp r11b, '&'
+    je .ae_cp_open_cm
+    cmp r11b, '|'
+    je .ae_cp_open_cm
+    cmp r11b, '('
+    jne .ae_cp_store
+.ae_cp_open_cm:
+    mov r10d, 1
+    jmp .ae_cp_store
+.ae_cp_incm:
+    cmp al, 10
+    jne .ae_cp_store
+    xor r10d, r10d
+    jmp .ae_cp_store
+.ae_cp_insq:
+    cmp al, 0x27
+    jne .ae_cp_store
+    xor r8d, r8d
+    jmp .ae_cp_store
+.ae_cp_indq:
+    cmp al, '"'
+    jne .ae_cp_store
+    xor r9d, r9d
+    jmp .ae_cp_store
+.ae_cp_open_sq:
+    mov r8d, 1
+    jmp .ae_cp_store
+.ae_cp_open_dq:
+    mov r9d, 1
+.ae_cp_store:
     mov [rbx + rcx], al
-    mov [rbx + rcx + 1], dl
-    add ecx, 2
-    add rsi, 2
-    jmp .ae_cp
-.ae_cp_join:
-    add rsi, 2
+    inc ecx
+    inc rsi
+    mov r11d, eax
     jmp .ae_cp
 .ae_cp_skip:
     inc rsi
     jmp .ae_cp
-.ae_cp_trailing:
-    test r13d, r13d
-    jz .ae_incomplete
-    jmp .ae_cp_end                  ; final: drop the lone backslash
-.ae_cp_store:
-    cmp ecx, ASH_TEXT_MAX - 2
-    jae .ae_toolong
+.ae_cp_bs:
+    movzx edx, byte [rsi + 1]
+    cmp dl, 10
+    je .ae_cp_bs_nl
+    cmp dl, 13
+    je .ae_cp_bs_cr
+    test dl, dl
+    jz .ae_cp_trailing
+    test r8d, r8d                   ; in '...' a backslash escapes nothing
+    jnz .ae_cp_bs_lit
+    mov [rbx + rcx], al             ; escaped pair, stored whole
+    mov [rbx + rcx + 1], dl
+    add ecx, 2
+    add rsi, 2
+    mov r11d, edx
+    jmp .ae_cp
+.ae_cp_bs_cr:
+    cmp byte [rsi + 2], 10
+    je .ae_cp_bs_crnl
+    inc rsi                         ; "\<CR>x": the CR is dropped, the backslash escapes x
+    jmp .ae_cp
+.ae_cp_bs_crnl:
+    test r8d, r8d
+    jnz .ae_cp_bs_lit
+    test r10d, r10d
+    jnz .ae_cp_bs_lit
+    add rsi, 3                      ; "\<CR><LF>" joins like "\<LF>"
+    jmp .ae_cp
+.ae_cp_bs_nl:
+    test r8d, r8d
+    jnz .ae_cp_bs_lit
+    test r10d, r10d
+    jnz .ae_cp_bs_lit
+    add rsi, 2
+    jmp .ae_cp
+.ae_cp_bs_lit:
     mov [rbx + rcx], al
     inc ecx
     inc rsi
+    mov r11d, eax
     jmp .ae_cp
-.ae_cp_end:
+.ae_cp_trailing:
+    test r8d, r8d
+    jnz .ae_cp_bs_lit
+    test r10d, r10d
+    jnz .ae_cp_bs_lit
+    test r13d, r13d
+    jz .ae_incomplete
+.ae_cp_end:                         ; final: a lone backslash at the end is dropped
     mov byte [rbx + rcx], 0
     ; Keep an untouched copy for statements that go to /bin/sh
-    lea rdi, [rbx + ASH_PRISTINE_OFF]
-.ae_pr:
-    mov al, [rbx + rcx]
-    mov [rdi + rcx], al
-    dec ecx
-    jns .ae_pr
+    mov rdi, rbx
+    add rdi, [rbp - 48]
+    mov rsi, rbx
+    inc ecx
+    rep movsb
 
-    imul eax, r14d, ASH_NODES_MAX * ASH_NODE_SIZE
-    lea r12, [ash_node_bufs]
-    add r12, rax
+    mov rdi, rbx
+    call ash_count_nodes
+    mov [ash_node_cap], eax
+    mov edi, eax
+    imul rdi, rdi, ASH_NODE_SIZE
+    call ash_alloc
+    test rax, rax
+    jz .ae_toolong
+    mov r12, rax
     mov rdi, rbx
     mov rsi, r12
     call ash_tokenize
@@ -391,10 +578,12 @@ ash_eval:
     test r14d, r14d
     jnz .ae_run
     mov byte [ctrl_c_flag], 0       ; stale Ctrl+C must not abort a new line
+    mov byte [ash_abort], 0
 .ae_run:
     inc dword [ash_depth]
     mov rdi, r12
     mov esi, ebx
+    mov rdx, [rbp - 48]
     call ash_exec_nodes
     dec dword [ash_depth]
     xor eax, eax
@@ -416,10 +605,15 @@ ash_eval:
 .ae_deep:
     lea rdi, [ash_e_depth]
     call ash_write_err
+    mov byte [ash_abort], 1         ; a runaway recursion must not resume above
 .ae_error:
     mov dword [last_exit_status], 2
     mov eax, 2
 .ae_ret:
+    mov rcx, [rbp - 56]
+    mov [ash_arena_used], rcx
+    add rsp, 24
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -479,7 +673,7 @@ ash_kw_match:
 ; Writes NULs into text to end each command.
 ; ----------------------------------------------------------------------------
 %macro ASH_EMIT 0                   ; eax = type, rcx = text
-    cmp r14d, ASH_NODES_MAX
+    cmp r14d, [ash_node_cap]
     jae .tk_complex
     imul r8d, r14d, ASH_NODE_SIZE
     add r8, r13
@@ -728,12 +922,39 @@ ash_tokenize:
     jmp .tk_item_end
 .tk_sc_amp:
     cmp byte [r12 + 1], '&'
-    jne .tk_sc_adv
+    jne .tk_sc_amp1
     mov rdx, r12
     mov byte [r12], 0
     add r12, 2
     mov dword [rbp - 56], C_AND
     jmp .tk_item_end_need
+.tk_sc_amp1:
+    ; A lone "&" ends the command and stays at its end, which tells the
+    ; dispatcher to run it in the background. "2>&1", ">&2" and "&>" are
+    ; redirections, not separators.
+    cmp r11d, '>'
+    je .tk_sc_adv
+    cmp r11d, '<'
+    je .tk_sc_adv
+    movzx eax, byte [r12 + 1]
+    test al, al
+    jz .tk_sc_adv_amp               ; at the very end: nothing to split
+    cmp al, ' '
+    je .tk_sc_amp_cut
+    cmp al, 9
+    je .tk_sc_amp_cut
+    cmp al, 10
+    je .tk_sc_amp_cut
+    cmp al, ';'
+    jne .tk_sc_adv                  ; "&>" and "&word" are not a separator
+.tk_sc_amp_cut:
+    lea rdx, [r12 + 1]              ; the blank after the "&" becomes the NUL
+    mov byte [rdx], 0
+    lea r12, [rdx + 1]
+    mov dword [rbp - 56], C_SEQ
+    jmp .tk_item_end
+.tk_sc_adv_amp:
+    jmp .tk_sc_adv
 .tk_sc_pipe:
     cmp byte [r12 + 1], '|'
     jne .tk_sc_pipe1
@@ -1005,6 +1226,9 @@ ash_link:
     cmp ecx, N_ELIF
     jne .lk_err
 .lk_then_ok:
+    lea eax, [edx + 1]
+    cmp eax, r14d                   ; "if then": no condition to run
+    je .lk_err
     LK_SET_CUR
     jmp .lk_next
 
@@ -1052,6 +1276,12 @@ ash_link:
     cmp ecx, N_FOR
     jne .lk_err
 .lk_do_ok:
+    cmp ecx, N_FOR
+    je .lk_do_set
+    lea eax, [edx + 1]
+    cmp eax, r14d                   ; "while do": no condition, it would never end
+    je .lk_err
+.lk_do_set:
     mov [r9 + ND_J2], r14d
     mov [rsi + ND_J2], r8d
     LK_SET_CUR
@@ -1122,9 +1352,14 @@ ash_link:
     pop rbp
     ret
 
-; Statement r15d..ecx: if it needs /bin/sh, make its first node N_SH
+; Statement r15d..ecx: if it needs /bin/sh, make its first node N_SH.
+; A function definition stays as it is: its body is looked at again when the
+; function is called, and a case or piped loop inside it goes to /bin/sh then.
 .lk_finish:
     cmp dword [rbp - 48], 0
+    je .lf_ret
+    imul eax, r15d, ASH_NODE_SIZE
+    cmp dword [r12 + rax + ND_TYPE], N_FUNC
     je .lf_ret
     imul eax, ecx, ASH_NODE_SIZE
     lea r8, [r12 + rax]             ; last node
@@ -1193,8 +1428,12 @@ ash_exec_nodes:
     push r13
     push r14
     push r15
-    sub rsp, 24                     ; [rbp-48] frame pointer scratch,
-                                    ; [rbp-56] saved byte
+    sub rsp, 40                     ; [rbp-48] frame pointer scratch,
+                                    ; [rbp-64] untouched-copy offset,
+                                    ; [rbp-72] arena mark to restore
+    mov [rbp - 64], rdx
+    mov rax, [ash_arena_used]
+    mov [rbp - 72], rax
     mov r12, rdi
     mov r13d, esi
     xor r14d, r14d                  ; pc
@@ -1205,6 +1444,8 @@ ash_exec_nodes:
     jae .ex_done
     cmp byte [ctrl_c_flag], 0
     jne .ex_intr
+    cmp byte [ash_abort], 0
+    jne .ex_done
     imul eax, r14d, ASH_NODE_SIZE
     lea rbx, [r12 + rax]
     mov eax, [rbx + ND_TYPE]
@@ -1265,17 +1506,9 @@ ash_exec_nodes:
 .ex_sh:
     ; Run the statement's original text with /bin/sh
     mov rdi, [rbx + ND_TEXT]
-    add rdi, ASH_PRISTINE_OFF
-    mov ecx, [rbx + ND_J2]
-    add rcx, rdi
-    mov [rbp - 48], rcx
-    movzx eax, byte [rcx]
-    mov [rbp - 56], eax
-    mov byte [rcx], 0
+    add rdi, [rbp - 64]
+    mov esi, [rbx + ND_J2]
     call ash_sh_run
-    mov rcx, [rbp - 48]
-    mov eax, [rbp - 56]
-    mov [rcx], al
     mov r14d, [rbx + ND_J1]
     jmp .ex_next
 
@@ -1291,7 +1524,7 @@ ash_exec_nodes:
     mov rsi, [r8 + ND_TEXT]
     inc rsi
     sub rdx, rsi
-    add rsi, ASH_PRISTINE_OFF
+    add rsi, [rbp - 64]
     mov rdi, [rbx + ND_TEXT]
     call ash_func_define
     jmp .ex_next
@@ -1338,6 +1571,8 @@ ash_exec_nodes:
     test al, al
     jnz .ex_next
 .ex_loop_exit:                      ; rdx = frame
+    mov rax, [rdx + F_ARENA]        ; frees the word list of a "for"
+    mov [ash_arena_used], rax
     mov eax, [rdx + F_STATUS]
     mov [last_exit_status], eax
     mov eax, [rdx + F_DONE]
@@ -1370,11 +1605,43 @@ ash_exec_nodes:
     mov [rdx + F_DO], eax
     mov dword [rdx + F_STATUS], 0
     mov dword [rdx + F_CURSOR], 0
+    ; The word list may use all the free arena while it is built; what it
+    ; does not need is given back right after.
+    mov [rbp - 48], rdx
+    xor edi, edi
+    call ash_alloc
+    mov rdx, [rbp - 48]
+    mov [rdx + F_WORDS], rax
+    mov rcx, ASH_ARENA_SIZE
+    sub rcx, [ash_arena_used]
+    sub rcx, 262144                 ; room above the list for a /bin/sh script
+    cmp rcx, 8192
+    jb .ex_for_nomem
+    mov [rdx + F_WCAP], ecx
+    mov rdi, rcx
+    call ash_alloc
+    mov rdx, [rbp - 48]
     mov rdi, rdx
     mov rsi, [rbx + ND_TEXT]
     call ash_for_setup
     test eax, eax
-    jz .ex_for_next
+    jnz .ex_for_fail
+    mov rdx, [rbp - 48]
+    mov rdi, [rdx + F_WORDS]
+    call str_len
+    mov rdx, [rbp - 48]
+    mov rcx, [rdx + F_WORDS]
+    lea rdx, [ash_arena]
+    sub rcx, rdx
+    lea rax, [rcx + rax + 16]       ; keep just the list: end of text + NUL, rounded up
+    and rax, -16
+    mov [ash_arena_used], rax
+    jmp .ex_for_next
+
+.ex_for_nomem:
+    lea rdi, [ash_e_toolong]
+    call ash_write_err
+.ex_for_fail:
     dec dword [ash_frame_top]
     mov dword [last_exit_status], 2
     jmp .ex_done
@@ -1383,7 +1650,8 @@ ash_exec_nodes:
     FRAME_TOP
     mov [rbp - 48], rdx
     mov ecx, [rdx + F_CURSOR]
-    lea rsi, [rdx + F_WORDS + rcx]
+    mov rsi, [rdx + F_WORDS]
+    add rsi, rcx
     cmp byte [rsi], 0
     je .ex_for_end
     lea rdi, [ash_word_buf]
@@ -1396,23 +1664,33 @@ ash_exec_nodes:
     cmp al, 10
     je .ex_for_cp_end
     cmp ecx, 1022
-    jae .ex_for_cp
+    jae .ex_for_long
     mov [rdi + rcx], al
     inc ecx
     jmp .ex_for_cp
 .ex_for_cp_end:
     mov byte [rdi + rcx], 0
     mov rdx, [rbp - 48]
-    lea rax, [rdx + F_WORDS]
+    mov rax, [rdx + F_WORDS]
     sub rsi, rax
     mov [rdx + F_CURSOR], esi
     lea rdi, [rdx + F_VAR]
     lea rsi, [ash_word_buf]
-    call setenv_internal
+    call ash_setvar
+    test eax, eax
+    jnz .ex_for_stop
     mov rdx, [rbp - 48]
     mov eax, [rdx + F_DO]
     lea r14d, [rax + 1]
     jmp .ex_loop
+.ex_for_long:
+    lea rdi, [ash_e_forlong]
+    call ash_write_err
+    mov dword [last_exit_status], 1
+.ex_for_stop:                       ; the loop variable cannot hold the word
+    mov rdx, [rbp - 48]
+    mov dword [rdx + F_STATUS], 1
+    jmp .ex_loop_exit
 .ex_for_end:
     mov rdx, [rbp - 48]
     jmp .ex_loop_exit
@@ -1421,7 +1699,7 @@ ash_exec_nodes:
     mov eax, [ash_frame_top]
     cmp eax, r15d
     jbe .ex_next
-    FRAME_TOP
+    call .ex_nth_frame              ; "break N" leaves N loops at once
     mov dword [rdx + F_STATUS], 0
     jmp .ex_loop_exit
 
@@ -1429,7 +1707,7 @@ ash_exec_nodes:
     mov eax, [ash_frame_top]
     cmp eax, r15d
     jbe .ex_next
-    FRAME_TOP
+    call .ex_nth_frame
     mov dword [last_exit_status], 0
     cmp dword [rdx + F_TYPE], N_FOR
     je .ex_for_next
@@ -1437,11 +1715,39 @@ ash_exec_nodes:
     lea r14d, [rax + 1]
     jmp .ex_loop
 
+; Makes the Nth loop from the top (N = ash_loop_n, at most the loops of this
+; body) the top one, dropping the ones inside it and what they held in the
+; arena. Returns rdx = its frame.
+.ex_nth_frame:
+    mov eax, [ash_frame_top]
+    sub eax, [ash_loop_n]
+    jb .enf_clamp
+    cmp eax, r15d
+    jae .enf_set
+.enf_clamp:
+    mov eax, r15d
+.enf_set:
+    lea ecx, [rax + 1]
+    cmp ecx, [ash_frame_top]
+    jae .enf_same
+    imul edx, ecx, ASH_FRAME_SIZE
+    lea rsi, [ash_frames]
+    mov rdx, [rsi + rdx + F_ARENA]
+    mov [ash_arena_used], rdx
+.enf_same:
+    mov [ash_frame_top], ecx
+    imul eax, eax, ASH_FRAME_SIZE
+    lea rdx, [ash_frames]
+    add rdx, rax
+    ret
+
 .ex_intr:
     mov dword [last_exit_status], 130
 .ex_done:
     mov [ash_frame_top], r15d
-    add rsp, 24
+    mov rax, [rbp - 72]
+    mov [ash_arena_used], rax
+    add rsp, 40
     pop r15
     pop r14
     pop r13
@@ -1469,42 +1775,40 @@ ash_exec_nodes:
     ret
 
 ; ----------------------------------------------------------------------------
-; ash_sh_run(rdi = script text) - run it with /bin/sh -c, wait, set status
+; ash_sh_run(rdi = script text, esi = its length) - run it with /bin/sh -c,
+; wait, set the status. The script gets the shell functions, the positional
+; parameters and $? put in front of it (see ash_ctx_script).
 ; ----------------------------------------------------------------------------
 ash_sh_run:
     push rbp
     mov rbp, rsp
     push rbx
     push r12
-    mov r12, rdi
+    push r13
+    sub rsp, 8
+    mov [rsp], rdi                  ; the statement as written, for the job list
+    mov r13, [ash_arena_used]
+    call ash_ctx_script
+    test rax, rax
+    jz .sr_nomem
+    mov r12, rax
     cmp byte [interactive_mode], 0
     je .sr_fork
     call restore_terminal
 .sr_fork:
+    call jc_prepare
     mov eax, SYS_FORK
     syscall
     test rax, rax
     js .sr_fail
     jz .sr_child
     mov ebx, eax
-.sr_wait:
     mov edi, ebx
-    lea rsi, [ash_sh_wstatus]
-    xor edx, edx
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
-    cmp rax, -EINTR
-    je .sr_wait
-    mov eax, [ash_sh_wstatus]
-    mov edx, eax
-    and edx, 0x7F
-    jz .sr_exited
-    lea eax, [rdx + 128]
-    jmp .sr_status
-.sr_exited:
-    shr eax, 8
-    and eax, 0xFF
+    mov esi, 1
+    call jc_parent_after_fork
+    mov edi, ebx
+    mov rsi, [rsp]
+    call jc_wait_fg                 ; 128 + signal when killed, job control aware
 .sr_status:
     mov [last_exit_status], eax
     jmp .sr_done
@@ -1515,14 +1819,430 @@ ash_sh_run:
     je .sr_ret
     call setup_raw_mode
 .sr_ret:
+    mov [ash_arena_used], r13
+    add rsp, 8
+    pop r13
     pop r12
     pop rbx
     pop rbp
     ret
+.sr_nomem:
+    lea rdi, [ash_e_shlong]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+    jmp .sr_ret
 .sr_child:
+    mov edi, 1
+    call jc_child_setup
     lea rdi, [ash_shc_argv]
     mov [rdi + 16], r12
     call ash_exec_argv              ; does not return
+
+; ----------------------------------------------------------------------------
+; ash_ctx_script(rdi = text, esi = length) -> rax = NUL-terminated script in
+; the arena, or 0 when it does not fit (a program argument is limited to
+; about 128 KB).
+; /bin/sh knows nothing about this shell, so the text gets what is cheap to
+; hand over put in front of it: "set --" with the positional parameters, a
+; "(exit N)" so that $? starts out right, and every shell function defined
+; with name() { body }. Variables set with NAME=value are exported already.
+; Changes the text makes to the shell itself (cd, assignments, functions)
+; stay in the child.
+; ----------------------------------------------------------------------------
+section .data
+    ash_c_set           db "set --", 0
+    ash_c_exit          db "(exit ", 0
+    ash_c_close         db ")", 10, 0
+    ash_c_fopen         db "() {", 10, 0
+    ash_c_fclose        db 10, "}", 10, 0
+    ash_c_nl            db 10, 0
+    ash_c_sp            db " ", 0
+    ash_e_shlong        db "ash: statement too long for /bin/sh", 10, 0
+section .text
+
+ash_ctx_script:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 24                     ; [rbp-48] scratch pointer, [rbp-56] text length
+
+    mov r12, rdi
+    mov eax, esi
+    mov [rbp - 56], rax
+    xor edi, edi
+    call ash_alloc                  ; the free end of the arena
+    mov r14, rax                    ; start of the script
+    mov rbx, rax                    ; write cursor
+    lea r15, [ash_arena + ASH_ARENA_SIZE - 16]
+    lea rax, [r14 + 126000]
+    cmp rax, r15
+    jae .cx_limit_ok
+    mov r15, rax
+.cx_limit_ok:                       ; bytes below r15 may be written
+
+    ; positional parameters
+    cmp dword [ash_pos_argc], 0
+    je .cx_funcs
+    lea rsi, [ash_c_set]
+    call .cx_put
+    xor r13d, r13d
+.cx_args:
+    cmp r13d, [ash_pos_argc]
+    jae .cx_args_end
+    lea rsi, [ash_c_sp]
+    call .cx_put
+    mov rax, [ash_pos_argv]
+    mov rsi, [rax + r13 * 8]
+    call .cx_putq
+    inc r13d
+    jmp .cx_args
+.cx_args_end:
+    lea rsi, [ash_c_nl]
+    call .cx_put
+
+    ; functions
+.cx_funcs:
+    xor r13d, r13d
+.cx_fn:
+    cmp r13d, [ash_func_count]
+    jae .cx_status
+    imul eax, r13d, ASH_FUNC_SIZE
+    lea rsi, [ash_funcs]
+    add rsi, rax
+    mov [rbp - 48], rsi
+    call .cx_put
+    lea rsi, [ash_c_fopen]
+    call .cx_put
+    mov rsi, [rbp - 48]
+    add rsi, ASH_FUNC_NAME
+    call .cx_put
+    lea rsi, [ash_c_fclose]
+    call .cx_put
+    inc r13d
+    jmp .cx_fn
+
+    ; $? (after the definitions, which would reset it)
+.cx_status:
+    cmp dword [last_exit_status], 0
+    je .cx_text
+    lea rsi, [ash_c_exit]
+    call .cx_put
+    movsxd rsi, dword [last_exit_status]
+    lea rdi, [ash_num_buf]
+    call ash_fmt_int
+    lea rsi, [ash_num_buf]
+    call .cx_put
+    lea rsi, [ash_c_close]
+    call .cx_put
+
+    ; the statement itself
+.cx_text:
+    mov ecx, [rbp - 56]
+    lea rax, [rbx + rcx]
+    cmp rax, r15
+    jae .cx_fail
+    cmp rbx, r15
+    ja .cx_fail
+    mov rsi, r12
+    mov rdi, rbx
+    rep movsb
+    mov rbx, rax
+    mov byte [rbx], 0
+    lea rdi, [rbx + 1]
+    sub rdi, r14
+    call ash_alloc                  ; claim what was written
+    mov rax, r14
+    jmp .cx_ret
+.cx_fail:
+    xor eax, eax
+.cx_ret:
+    add rsp, 24
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; .cx_put - append the string at rsi (rbx = cursor, r15 = limit)
+.cx_put:
+    mov al, [rsi]
+    test al, al
+    jz .cp_done
+    cmp rbx, r15
+    jae .cp_over
+    mov [rbx], al
+    inc rbx
+    inc rsi
+    jmp .cx_put
+.cp_over:
+    lea rbx, [r15 + 1]
+.cp_done:
+    ret
+
+; .cx_putq - append the string at rsi in single quotes
+.cx_putq:
+    cmp rbx, r15
+    jae .cq_over
+    mov byte [rbx], 0x27
+    inc rbx
+.cq_loop:
+    mov al, [rsi]
+    test al, al
+    jz .cq_end
+    inc rsi
+    cmp al, 0x27
+    je .cq_quote
+    cmp rbx, r15
+    jae .cq_over
+    mov [rbx], al
+    inc rbx
+    jmp .cq_loop
+.cq_quote:                          ; ' becomes '\''
+    lea rax, [rbx + 4]
+    cmp rax, r15
+    jae .cq_over
+    mov dword [rbx], 0x27275C27
+    mov rbx, rax
+    jmp .cq_loop
+.cq_end:
+    cmp rbx, r15
+    jae .cq_over
+    mov byte [rbx], 0x27
+    inc rbx
+    ret
+.cq_over:
+    lea rbx, [r15 + 1]
+    ret
+
+; ----------------------------------------------------------------------------
+; ash_capture(rdi = argv, rsi = buffer, edx = size) -> eax = bytes captured
+; Runs argv with its stdout into the buffer (NUL-terminated); stdin is
+; /dev/null. Output beyond size - 1 bytes is dropped and ash_cap_trunc is
+; set. The child's status (128 + signal when killed) goes to ash_cap_status.
+; In an interactive shell the terminal is cooked meanwhile, so Ctrl+C
+; reaches the child and stops it; a child killed by SIGINT also raises
+; ctrl_c_flag so the running script stops too.
+; ----------------------------------------------------------------------------
+section .data
+    ash_dev_null        db "/dev/null", 0
+section .bss
+    ash_cap_status      resd 1
+    ash_cap_trunc       resb 1
+    ash_cap_drain       resb 4096
+section .text
+
+ash_capture:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 24                     ; [rbp-48] wait status, [rbp-56] pipe fds
+
+    mov r12, rdi
+    mov r13, rsi
+    mov r14d, edx
+    mov dword [ash_cap_status], 1
+    mov byte [ash_cap_trunc], 0
+    mov byte [r13], 0
+    xor r15d, r15d                  ; bytes stored
+    cmp byte [interactive_mode], 0
+    je .ac_pipe
+    call restore_terminal
+.ac_pipe:
+    lea rdi, [rbp - 56]
+    mov esi, O_CLOEXEC
+    mov eax, SYS_PIPE2
+    syscall
+    test rax, rax
+    js .ac_error
+    mov eax, SYS_FORK
+    syscall
+    test rax, rax
+    js .ac_fork_error
+    jz .ac_child
+    mov ebx, eax                    ; child pid
+
+    mov edi, [rbp - 52]             ; the parent keeps only the read end
+    mov eax, SYS_CLOSE
+    syscall
+.ac_read:
+    mov edx, r14d
+    dec edx
+    sub edx, r15d
+    jle .ac_drain
+    mov edi, [rbp - 56]
+    lea rsi, [r13 + r15]
+    xor eax, eax                    ; SYS_READ
+    syscall
+    cmp rax, -EINTR
+    je .ac_read
+    test rax, rax
+    jle .ac_read_done
+    add r15d, eax
+    jmp .ac_read
+.ac_drain:
+    mov edi, [rbp - 56]
+    lea rsi, [ash_cap_drain]
+    mov edx, 4096
+    xor eax, eax
+    syscall
+    cmp rax, -EINTR
+    je .ac_drain
+    test rax, rax
+    jle .ac_read_done
+    mov byte [ash_cap_trunc], 1
+    jmp .ac_drain
+.ac_read_done:
+    mov byte [r13 + r15], 0
+    mov edi, [rbp - 56]
+    mov eax, SYS_CLOSE
+    syscall
+.ac_wait:
+    mov dword [rbp - 48], 0
+    mov edi, ebx
+    lea rsi, [rbp - 48]
+    xor edx, edx
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -EINTR
+    je .ac_wait
+    mov eax, [rbp - 48]
+    mov edx, eax
+    and edx, 0x7F
+    jz .ac_exited
+    cmp edx, SIGINT
+    jne .ac_sig
+    mov byte [ctrl_c_flag], 1
+.ac_sig:
+    lea eax, [rdx + 128]
+    jmp .ac_status
+.ac_exited:
+    shr eax, 8
+    and eax, 0xFF
+.ac_status:
+    mov [ash_cap_status], eax
+    jmp .ac_done
+
+.ac_fork_error:
+    mov edi, [rbp - 56]
+    mov eax, SYS_CLOSE
+    syscall
+    mov edi, [rbp - 52]
+    mov eax, SYS_CLOSE
+    syscall
+    lea rdi, [ash_msg_fork]
+    call ash_write_err
+.ac_error:
+.ac_done:
+    cmp byte [interactive_mode], 0
+    je .ac_ret
+    call setup_raw_mode
+.ac_ret:
+    mov eax, r15d
+    add rsp, 24
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+.ac_child:
+    mov edi, [rbp - 52]
+    mov esi, 1
+    mov eax, SYS_DUP2
+    syscall
+    lea rdi, [ash_dev_null]
+    mov esi, O_RDONLY
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .ac_exec
+    mov edi, eax
+    xor esi, esi
+    mov eax, SYS_DUP2
+    syscall
+.ac_exec:
+    mov rdi, r12
+    call ash_exec_argv              ; does not return
+
+; ----------------------------------------------------------------------------
+; ash_capture_script(rdi = script text, rsi = buffer, edx = size) -> eax = bytes
+; ash_capture for "/bin/sh -c SCRIPT", with the shell functions and positional
+; parameters in front of the script (see ash_ctx_script).
+; ----------------------------------------------------------------------------
+ash_capture_script:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 32                     ; [rbp-64] argv for the shell
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13d, edx
+    mov r14, [ash_arena_used]
+    call str_len
+    mov esi, eax
+    mov rdi, rbx
+    call ash_ctx_script
+    test rax, rax
+    jz .cs_fail
+    lea rcx, [sh_path]
+    mov [rbp - 64], rcx
+    lea rcx, [sh_dash_c]
+    mov [rbp - 56], rcx
+    mov [rbp - 48], rax
+    mov qword [rbp - 40], 0
+    lea rdi, [rbp - 64]
+    mov rsi, r12
+    mov edx, r13d
+    call ash_capture
+    jmp .cs_ret
+.cs_fail:
+    lea rdi, [ash_e_shlong]
+    call ash_write_err
+    mov byte [r12], 0
+    mov byte [ash_cap_trunc], 0
+    mov dword [ash_cap_status], 2
+    xor eax, eax
+.cs_ret:
+    mov [ash_arena_used], r14
+    add rsp, 32
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; ash_setvar(rdi = name, rsi = value) -> eax = 0 stored, 1 refused
+; setenv_internal says why on its own when the name, the value or the table
+; do not fit; this turns that into the status the script engine wants.
+; ----------------------------------------------------------------------------
+ash_setvar:
+    sub rsp, 8
+    call setenv_internal
+    add rsp, 8
+    test eax, eax
+    jz .sv_ret
+    mov dword [last_exit_status], 1
+    mov eax, 1
+.sv_ret:
+    ret
 
 ; ash_frame_push -> rdx = new frame, or 0 (message printed) when too deep
 ash_frame_push:
@@ -1533,12 +2253,15 @@ ash_frame_push:
     lea rcx, [ash_frames]
     add rdx, rcx
     inc dword [ash_frame_top]
+    mov rax, [ash_arena_used]
+    mov [rdx + F_ARENA], rax
     ret
 .fp_full:
     sub rsp, 8
     lea rdi, [ash_e_depth]
     call ash_write_err
     add rsp, 8
+    mov byte [ash_abort], 1
     mov dword [last_exit_status], 2
     xor edx, edx
     ret
@@ -1558,7 +2281,8 @@ ash_for_setup:
 
     mov rbx, rdi
     mov r12, rsi
-    mov byte [rbx + F_WORDS], 0
+    mov rax, [rbx + F_WORDS]
+    mov byte [rax], 0
 
     ; NAME
     xor ecx, ecx
@@ -1600,19 +2324,30 @@ ash_for_setup:
     call str_len
     cmp eax, MAX_INPUT - 1
     jae .fs_toolong
+    ; Globs and $( ) are judged on the text as written: a variable's value
+    ; is data and never needs /bin/sh. When sh runs the list it expands the
+    ; command substitutions itself, everything else is expanded here first.
+    mov rdi, r12
+    call ash_needs_sh
+    mov [rsp], eax
     lea rdi, [input_buf]
     mov rsi, r12
     call str_copy
+    cmp dword [rsp], 0
+    jne .fs_expand_sh
     call expand_env_vars
-
-    lea rdi, [input_buf]
-    call ash_needs_sh
+    jmp .fs_expanded
+.fs_expand_sh:
+    call expand_env_vars_sh
+.fs_expanded:
     test eax, eax
-    jnz .fs_sh
+    jnz .fs_failed                  ; message printed
+    cmp dword [rsp], 0
+    jne .fs_sh
 
     ; Native split: one unquoted word per line
     lea r12, [input_buf]
-    lea r13, [rbx + F_WORDS]        ; write pointer
+    mov r13, [rbx + F_WORDS]        ; write pointer
 .fs_split:
     mov rdi, r12
     lea rsi, [ash_word_buf]
@@ -1623,9 +2358,11 @@ ash_for_setup:
     mov r12, rax
     lea rsi, [ash_word_buf]
 .fs_split_cp:
-    lea rax, [rbx + F_WORDS + F_WORDS_MAX - 1]
+    mov rax, [rbx + F_WORDS]
+    mov ecx, [rbx + F_WCAP]
+    lea rax, [rax + rcx - 2]
     cmp r13, rax
-    jae .fs_split_end
+    jae .fs_listlong
     movzx eax, byte [rsi]
     test al, al
     jz .fs_split_nl
@@ -1643,34 +2380,34 @@ ash_for_setup:
 
 .fs_sh:
     ; printf '%s\n' WORDS  -> one word per line from /bin/sh
+    lea rdi, [input_buf]
+    call ash_sh_decode              ; marked data bytes become plain text
+    mov r13, rax
     lea rdi, [ash_sh_script]
     lea rsi, [ash_sh_printf]
     call upd_stpcpy
     mov rdi, rax
-    lea rsi, [input_buf]
+    mov rsi, r13
     call upd_stpcpy
-    lea rdi, [ash_shc_argv]
-    xor esi, esi
-    call upd_capture
-    lea rsi, [upd_buf]
-    lea rdi, [rbx + F_WORDS]
-    xor ecx, ecx
-.fs_sh_cp:
-    cmp ecx, F_WORDS_MAX
-    jae .fs_sh_end
-    movzx eax, byte [rsi + rcx]
-    test al, al
-    jz .fs_sh_end
-    mov [rdi + rcx], al
-    inc ecx
-    jmp .fs_sh_cp
-.fs_sh_end:
-    mov byte [rdi + rcx], 0
+    lea rdi, [ash_sh_script]
+    mov rsi, [rbx + F_WORDS]
+    mov edx, [rbx + F_WCAP]
+    call ash_capture_script
+    cmp byte [ash_cap_trunc], 0
+    jne .fs_listlong
 .fs_ok:
     xor eax, eax
     jmp .fs_ret
+.fs_failed:
+    mov eax, 2
+    jmp .fs_ret
 .fs_toolong:
     lea rdi, [ash_e_line]
+    call ash_write_err
+    mov eax, 2
+    jmp .fs_ret
+.fs_listlong:
+    lea rdi, [ash_e_forlist]
     call ash_write_err
     mov eax, 2
     jmp .fs_ret
@@ -1696,6 +2433,8 @@ ash_needs_sh:
     movzx eax, byte [rdi]
     test al, al
     jz .ns_no
+    cmp al, EV_MARK
+    je .ns_mark
     cmp al, '`'
     je .ns_yes
     cmp al, '$'
@@ -1733,6 +2472,11 @@ ash_needs_sh:
     je .ns_no
     add rdi, 2
     jmp .ns_loop
+.ns_mark:
+    cmp byte [rdi + 1], 0
+    je .ns_no
+    add rdi, 2
+    jmp .ns_loop
 .ns_yes:
     mov eax, 1
     ret
@@ -1748,6 +2492,8 @@ ash_run_cmd:
     mov rbp, rsp
     push rbx
     push r12
+    push r13
+    sub rsp, 8
 
     call ash_skip_blanks
     mov rbx, rax
@@ -1769,6 +2515,11 @@ ash_run_cmd:
     call ash_word_is
     test eax, eax
     jnz .rc_return
+    mov rdi, rbx
+    lea rsi, [ash_s_shift]
+    call ash_word_is
+    test eax, eax
+    jnz .rc_shift
 
     cmp byte [rbx], '!'
     jne .rc_assign
@@ -1814,9 +2565,23 @@ ash_run_cmd:
     call ash_func_find
     test rax, rax
     jz .rc_dispatch
-    mov rdi, rax
+    mov r13, rax
+    lea rdi, [rbx + r12]
+    call ash_has_shell_ops
+    test eax, eax
+    jnz .rc_func_sh
+    mov rdi, r13
     lea rsi, [rbx + r12]
     call ash_call_func
+    jmp .rc_ok
+.rc_func_sh:
+    ; "f args | cmd", "f > file", "f &", "f $(cmd)": the whole command goes to
+    ; /bin/sh, which gets the function definitions along with it
+    mov rdi, rbx
+    call str_len
+    mov esi, eax
+    mov rdi, rbx
+    call ash_sh_run
     jmp .rc_ok
 
 .rc_dispatch:
@@ -1839,13 +2604,67 @@ ash_run_cmd:
     xor eax, eax
     jmp .rc_ret
 .rc_break:
+    lea rdi, [rbx + 5]
+    mov esi, 1
+    call ash_count_arg
+    test edx, edx
+    jz .rc_badcount
+    test eax, eax
+    jz .rc_badcount
+    mov [ash_loop_n], eax
     mov eax, 1
     jmp .rc_ret
 .rc_continue:
+    lea rdi, [rbx + 8]
+    mov esi, 1
+    call ash_count_arg
+    test edx, edx
+    jz .rc_badcount
+    test eax, eax
+    jz .rc_badcount
+    mov [ash_loop_n], eax
     mov eax, 2
     jmp .rc_ret
+.rc_badcount:
+    lea rdi, [ash_e_count]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+    xor eax, eax
+    jmp .rc_ret
+.rc_shift:
+    ; shift [N]: drop the first N positional parameters
+    lea rdi, [rbx + 5]
+    mov esi, 1
+    call ash_count_arg
+    test edx, edx
+    jz .rc_badcount
+    cmp eax, [ash_pos_argc]
+    ja .rc_shift_range
+    mov ecx, eax
+    sub [ash_pos_argc], ecx
+    shl rcx, 3
+    add [ash_pos_argv], rcx
+    call ash_pos_publish
+    test eax, eax
+    jnz .rc_ok
+    mov dword [last_exit_status], 0
+    jmp .rc_ok
+.rc_shift_range:
+    lea rdi, [ash_e_shift]
+    call ash_write_err
+    mov dword [last_exit_status], 1
+    jmp .rc_ok
 .rc_return:
     ; return [N]: status N (default: keep the last one), stop this body
+    cmp dword [ash_func_depth], 0
+    jne .rc_return_ok
+    cmp dword [source_depth], 0
+    jne .rc_return_ok
+    lea rdi, [ash_e_return]
+    call ash_write_err
+    mov dword [last_exit_status], 1
+    jmp .rc_ok
+.rc_return_ok:
     lea rdi, [rbx + 6]
     call ash_skip_blanks
     cmp byte [rax], 0
@@ -1859,9 +2678,144 @@ ash_run_cmd:
 .rc_return_go:
     mov eax, 3
 .rc_ret:
+    add rsp, 8
+    pop r13
     pop r12
     pop rbx
     pop rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; ash_count_arg(rdi = text after the command word, esi = default)
+;   -> eax = the number, edx = 1 ok / 0 when it is not a number >= 0
+; Variables in the argument are expanded first ("break $n").
+; ----------------------------------------------------------------------------
+ash_count_arg:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    mov ebx, esi
+    call ash_skip_blanks
+    mov r12, rax
+    cmp byte [r12], 0
+    je .ca_default
+    mov rdi, r12
+    call str_len
+    cmp eax, MAX_INPUT - 1
+    jae .ca_bad
+    lea rdi, [input_buf]
+    mov rsi, r12
+    call str_copy
+    call expand_env_vars
+    test eax, eax
+    jnz .ca_bad
+    lea rdi, [input_buf]
+    call ash_parse_int
+    test edx, edx
+    jz .ca_bad
+    test rax, rax
+    js .ca_bad
+    cmp rax, 0x7FFFFFFF
+    ja .ca_bad
+    mov edx, 1
+    jmp .ca_ret
+.ca_default:
+    mov eax, ebx
+    mov edx, 1
+    jmp .ca_ret
+.ca_bad:
+    xor eax, eax
+    xor edx, edx
+.ca_ret:
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; ash_has_shell_ops(rdi = text) -> eax = 1 when the text has an unquoted
+; | < > & or a $( ) / backtick substitution (not $(( )) arithmetic): things
+; only /bin/sh can do with a function call.
+; ----------------------------------------------------------------------------
+ash_has_shell_ops:
+    xor ecx, ecx                    ; open quote character
+.hs_loop:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .hs_no
+    inc rdi
+    cmp ecx, 0x27
+    je .hs_sq
+    cmp al, '\'
+    je .hs_bs
+    cmp al, '`'
+    je .hs_yes
+    cmp al, '$'
+    je .hs_dollar
+    test ecx, ecx
+    jnz .hs_dq
+    cmp al, '"'
+    je .hs_open_dq
+    cmp al, 0x27
+    je .hs_open_sq
+    cmp al, '|'
+    je .hs_yes
+    cmp al, '<'
+    je .hs_yes
+    cmp al, '>'
+    je .hs_yes
+    cmp al, '&'
+    je .hs_yes
+    jmp .hs_loop
+.hs_sq:
+    cmp al, 0x27
+    jne .hs_loop
+    xor ecx, ecx
+    jmp .hs_loop
+.hs_dq:
+    cmp al, '"'
+    jne .hs_loop
+    xor ecx, ecx
+    jmp .hs_loop
+.hs_open_dq:
+    mov ecx, '"'
+    jmp .hs_loop
+.hs_open_sq:
+    mov ecx, 0x27
+    jmp .hs_loop
+.hs_bs:
+    cmp byte [rdi], 0
+    je .hs_no
+    inc rdi
+    jmp .hs_loop
+.hs_dollar:
+    cmp byte [rdi], '('
+    jne .hs_loop
+    cmp byte [rdi + 1], '('
+    jne .hs_yes
+    add rdi, 2                      ; $(( ... )): skip to the matching ))
+    mov edx, 2
+.hs_ar:
+    movzx eax, byte [rdi]
+    test al, al
+    jz .hs_no
+    inc rdi
+    cmp al, '('
+    jne .hs_ar_rp
+    inc edx
+    jmp .hs_ar
+.hs_ar_rp:
+    cmp al, ')'
+    jne .hs_ar
+    dec edx
+    jnz .hs_ar
+    jmp .hs_loop
+.hs_yes:
+    mov eax, 1
+    ret
+.hs_no:
+    xor eax, eax
     ret
 
 ; ----------------------------------------------------------------------------
@@ -1918,6 +2872,8 @@ ash_try_assign:
     cmp al, 0x27
     je .ta_val_open
     cmp al, '"'
+    je .ta_val_open
+    cmp al, '`'
     je .ta_val_open
     cmp al, '('
     je .ta_val_lp
@@ -1978,40 +2934,33 @@ ash_try_assign:
     lea rdi, [input_buf]
     mov rsi, rbx
     call str_copy
-    call expand_env_vars
-
-    lea rdi, [input_buf]
-    call ash_needs_sh
+    mov byte [ev_keep_nl], 1        ; the value of an assignment is not word split
+    call expand_env_vars            ; $( ) and `` run here and come back as data
+    mov byte [ev_keep_nl], 0
     test eax, eax
-    jnz .ta_sh
+    jnz .ta_expand_failed           ; message printed, status set
 
     lea rdi, [input_buf]
     lea rsi, [ash_word_buf]
     xor edx, edx
     call ash_next_word
     lea rsi, [ash_word_buf]
-    jmp .ta_set
 
-.ta_sh:
-    ; __ash_v=VALUE; printf '%s' "$__ash_v"   (keeps $( ) and ` working)
-    lea rdi, [ash_sh_script]
-    lea rsi, [ash_sh_assign_pre]
-    call upd_stpcpy
-    mov rdi, rax
-    lea rsi, [input_buf]
-    call upd_stpcpy
-    mov rdi, rax
-    lea rsi, [ash_sh_assign_post]
-    call upd_stpcpy
-    lea rdi, [ash_shc_argv]
-    xor esi, esi
-    call upd_capture
-    lea rsi, [upd_buf]
-
-.ta_set:
     lea rdi, [ash_name_buf]
-    call setenv_internal
-    mov dword [last_exit_status], 0
+    call ash_setvar
+    test eax, eax
+    jnz .ta_set_failed              ; refused: the message and status say so
+    ; "x=$(cmd)" has the status of cmd, like sh
+    mov eax, [ev_subst_status]
+    test eax, eax
+    jns .ta_status
+    xor eax, eax
+.ta_status:
+    mov [last_exit_status], eax
+.ta_set_failed:
+    mov eax, 1
+    jmp .ta_ret
+.ta_expand_failed:
     mov eax, 1
     jmp .ta_ret
 .ta_toolong:
@@ -2036,7 +2985,7 @@ ash_try_assign:
 ash_func_find:
     xor eax, eax
     cmp esi, ASH_FUNC_NAME - 1
-    jae .ff_ret
+    ja .ff_ret
     lea r8, [ash_funcs]
     xor r9d, r9d
 .ff_loop:
@@ -2066,6 +3015,7 @@ ash_func_find:
     ret
 
 ; ash_func_define(rdi = name (NUL-terminated), rsi = body, edx = body length)
+; Replaces an existing function of the same name.
 ash_func_define:
     push rbp
     mov rbp, rsp
@@ -2077,12 +3027,35 @@ ash_func_define:
     mov r13, rsi
     mov r14d, edx
     mov dword [last_exit_status], 0
+
+    ; The name must be one plain word that fits the table entry
+    xor ecx, ecx
+.fd_chk:
+    movzx eax, byte [r12 + rcx]
+    test al, al
+    jz .fd_chk_end
+    cmp al, '-'
+    je .fd_chk_ok
+    cmp al, '.'
+    je .fd_chk_ok
+    cmp al, ':'
+    je .fd_chk_ok
+    call ash_is_name_char
+    test edx, edx
+    jz .fd_badname
+.fd_chk_ok:
+    inc ecx
+    jmp .fd_chk
+.fd_chk_end:
+    test ecx, ecx
+    jz .fd_badname
+    cmp ecx, ASH_FUNC_NAME - 1
+    ja .fd_namelong
+    mov ebx, ecx                    ; name length
     cmp r14d, ASH_FUNC_SIZE - ASH_FUNC_NAME - 1
     jae .fd_long
     mov rdi, r12
-    call str_len
-    mov esi, eax
-    mov rdi, r12
+    mov esi, ebx
     call ash_func_find
     test rax, rax
     jnz .fd_have
@@ -2091,24 +3064,19 @@ ash_func_define:
     jae .fd_full
     inc dword [ash_func_count]
     imul eax, eax, ASH_FUNC_SIZE
-    lea rbx, [ash_funcs]
-    add rbx, rax
-    mov rdi, rbx
+    lea rcx, [ash_funcs]
+    add rax, rcx
+    mov rdi, rax
     mov rsi, r12
     xor ecx, ecx
 .fd_name:
-    mov al, [rsi + rcx]
-    mov [rdi + rcx], al
+    mov dl, [rsi + rcx]
+    mov [rdi + rcx], dl
     inc ecx
-    test al, al
-    jz .fd_body
-    cmp ecx, ASH_FUNC_NAME - 1
-    jb .fd_name
-    mov byte [rdi + rcx], 0
-    jmp .fd_body
+    test dl, dl
+    jnz .fd_name
 .fd_have:
     mov rbx, rax
-.fd_body:
     lea rdi, [rbx + ASH_FUNC_NAME]
     xor ecx, ecx
 .fd_cp:
@@ -2126,6 +3094,12 @@ ash_func_define:
     jmp .fd_err
 .fd_long:
     lea rdi, [ash_e_func_long]
+    jmp .fd_err
+.fd_namelong:
+    lea rdi, [ash_e_func_name]
+    jmp .fd_err
+.fd_badname:
+    lea rdi, [ash_e_func_bad]
 .fd_err:
     call ash_write_err
     mov dword [last_exit_status], 1
@@ -2137,8 +3111,9 @@ ash_func_define:
     pop rbp
     ret
 
-; ash_call_func(rdi = table entry, rsi = argument text)
-; Sets $1..$9, $#, $@ from the arguments, runs the body, restores them.
+; ash_call_func(rdi = table entry, rsi = argument text) -> eax = 0 ran, 1 not run
+; Sets $1..$9, $# and $@ from the arguments, runs the body, then puts the
+; caller's parameters back. The arguments live in the arena for the call.
 ash_call_func:
     push rbp
     mov rbp, rsp
@@ -2146,148 +3121,227 @@ ash_call_func:
     push r12
     push r13
     push r14
-    sub rsp, ASH_POS_COUNT * ASH_POS_SLOT     ; 1408: keeps rsp 16-aligned
+    push r15
+    sub rsp, 40                     ; [rbp-48] caller's argv, [rbp-56] argc,
+                                    ; [rbp-64] arena mark
     mov rbx, rdi
     mov r12, rsi
-
-    ; Save the caller's positional parameters
-    xor r13d, r13d
-.cf_save:
-    lea rax, [ash_pos_names]
-    mov rdi, [rax + r13 * 8]
-    call getenv_internal
-    imul ecx, r13d, ASH_POS_SLOT
-    lea rdi, [rsp + rcx]
-    mov byte [rdi], 0
-    test rax, rax
-    jz .cf_save_next
-    xor ecx, ecx
-.cf_save_cp:
-    cmp ecx, ASH_POS_SLOT - 1
-    jae .cf_save_end
-    mov dl, [rax + rcx]
-    mov [rdi + rcx], dl
-    test dl, dl
-    jz .cf_save_next
-    inc ecx
-    jmp .cf_save_cp
-.cf_save_end:
-    mov byte [rdi + rcx], 0
-.cf_save_next:
-    inc r13d
-    cmp r13d, ASH_POS_COUNT
-    jb .cf_save
+    mov rax, [ash_pos_argv]
+    mov [rbp - 48], rax
+    mov eax, [ash_pos_argc]
+    mov [rbp - 56], rax
+    mov rax, [ash_arena_used]
+    mov [rbp - 64], rax
 
     ; Expand and split the arguments
     mov rdi, r12
     call str_len
-    xor r13d, r13d                  ; argc
     cmp eax, MAX_INPUT - 1
-    jae .cf_args_done
+    jae .cf_toolong
     lea rdi, [input_buf]
     mov rsi, r12
     call str_copy
     call expand_env_vars
+    test eax, eax
+    jnz .cf_expand_failed           ; message printed: do not call
+    lea rdi, [input_buf]
+    call str_len
+    mov r13d, eax                   ; length of the expanded arguments
+    mov edi, r13d
+    shr edi, 1
+    add edi, 2
+    shl edi, 3
+    call ash_alloc                  ; argv[]: a word needs two bytes at least
+    test rax, rax
+    jz .cf_nomem
+    mov r14, rax
+    lea edi, [r13 + 2]
+    call ash_alloc                  ; the words themselves
+    test rax, rax
+    jz .cf_nomem
+    mov r15, rax
     lea r12, [input_buf]
-    lea r14, [ash_args_buf]
+    xor r13d, r13d                  ; argc
 .cf_split:
-    cmp r13d, 16
-    jae .cf_args_done
     mov rdi, r12
-    mov rsi, r14
+    mov rsi, r15
     mov edx, 1
     call ash_next_word
     test rax, rax
-    jz .cf_args_done
+    jz .cf_split_done
     mov r12, rax
-    lea rax, [ash_args_argv]
-    mov [rax + r13 * 8], r14
-    mov r14, rdx
+    mov [r14 + r13 * 8], r15
+    mov r15, rdx
     inc r13d
     jmp .cf_split
-.cf_args_done:
-    ; $@ = arguments joined by spaces
-    lea rdi, [ash_word_buf]
-    mov byte [rdi], 0
-    xor ecx, ecx
-.cf_join:
-    cmp ecx, r13d
-    jae .cf_join_end
-    test ecx, ecx
-    jz .cf_join_word
-    mov byte [rdi], ' '
-    inc rdi
-.cf_join_word:
-    lea rax, [ash_args_argv]
-    mov rsi, [rax + rcx * 8]
-.cf_join_cp:
-    lea rax, [ash_word_buf + 1000]
-    cmp rdi, rax
-    jae .cf_join_end
-    mov al, [rsi]
-    test al, al
-    jz .cf_join_next
-    mov [rdi], al
-    inc rdi
-    inc rsi
-    jmp .cf_join_cp
-.cf_join_next:
-    inc ecx
-    jmp .cf_join
-.cf_join_end:
-    mov byte [rdi], 0
-    lea rdi, [ash_pos_nat]
-    lea rsi, [ash_word_buf]
-    call setenv_internal
-    ; $#
-    lea rdi, [ash_num_buf]
-    mov esi, r13d
-    call ash_fmt_int
-    lea rdi, [ash_pos_nhash]
-    lea rsi, [ash_num_buf]
-    call setenv_internal
-    ; $1..$9
-    xor r14d, r14d
-.cf_set:
-    lea rsi, [ash_s_empty]
-    cmp r14d, r13d
-    jae .cf_set_val
-    lea rax, [ash_args_argv]
-    mov rsi, [rax + r14 * 8]
-.cf_set_val:
-    lea rax, [ash_pos_names]
-    mov rdi, [rax + r14 * 8]
-    call setenv_internal
-    inc r14d
-    cmp r14d, 9
-    jb .cf_set
+.cf_split_done:
+    mov qword [r14 + r13 * 8], 0
+    mov [ash_pos_argv], r14
+    mov [ash_pos_argc], r13d
+    call ash_pos_publish
+    test eax, eax
+    jnz .cf_noargs
 
     ; Run the body
+    inc dword [ash_func_depth]
     lea rdi, [rbx + ASH_FUNC_NAME]
     mov esi, 1
     call ash_eval
+    dec dword [ash_func_depth]
+    jnz .cf_inner
+    mov byte [ash_abort], 0         ; the outermost call ends a runaway recursion
+.cf_inner:
+    xor ebx, ebx
+    jmp .cf_restore
 
+.cf_expand_failed:
+    mov ebx, 1
+    jmp .cf_ret
+.cf_toolong:
+    lea rdi, [ash_e_line]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+    mov ebx, 1
+    jmp .cf_ret
+.cf_nomem:
+    lea rdi, [ash_e_toolong]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+    mov ebx, 1
+    jmp .cf_restore
+.cf_noargs:
+    mov ebx, 1
+.cf_restore:
     ; Restore the caller's parameters (keep the status)
     mov r14d, [last_exit_status]
-    xor r13d, r13d
-.cf_restore:
-    lea rax, [ash_pos_names]
-    mov rdi, [rax + r13 * 8]
-    imul ecx, r13d, ASH_POS_SLOT
-    lea rsi, [rsp + rcx]
-    call setenv_internal
-    inc r13d
-    cmp r13d, ASH_POS_COUNT
-    jb .cf_restore
+    mov rax, [rbp - 48]
+    mov [ash_pos_argv], rax
+    mov eax, [rbp - 56]
+    mov [ash_pos_argc], eax
+    call ash_pos_publish
     mov [last_exit_status], r14d
-
-    add rsp, ASH_POS_COUNT * ASH_POS_SLOT
+    mov rax, [rbp - 64]
+    mov [ash_arena_used], rax
+.cf_ret:
+    mov eax, ebx
+    add rsp, 40
+    pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
     pop rbp
     ret
+
+; ash_pos_publish - copy ash_pos_argv / ash_pos_argc into the variables
+; 1..9, # and @ that expand_env_vars reads. eax = 0 ok, 1 a value did not fit.
+ash_pos_publish:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    mov r12, [ash_pos_argv]
+    mov r13d, [ash_pos_argc]
+    xor ebx, ebx
+.pp_loop:
+    lea rsi, [ash_s_empty]
+    cmp ebx, r13d
+    jae .pp_set
+    mov rsi, [r12 + rbx * 8]
+.pp_set:
+    lea rax, [ash_pos_names]
+    mov rdi, [rax + rbx * 8]
+    call ash_setvar
+    test eax, eax
+    jnz .pp_ret
+    inc ebx
+    cmp ebx, 9
+    jb .pp_loop
+    lea rdi, [ash_num_buf]
+    mov esi, r13d
+    call ash_fmt_int
+    lea rdi, [ash_pos_nhash]
+    lea rsi, [ash_num_buf]
+    call ash_setvar
+    test eax, eax
+    jnz .pp_ret
+
+    ; $@ = the arguments joined by spaces, built in the arena
+    mov r15, [ash_arena_used]
+    xor ebx, ebx
+    xor r14d, r14d
+.pp_len:
+    cmp ebx, r13d
+    jae .pp_len_end
+    mov rdi, [r12 + rbx * 8]
+    call str_len
+    lea r14d, [r14 + rax + 1]
+    inc ebx
+    jmp .pp_len
+.pp_len_end:
+    lea edi, [r14 + 1]
+    call ash_alloc
+    test rax, rax
+    jz .pp_nomem
+    mov r14, rax
+    mov rdi, rax
+    xor ebx, ebx
+.pp_join:
+    cmp ebx, r13d
+    jae .pp_join_end
+    test ebx, ebx
+    jz .pp_word
+    mov byte [rdi], ' '
+    inc rdi
+.pp_word:
+    mov rsi, [r12 + rbx * 8]
+.pp_cp:
+    mov al, [rsi]
+    test al, al
+    jz .pp_next
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .pp_cp
+.pp_next:
+    inc ebx
+    jmp .pp_join
+.pp_join_end:
+    mov byte [rdi], 0
+    lea rdi, [ash_pos_nat]
+    mov rsi, r14
+    call ash_setvar
+    mov [ash_arena_used], r15
+    jmp .pp_ret
+.pp_nomem:
+    lea rdi, [ash_e_toolong]
+    call ash_write_err
+    mov dword [last_exit_status], 1
+    mov eax, 1
+.pp_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+section .data
+    ash_e_func_name     db "ash: function name too long", 10, 0
+    ash_e_func_bad      db "ash: invalid function name", 10, 0
+section .bss
+    alignb 8
+    ash_pos_argv        resq 1              ; arguments of the running function
+    ash_pos_argc        resd 1
+    ash_func_depth      resd 1              ; > 0 while a function body runs
+section .text
 
 ; ----------------------------------------------------------------------------
 ; Small helpers
@@ -2417,6 +3471,8 @@ ash_next_word:
     cmp al, 10
     je .nw_end
 .nw_noblank:
+    cmp al, EV_MARK
+    je .nw_mark
     cmp al, 0x27
     je .nw_sq
     cmp al, '"'
@@ -2427,6 +3483,14 @@ ash_next_word:
     mov [rsi], al
     inc rsi
     inc rdi
+    jmp .nw_loop
+.nw_mark:
+    movzx ecx, byte [rdi + 1]       ; "EV_MARK c" is the plain character c
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
     jmp .nw_loop
 .nw_bs:
     movzx ecx, byte [rdi + 1]
@@ -2443,6 +3507,16 @@ ash_next_word:
     movzx eax, byte [rdi]
     test al, al
     jz .nw_end
+    cmp al, EV_MARK
+    jne .nw_sq_plain
+    movzx ecx, byte [rdi + 1]
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
+    jmp .nw_sq_loop
+.nw_sq_plain:
     cmp al, 0x27
     je .nw_q_close
     mov [rsi], al
@@ -2455,6 +3529,16 @@ ash_next_word:
     movzx eax, byte [rdi]
     test al, al
     jz .nw_end
+    cmp al, EV_MARK
+    jne .nw_dq_plain
+    movzx ecx, byte [rdi + 1]
+    test cl, cl
+    jz .nw_end
+    mov [rsi], cl
+    inc rsi
+    add rdi, 2
+    jmp .nw_dq_loop
+.nw_dq_plain:
     cmp al, '"'
     je .nw_q_close
     cmp al, '\'
@@ -2575,7 +3659,9 @@ ash_parse_int:
     cmp ecx, 9
     ja .pi_end
     imul rax, rax, 10
+    jo .pi_bad                      ; does not fit 63 bits
     add rax, rcx
+    jo .pi_bad
     inc rdi
     inc r9d
     jmp .pi_loop
@@ -2604,8 +3690,10 @@ ash_parse_int:
     ret
 
 ; ============================================================================
-; $(( )) arithmetic: + - * / % ( ) unary - + ! ~, < <= > >= == !=, && ||
-; Names and $names read variables (unset or non-numeric = 0).
+; $(( )) arithmetic: + - * / % ( ) unary - + ! ~, << >>, < <= > >= == !=,
+; & ^ |, && || (short-circuit), ?: and the literals 0x1F and 017.
+; Names and $names read variables (unset or non-numeric = 0). Assignment
+; operators and ++ -- are not supported.
 ; ============================================================================
 
 ; ash_arith(rdi = expression) -> rax = value, edx = 0 ok / 1 syntax / 2 div0
@@ -2613,7 +3701,14 @@ ash_arith:
     push rbx
     mov [ash_ar_p], rdi
     mov byte [ash_ar_err], 0
-    call ar_or
+    mov byte [ash_ar_skip], 0
+    call ar_ws
+    cmp byte [rcx], 0
+    jne .aa_expr
+    xor ebx, ebx                    ; "$(( ))" is 0
+    jmp .aa_ok
+.aa_expr:
+    call ar_expr
     mov rbx, rax
     call ar_ws
     cmp byte [rcx], 0
@@ -2644,221 +3739,364 @@ ar_ws:
     mov [ash_ar_p], rcx
     ret
 
-ar_or:
+; ar_expr -> rax: a whole expression, C precedence from the top:
+;   ?:   ||   &&   |   ^   &   == !=   < <= > >=   << >>   + -   * / %
+; The right side of && || and the branch of ?: that is not taken are parsed
+; with ash_ar_skip set, so they cannot raise an error (division by zero).
+ar_expr:
+ar_ternary:
     push rbx
-    call ar_and
+    push r12
+    push r13
+    mov edi, 1
+    call ar_bin
     mov rbx, rax
-.ao_loop:
     call ar_ws
-    cmp byte [rcx], '|'
-    jne .ao_ret
-    cmp byte [rcx + 1], '|'
-    jne .ao_ret
-    add rcx, 2
+    cmp byte [rcx], '?'
+    jne .at_ret
+    inc rcx
     mov [ash_ar_p], rcx
-    call ar_and
-    or rax, rbx
-    setnz bl
-    movzx ebx, bl
-    jmp .ao_loop
-.ao_ret:
+    movzx r12d, byte [ash_ar_skip]
+    test rbx, rbx
+    jnz .at_then
+    mov byte [ash_ar_skip], 1
+.at_then:
+    call ar_ternary
+    mov r13, rax
+    mov [ash_ar_skip], r12b
+    call ar_ws
+    cmp byte [rcx], ':'
+    jne .at_err
+    inc rcx
+    mov [ash_ar_p], rcx
+    test rbx, rbx
+    jz .at_else
+    mov byte [ash_ar_skip], 1
+.at_else:
+    call ar_ternary
+    mov [ash_ar_skip], r12b
+    test rbx, rbx
+    cmovnz rax, r13
+    mov rbx, rax
+    jmp .at_ret
+.at_err:
+    cmp byte [ash_ar_err], 0
+    jne .at_ret
+    mov byte [ash_ar_err], 1
+.at_ret:
     mov rax, rbx
+    pop r13
+    pop r12
     pop rbx
     ret
 
-ar_and:
+; ar_bin(edi = lowest precedence to accept) -> rax
+; Operator ids / precedences: || 1, && 2, | 3, ^ 4, & 5, == != 6,
+; < <= > >= 7, << >> 8, + - 9, * / % 10.
+AR_LOR equ 1
+AR_LAND equ 2
+AR_OR equ 3
+AR_XOR equ 4
+AR_AND equ 5
+AR_EQ equ 6
+AR_NE equ 7
+AR_LT equ 8
+AR_LE equ 9
+AR_GT equ 10
+AR_GE equ 11
+AR_SHL equ 12
+AR_SHR equ 13
+AR_ADD equ 14
+AR_SUB equ 15
+AR_MUL equ 16
+AR_DIV equ 17
+AR_MOD equ 18
+
+ar_bin:
     push rbx
-    call ar_cmp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edi
+    call ar_unary
     mov rbx, rax
-.an_loop:
+.ab_loop:
     call ar_ws
-    cmp byte [rcx], '&'
-    jne .an_ret
-    cmp byte [rcx + 1], '&'
-    jne .an_ret
-    add rcx, 2
+    call ar_getop
+    test eax, eax
+    jz .ab_ret
+    cmp r8d, r12d
+    jb .ab_ret
+    add rcx, rdx
     mov [ash_ar_p], rcx
-    call ar_cmp
+    mov r13d, eax
+    mov r15d, r8d
+    movzx r14d, byte [ash_ar_skip]
+    cmp r13d, AR_LOR
+    jne .ab_not_lor
+    test rbx, rbx
+    jz .ab_rhs
+    mov byte [ash_ar_skip], 1       ; the left side already decided
+    jmp .ab_rhs
+.ab_not_lor:
+    cmp r13d, AR_LAND
+    jne .ab_rhs
+    test rbx, rbx
+    jnz .ab_rhs
+    mov byte [ash_ar_skip], 1
+.ab_rhs:
+    lea edi, [r15 + 1]
+    call ar_bin
+    mov [ash_ar_skip], r14b
+    ; rbx = left, rax = right
+    cmp r13d, AR_LOR
+    je .ab_lor
+    cmp r13d, AR_LAND
+    je .ab_land
+    cmp r13d, AR_OR
+    je .ab_or
+    cmp r13d, AR_XOR
+    je .ab_xor
+    cmp r13d, AR_AND
+    je .ab_and
+    cmp r13d, AR_ADD
+    je .ab_add
+    cmp r13d, AR_SUB
+    je .ab_sub
+    cmp r13d, AR_MUL
+    je .ab_mul
+    cmp r13d, AR_DIV
+    jae .ab_div
+    cmp r13d, AR_SHL
+    je .ab_shl
+    cmp r13d, AR_SHR
+    je .ab_shr
+%macro AR_SET 2                     ; operator id, condition
+    cmp r13d, %1
+    jne %%next
+    cmp rbx, rax
+    set%2 bl
+    movzx ebx, bl
+    jmp .ab_loop
+%%next:
+%endmacro
+    AR_SET AR_EQ, e
+    AR_SET AR_NE, ne
+    AR_SET AR_LT, l
+    AR_SET AR_LE, le
+    AR_SET AR_GT, g
+    AR_SET AR_GE, ge
+    jmp .ab_loop                    ; not reached
+.ab_lor:
+    or rbx, rax
+    setnz bl
+    movzx ebx, bl
+    jmp .ab_loop
+.ab_land:
     test rbx, rbx
     setnz bl
     test rax, rax
     setnz al
     and bl, al
     movzx ebx, bl
-    jmp .an_loop
-.an_ret:
+    jmp .ab_loop
+.ab_or:
+    or rbx, rax
+    jmp .ab_loop
+.ab_xor:
+    xor rbx, rax
+    jmp .ab_loop
+.ab_and:
+    and rbx, rax
+    jmp .ab_loop
+.ab_add:
+    add rbx, rax
+    jmp .ab_loop
+.ab_sub:
+    sub rbx, rax
+    jmp .ab_loop
+.ab_mul:
+    imul rbx, rax
+    jmp .ab_loop
+.ab_shl:
+.ab_shr:
+    mov ecx, eax                    ; the count is taken modulo 64, like the hardware
+    cmp r13d, AR_SHL
+    jne .ab_sar
+    shl rbx, cl
+    jmp .ab_loop
+.ab_sar:
+    sar rbx, cl
+    jmp .ab_loop
+.ab_div:
+    test rax, rax
+    jnz .ab_div_ok
+    cmp byte [ash_ar_skip], 0
+    jne .ab_div_skip
+    cmp byte [ash_ar_err], 0
+    jne .ab_div_skip
+    mov byte [ash_ar_err], 2
+.ab_div_skip:
+    xor ebx, ebx
+    jmp .ab_loop
+.ab_div_ok:
+    cmp rax, -1
+    je .ab_div_neg1
+    mov rcx, rax
     mov rax, rbx
+    cqo
+    idiv rcx
+    cmp r13d, AR_MOD
+    je .ab_mod_res
+    mov rbx, rax
+    jmp .ab_loop
+.ab_mod_res:
+    mov rbx, rdx
+    jmp .ab_loop
+.ab_div_neg1:                       ; INT64_MIN / -1 would trap
+    cmp r13d, AR_MOD
+    je .ab_mod_zero
+    neg rbx
+    jmp .ab_loop
+.ab_mod_zero:
+    xor ebx, ebx
+    jmp .ab_loop
+.ab_ret:
+    mov rax, rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret
 
-ar_cmp:
-    push rbx
-    call ar_add
-    mov rbx, rax
-.ac_loop:
-    call ar_ws
+; ar_getop: rcx = text at an operator position
+;   -> eax = operator id (0 = none), edx = its length, r8d = precedence
+ar_getop:
     movzx eax, byte [rcx]
     movzx edx, byte [rcx + 1]
+    cmp al, '|'
+    je .go_bar
+    cmp al, '&'
+    je .go_amp
+    cmp al, '^'
+    je .go_xor
     cmp al, '='
-    je .ac_eq
+    je .go_eq
     cmp al, '!'
-    je .ac_ne
+    je .go_ne
     cmp al, '<'
-    je .ac_lt
+    je .go_lt
     cmp al, '>'
-    je .ac_gt
-    jmp .ac_ret
-.ac_eq:
-    cmp dl, '='
-    jne .ac_ret
-    add rcx, 2
-    mov [ash_ar_p], rcx
-    call ar_add
-    cmp rbx, rax
-    sete bl
-    movzx ebx, bl
-    jmp .ac_loop
-.ac_ne:
-    cmp dl, '='
-    jne .ac_ret
-    add rcx, 2
-    mov [ash_ar_p], rcx
-    call ar_add
-    cmp rbx, rax
-    setne bl
-    movzx ebx, bl
-    jmp .ac_loop
-.ac_lt:
-    cmp dl, '='
-    je .ac_le
-    inc rcx
-    mov [ash_ar_p], rcx
-    call ar_add
-    cmp rbx, rax
-    setl bl
-    movzx ebx, bl
-    jmp .ac_loop
-.ac_le:
-    add rcx, 2
-    mov [ash_ar_p], rcx
-    call ar_add
-    cmp rbx, rax
-    setle bl
-    movzx ebx, bl
-    jmp .ac_loop
-.ac_gt:
-    cmp dl, '='
-    je .ac_ge
-    inc rcx
-    mov [ash_ar_p], rcx
-    call ar_add
-    cmp rbx, rax
-    setg bl
-    movzx ebx, bl
-    jmp .ac_loop
-.ac_ge:
-    add rcx, 2
-    mov [ash_ar_p], rcx
-    call ar_add
-    cmp rbx, rax
-    setge bl
-    movzx ebx, bl
-    jmp .ac_loop
-.ac_ret:
-    mov rax, rbx
-    pop rbx
-    ret
-
-ar_add:
-    push rbx
-    call ar_mul
-    mov rbx, rax
-.ad_loop:
-    call ar_ws
-    movzx eax, byte [rcx]
+    je .go_gt
     cmp al, '+'
-    je .ad_plus
+    je .go_add
     cmp al, '-'
-    je .ad_minus
-    mov rax, rbx
-    pop rbx
-    ret
-.ad_plus:
-    inc rcx
-    mov [ash_ar_p], rcx
-    call ar_mul
-    add rbx, rax
-    jmp .ad_loop
-.ad_minus:
-    inc rcx
-    mov [ash_ar_p], rcx
-    call ar_mul
-    sub rbx, rax
-    jmp .ad_loop
-
-ar_mul:
-    push rbx
-    call ar_unary
-    mov rbx, rax
-.am_loop:
-    call ar_ws
-    movzx eax, byte [rcx]
+    je .go_sub
     cmp al, '*'
-    je .am_mul
+    je .go_mul
     cmp al, '/'
-    je .am_div
+    je .go_div
     cmp al, '%'
-    je .am_mod
-    mov rax, rbx
-    pop rbx
+    je .go_mod
+.go_none:
+    xor eax, eax
     ret
-.am_mul:
-    inc rcx
-    mov [ash_ar_p], rcx
-    call ar_unary
-    imul rbx, rax
-    jmp .am_loop
-.am_div:
-    inc rcx
-    mov [ash_ar_p], rcx
-    call ar_unary
-    test rax, rax
-    jz .am_zero
-    cmp rax, -1
-    je .am_div_neg
-    mov rcx, rax
-    mov rax, rbx
-    cqo
-    idiv rcx
-    mov rbx, rax
-    jmp .am_loop
-.am_div_neg:
-    neg rbx
-    jmp .am_loop
-.am_mod:
-    inc rcx
-    mov [ash_ar_p], rcx
-    call ar_unary
-    test rax, rax
-    jz .am_zero
-    cmp rax, -1
-    je .am_mod_neg
-    mov rcx, rax
-    mov rax, rbx
-    cqo
-    idiv rcx
-    mov rbx, rdx
-    jmp .am_loop
-.am_mod_neg:
-    xor ebx, ebx
-    jmp .am_loop
-.am_zero:
-    cmp byte [ash_ar_err], 0
-    jne .am_zero_set
-    mov byte [ash_ar_err], 2
-.am_zero_set:
-    xor ebx, ebx
-    jmp .am_loop
+.go_bar:
+    cmp dl, '|'
+    jne .go_or1
+    mov eax, AR_LOR
+    mov edx, 2
+    mov r8d, 1
+    ret
+.go_or1:
+    mov eax, AR_OR
+    mov r8d, 3
+    jmp .go_len1
+.go_amp:
+    cmp dl, '&'
+    jne .go_and1
+    mov eax, AR_LAND
+    mov edx, 2
+    mov r8d, 2
+    ret
+.go_and1:
+    mov eax, AR_AND
+    mov r8d, 5
+    jmp .go_len1
+.go_xor:
+    mov eax, AR_XOR
+    mov r8d, 4
+    jmp .go_len1
+.go_eq:
+    cmp dl, '='
+    jne .go_none                    ; a lone = is an assignment: not supported
+    mov eax, AR_EQ
+    jmp .go_eq6
+.go_ne:
+    cmp dl, '='
+    jne .go_none
+    mov eax, AR_NE
+.go_eq6:
+    mov edx, 2
+    mov r8d, 6
+    ret
+.go_lt:
+    cmp dl, '<'
+    je .go_shl
+    mov r8d, 7
+    cmp dl, '='
+    je .go_le
+    mov eax, AR_LT
+    jmp .go_len1
+.go_le:
+    mov eax, AR_LE
+    jmp .go_len2
+.go_shl:
+    mov eax, AR_SHL
+    mov r8d, 8
+    jmp .go_len2
+.go_gt:
+    cmp dl, '>'
+    je .go_shr
+    mov r8d, 7
+    cmp dl, '='
+    je .go_ge
+    mov eax, AR_GT
+    jmp .go_len1
+.go_ge:
+    mov eax, AR_GE
+    jmp .go_len2
+.go_shr:
+    mov eax, AR_SHR
+    mov r8d, 8
+    jmp .go_len2
+.go_add:
+    mov eax, AR_ADD
+    mov r8d, 9
+    jmp .go_len1
+.go_sub:
+    mov eax, AR_SUB
+    mov r8d, 9
+    jmp .go_len1
+.go_mul:
+    mov eax, AR_MUL
+    mov r8d, 10
+    jmp .go_len1
+.go_div:
+    mov eax, AR_DIV
+    mov r8d, 10
+    jmp .go_len1
+.go_mod:
+    mov eax, AR_MOD
+    mov r8d, 10
+.go_len1:
+    mov edx, 1
+    ret
+.go_len2:
+    mov edx, 2
+    ret
 
 ar_unary:
     push rbx
@@ -2959,13 +4197,66 @@ ar_primary:
     jmp .ap_name
 .ap_num:
     xor eax, eax
+    cmp byte [rcx], '0'
+    jne .ap_num_loop
+    movzx edx, byte [rcx + 1]
+    or dl, 0x20
+    cmp dl, 'x'
+    je .ap_hex
+.ap_oct:                            ; a leading 0 means octal
+    movzx edx, byte [rcx]
+    sub edx, '0'
+    cmp edx, 9
+    ja .ap_num_end
+    cmp edx, 7
+    ja .ap_err
+    mov rsi, rax
+    shr rsi, 60
+    jnz .ap_err                     ; would not fit 63 bits
+    shl rax, 3
+    add rax, rdx
+    inc rcx
+    jmp .ap_oct
+.ap_hex:
+    add rcx, 2
+    xor esi, esi                    ; digits seen
+.ap_hex_loop:
+    movzx edx, byte [rcx]
+    cmp edx, '0'
+    jb .ap_hex_end
+    cmp edx, '9'
+    jbe .ap_hex_dec
+    or edx, 0x20
+    cmp edx, 'a'
+    jb .ap_hex_end
+    cmp edx, 'f'
+    ja .ap_hex_end
+    sub edx, 'a' - 10
+    jmp .ap_hex_add
+.ap_hex_dec:
+    sub edx, '0'
+.ap_hex_add:
+    mov rdi, rax
+    shr rdi, 59
+    jnz .ap_err
+    shl rax, 4
+    add rax, rdx
+    inc esi
+    inc rcx
+    jmp .ap_hex_loop
+.ap_hex_end:
+    test esi, esi
+    jz .ap_err
+    jmp .ap_num_end
 .ap_num_loop:
     movzx edx, byte [rcx]
     sub edx, '0'
     cmp edx, 9
     ja .ap_num_end
     imul rax, rax, 10
+    jo .ap_err                      ; larger than 2^63 - 1
     add rax, rdx
+    jo .ap_err
     inc rcx
     jmp .ap_num_loop
 .ap_num_end:
@@ -2974,7 +4265,7 @@ ar_primary:
 .ap_paren:
     inc rcx
     mov [ash_ar_p], rcx
-    call ar_or
+    call ar_expr
     mov rbx, rax
     call ar_ws
     cmp byte [rcx], ')'
@@ -2998,6 +4289,7 @@ ar_primary:
 ; result string in ash_num_buf ("" on error, message printed).
 ash_expand_arith:
     push rbx
+    mov byte [ash_arith_failed], 0
     mov rcx, rdi
     xor r8d, r8d                    ; ( depth
 .ea_scan:
@@ -3029,7 +4321,7 @@ ash_expand_arith:
     cmp rdi, rcx
     jae .ea_cp_end
     cmp edx, 510
-    jae .ea_cp_end
+    jae .ea_long                    ; an expression cut short would compute something else
     mov al, [rdi]
     mov [rsi + rdx], al
     inc rdi
@@ -3048,6 +4340,7 @@ ash_expand_arith:
     pop rbx
     ret
 .ea_err:
+    mov byte [ash_arith_failed], 1
     mov byte [ash_num_buf], 0
     lea rdi, [ash_e_arith]
     cmp edx, 2
@@ -3058,6 +4351,9 @@ ash_expand_arith:
     mov rax, rbx
     pop rbx
     ret
+.ea_long:
+    mov edx, 1
+    jmp .ea_err
 .ea_open:
     xor eax, eax
     pop rbx
@@ -3091,7 +4387,7 @@ ash_test_main:
     lea r14, [ash_test_buf]
 .tm_split:
     cmp ebx, 31
-    jae .tm_parsed
+    jae .tm_full
     mov rdi, r12
     mov rsi, r14
     mov edx, 1
@@ -3104,6 +4400,17 @@ ash_test_main:
     mov r14, rdx
     inc ebx
     jmp .tm_split
+.tm_full:                           ; room for 31 words: a 32nd is an error
+    mov rdi, r12
+    mov rsi, r14
+    mov edx, 1
+    call ash_next_word
+    test rax, rax
+    jz .tm_parsed
+    lea rdi, [ash_e_test_args]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+    jmp .tm_ret
 .tm_parsed:
     test r13d, r13d
     jz .tm_eval
@@ -3145,6 +4452,8 @@ ash_test_eval:
     mov ebx, edi
     lea r12, [ash_test_argv]
     xor r13d, r13d                  ; negate
+    cmp ebx, 5
+    jae .te_rd
     cmp ebx, 2
     jb .te_go
     mov rdi, [r12]
@@ -3164,9 +4473,22 @@ ash_test_eval:
     je .te_two
     cmp ebx, 3
     je .te_three
-    lea rdi, [ash_e_test_args]
+.te_rd:
+    ; four or more words: the full grammar with -a -o ! ( )
+    mov dword [ash_t_pos], 0
+    mov [ash_t_end], ebx
+    call ash_t_or
+    mov r13d, eax
+    mov eax, [ash_t_pos]
+    cmp eax, [ash_t_end]
+    je .te_rd_done
+    cmp r13d, 2                     ; leftover words: the expression is malformed
+    je .te_rd_done
+    lea rdi, [ash_e_test_expr]
     call ash_write_err
-    mov eax, 2
+    mov r13d, 2
+.te_rd_done:
+    mov eax, r13d
     jmp .te_ret
 .te_one:
     mov rax, [r12]
@@ -3179,6 +4501,23 @@ ash_test_eval:
     call ash_test_unary
     jmp .te_result
 .te_three:
+    mov rdi, [r12 + 8]
+    call ash_test_isbin
+    test eax, eax
+    jnz .te_bin
+    mov rdi, [r12]
+    lea rsi, [ash_s_lp]
+    call ash_strcmp
+    test eax, eax
+    jnz .te_bin
+    mov rdi, [r12 + 16]
+    lea rsi, [ash_s_rp]
+    call ash_strcmp
+    test eax, eax
+    jnz .te_bin
+    add r12, 8                      ; ( word ): the word alone
+    jmp .te_one
+.te_bin:
     mov rdi, [r12]
     mov rsi, [r12 + 8]
     mov rdx, [r12 + 16]
@@ -3200,6 +4539,248 @@ ash_test_eval:
     pop rbx
     pop rbp
     ret
+
+section .data
+    ash_s_lp            db "(", 0
+    ash_s_rp            db ")", 0
+    ash_s_dasha         db "-a", 0
+    ash_s_dasho         db "-o", 0
+    ash_e_test_expr     db "test: syntax error", 10, 0
+    ash_e_test_miss     db "test: argument expected", 10, 0
+section .bss
+    ash_t_pos           resd 1
+    ash_t_end           resd 1
+section .text
+
+; The grammar for four words and more. Each routine returns the test status
+; in eax (0 true, 1 false, 2 error) and moves ash_t_pos over what it used.
+;   or   := and { -o and }        and := not { -a not }
+;   not  := ! not | primary
+;   primary := ( or ) | WORD OP WORD | -X WORD | WORD
+ash_t_or:
+    push rbx
+    call ash_t_and
+    mov ebx, eax
+.to_loop:
+    mov eax, [ash_t_pos]
+    cmp eax, [ash_t_end]
+    jae .to_ret
+    lea rdx, [ash_test_argv]
+    mov rdi, [rdx + rax * 8]
+    lea rsi, [ash_s_dasho]
+    call ash_strcmp
+    test eax, eax
+    jnz .to_ret
+    inc dword [ash_t_pos]
+    call ash_t_and
+    cmp ebx, 2
+    je .to_loop
+    cmp eax, 2
+    jne .to_comb
+    mov ebx, 2
+    jmp .to_loop
+.to_comb:
+    and ebx, eax                    ; true (0) on either side wins
+    jmp .to_loop
+.to_ret:
+    mov eax, ebx
+    pop rbx
+    ret
+
+ash_t_and:
+    push rbx
+    call ash_t_not
+    mov ebx, eax
+.ta_loop:
+    mov eax, [ash_t_pos]
+    cmp eax, [ash_t_end]
+    jae .ta_ret
+    lea rdx, [ash_test_argv]
+    mov rdi, [rdx + rax * 8]
+    lea rsi, [ash_s_dasha]
+    call ash_strcmp
+    test eax, eax
+    jnz .ta_ret
+    inc dword [ash_t_pos]
+    call ash_t_not
+    cmp ebx, 2
+    je .ta_loop
+    cmp eax, 2
+    jne .ta_comb
+    mov ebx, 2
+    jmp .ta_loop
+.ta_comb:
+    or ebx, eax                     ; both must be true (0)
+    jmp .ta_loop
+.ta_ret:
+    mov eax, ebx
+    pop rbx
+    ret
+
+ash_t_not:
+    mov eax, [ash_t_pos]
+    lea ecx, [rax + 1]
+    cmp ecx, [ash_t_end]
+    jae ash_t_primary               ; "!" with nothing after it is a word
+    lea rdx, [ash_test_argv]
+    mov rdi, [rdx + rax * 8]
+    cmp byte [rdi], '!'
+    jne ash_t_primary
+    cmp byte [rdi + 1], 0
+    jne ash_t_primary
+    mov [ash_t_pos], ecx
+    sub rsp, 8
+    call ash_t_not
+    add rsp, 8
+    cmp eax, 2
+    je .tn_ret
+    xor eax, 1
+.tn_ret:
+    ret
+
+ash_t_primary:
+    push rbx
+    push r12
+    push r13
+    mov ebx, [ash_t_pos]
+    mov r12d, [ash_t_end]
+    cmp ebx, r12d
+    jae .tp_missing
+    lea r13, [ash_test_argv]
+    mov rdi, [r13 + rbx * 8]
+    lea rsi, [ash_s_lp]
+    call ash_strcmp
+    test eax, eax
+    jnz .tp_plain
+    inc ebx
+    mov [ash_t_pos], ebx
+    call ash_t_or
+    mov ebx, eax
+    cmp ebx, 2
+    je .tp_done
+    mov eax, [ash_t_pos]
+    cmp eax, [ash_t_end]
+    jae .tp_missing
+    mov rdi, [r13 + rax * 8]
+    lea rsi, [ash_s_rp]
+    call ash_strcmp
+    test eax, eax
+    jnz .tp_missing
+    inc dword [ash_t_pos]
+.tp_done:
+    mov eax, ebx
+    jmp .tp_ret
+.tp_plain:
+    mov eax, r12d
+    sub eax, ebx                    ; words left
+    cmp eax, 3
+    jb .tp_unary
+    mov rdi, [r13 + rbx * 8 + 8]
+    call ash_test_isbin
+    test eax, eax
+    jz .tp_unary
+    mov rdi, [r13 + rbx * 8]
+    mov rsi, [r13 + rbx * 8 + 8]
+    mov rdx, [r13 + rbx * 8 + 16]
+    add dword [ash_t_pos], 3
+    call ash_test_binary
+    jmp .tp_ret
+.tp_unary:
+    mov eax, r12d
+    sub eax, ebx
+    cmp eax, 2
+    jb .tp_str
+    mov rdi, [r13 + rbx * 8]
+    call ash_test_isun
+    test eax, eax
+    jz .tp_str
+    mov rdi, [r13 + rbx * 8]
+    mov rsi, [r13 + rbx * 8 + 8]
+    add dword [ash_t_pos], 2
+    call ash_test_unary
+    jmp .tp_ret
+.tp_str:
+    inc dword [ash_t_pos]
+    mov rax, [r13 + rbx * 8]
+    cmp byte [rax], 0
+    sete al
+    movzx eax, al                   ; a non-empty word is true (0)
+    jmp .tp_ret
+.tp_missing:
+    lea rdi, [ash_e_test_miss]
+    call ash_write_err
+    mov eax, 2
+.tp_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ash_test_isbin(rdi = word) -> eax = 1 for = == != -eq -ne -lt -le -gt -ge
+ash_test_isbin:
+    movzx eax, byte [rdi]
+    cmp al, '='
+    je .ib_eq
+    cmp al, '!'
+    je .ib_ne
+    cmp al, '-'
+    jne .ib_no
+    cmp byte [rdi + 3], 0
+    jne .ib_no
+    movzx eax, word [rdi + 1]
+    cmp ax, 'eq'
+    je .ib_yes
+    cmp ax, 'ne'
+    je .ib_yes
+    cmp ax, 'lt'
+    je .ib_yes
+    cmp ax, 'le'
+    je .ib_yes
+    cmp ax, 'gt'
+    je .ib_yes
+    cmp ax, 'ge'
+    je .ib_yes
+.ib_no:
+    xor eax, eax
+    ret
+.ib_eq:
+    cmp byte [rdi + 1], 0
+    je .ib_yes
+    cmp word [rdi + 1], '='
+    je .ib_yes
+    jmp .ib_no
+.ib_ne:
+    cmp word [rdi + 1], '='
+    jne .ib_no
+.ib_yes:
+    mov eax, 1
+    ret
+
+; ash_test_isun(rdi = word) -> eax = 1 for -n -z -r -w -x -L -h -e -f -d -s
+ash_test_isun:
+    cmp byte [rdi], '-'
+    jne .iu_no
+    cmp byte [rdi + 2], 0
+    jne .iu_no
+    movzx eax, byte [rdi + 1]
+    lea rcx, [ash_test_unops]
+.iu_loop:
+    cmp byte [rcx], 0
+    je .iu_no
+    cmp al, [rcx]
+    je .iu_yes
+    inc rcx
+    jmp .iu_loop
+.iu_yes:
+    mov eax, 1
+    ret
+.iu_no:
+    xor eax, eax
+    ret
+
+section .data
+    ash_test_unops      db "nzrwxLhefds", 0
+section .text
 
 ; ash_test_unary(rdi = op, rsi = arg) -> eax 0/1/2
 ash_test_unary:
@@ -3324,6 +4905,16 @@ ash_test_binary:
     mov r13, rdx
 
     mov rdi, r12
+    lea rsi, [ash_s_dasha]
+    call ash_strcmp
+    test eax, eax
+    jz .tb_and
+    mov rdi, r12
+    lea rsi, [ash_s_dasho]
+    call ash_strcmp
+    test eax, eax
+    jz .tb_or
+    mov rdi, r12
     lea rsi, [ash_s_eq1]
     call ash_strcmp
     test eax, eax
@@ -3416,6 +5007,18 @@ ash_test_binary:
     call ash_strcmp
     test eax, eax
     jnz .tb_true
+    jmp .tb_false
+.tb_and:                            ; three words "a -a b": both non-empty
+    cmp byte [rbx], 0
+    je .tb_false
+    cmp byte [r13], 0
+    je .tb_false
+    jmp .tb_true
+.tb_or:
+    cmp byte [rbx], 0
+    jne .tb_true
+    cmp byte [r13], 0
+    jne .tb_true
     jmp .tb_false
 .tb_notint:
     lea rdi, [ash_e_test_int]
