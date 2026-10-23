@@ -17,9 +17,30 @@
 
 %define SYS_PIPE2           293
 %define O_CLOEXEC           0x80000
+%define ENOENT              2
+%define E2BIG               7
 %define ENOEXEC             8
+%define ENOMEM              12
 %define EACCES              13
+%define EISDIR              21
+%define ENOTDIR             20
+%define ETXTBSY             26
+%define ENAMETOOLONG        36
+%define ELOOP               40
 %define EINTR               4
+%define EBADINTERP          1000        ; not an errno: file exists but its #! interpreter does not
+
+; Job control
+%define JC_SYS_SETPGID      109
+%define JC_SYS_GETPGRP      111
+%define JC_SYS_ACCESS       21
+%define JC_TIOCGPGRP        0x540F
+%define JC_TIOCSPGRP        0x5410
+%define JC_SIGTTIN          21
+%define JC_SIGTTOU          22
+%define JC_SIG_IGN          1
+%define JC_VQUIT            1
+%define JC_VSUSP            10
 
 %define ASH_MAX_STAGES      16
 %define ASH_MAX_ARGS        256         ; argv slots for all stages, NULLs included
@@ -55,7 +76,40 @@ section .data
     ash_default_path    db "/usr/local/bin:/usr/bin:/bin", 0
     ash_msg_prefix      db "ash: ", 0
     ash_msg_notfound    db ": command not found", 10, 0
-    ash_msg_denied      db ": permission denied", 10, 0
+    ash_msg_denied      db ": Permission denied", 10, 0
+    ash_msg_noent       db ": No such file or directory", 10, 0
+    ash_msg_isdir       db ": Is a directory", 10, 0
+    ash_msg_notdir      db ": Not a directory", 10, 0
+    ash_msg_badinterp   db ": bad interpreter: No such file or directory", 10, 0
+    ash_msg_e2big       db ": Argument list too long", 10, 0
+    ash_msg_txtbsy      db ": Text file busy", 10, 0
+    ash_msg_nametoolong db ": File name too long", 10, 0
+    ash_msg_loop        db ": Too many levels of symbolic links", 10, 0
+    ash_msg_nomem       db ": Cannot allocate memory", 10, 0
+    ash_msg_cantexec    db ": cannot execute", 10, 0
+    ash_s_exit          db "exit", 0
+    ; Why an exec failed: errno, exit status, message. Anything not listed
+    ; is "cannot execute" (126).
+    ash_exec_errs:
+        dd ENOENT,       127
+        dq ash_msg_noent
+        dd ENOTDIR,      126
+        dq ash_msg_notdir
+        dd EISDIR,       126
+        dq ash_msg_isdir
+        dd EBADINTERP,   126
+        dq ash_msg_badinterp
+        dd E2BIG,        126
+        dq ash_msg_e2big
+        dd ETXTBSY,      126
+        dq ash_msg_txtbsy
+        dd ENAMETOOLONG, 126
+        dq ash_msg_nametoolong
+        dd ELOOP,        126
+        dq ash_msg_loop
+        dd ENOMEM,       126
+        dq ash_msg_nomem
+        dd 0, 0
     ash_msg_noopen      db ": cannot open file", 10, 0
     ash_msg_pipe        db "ash: pipe failed", 10, 0
     ash_msg_fork        db "ash: fork failed", 10, 0
@@ -71,11 +125,19 @@ section .bss
     ash_argv            resq ASH_MAX_ARGS
     ash_pool            resb ASH_POOL_SIZE
     ash_pipes           resd ASH_MAX_STAGES * 2
-    ash_nstages         resd 1
     alignb 8
     ash_child_stage     resq 1          ; set in a pipeline child: its stage record
     ash_exec_path       resb MAX_PATH_BUF
     ash_sh_argv         resq ASH_MAX_ARGS + 2
+
+    ; Job control state (see jc_ensure)
+    jc_state            resb 1          ; 0 = not probed yet, 1 = on, 2 = off
+    script_running      resb 1          ; 1 while a command line runs (Ctrl+C stays live)
+    jc_shell_pgid       resd 1          ; the shell's own process group
+    jc_pgid             resd 1          ; group of the job being started, 0 = none yet
+    jc_tmp              resd 1          ; argument cell for the TIOC*PGRP ioctls
+    jc_sa               resb 32         ; struct sigaction scratch
+    script_termios      resb 60
 
 section .text
 
@@ -322,7 +384,6 @@ ash_parse:
 .ap_fail:
     xor eax, eax
 .ap_ret:
-    mov [ash_nstages], eax
     add rsp, 24
     pop r15
     pop r14
@@ -559,6 +620,319 @@ ash_parse:
     ret
 
 ; ----------------------------------------------------------------------------
+; Job control. Every foreground pipeline and every background job gets its own
+; process group. A foreground job owns the terminal while it runs, so Ctrl+C
+; and Ctrl+Z reach only that job and background jobs are left alone. The shell
+; takes the terminal back when the job ends or stops. This is only switched on
+; when the shell started as the foreground group of its terminal; otherwise
+; (scripts, pipes, a shell started in the background) children simply share
+; the shell's group as before.
+; ----------------------------------------------------------------------------
+
+; jc_ensure() -> eax = 1 when job control is on. Probes once, on first use.
+; The shell ignores SIGTTOU and SIGTTIN from then on so it can hand the terminal
+; back from a background group; children restore the default (jc_child_setup).
+jc_ensure:
+    movzx eax, byte [jc_state]
+    test eax, eax
+    jnz .jce_known
+    mov byte [jc_state], 2
+    cmp byte [interactive_mode], 0
+    je .jce_off
+    mov eax, JC_SYS_GETPGRP
+    syscall
+    mov [jc_shell_pgid], eax
+    mov eax, SYS_IOCTL
+    xor edi, edi
+    mov esi, JC_TIOCGPGRP
+    lea rdx, [jc_tmp]
+    syscall
+    test rax, rax
+    js .jce_off                     ; no controlling terminal
+    mov eax, [jc_tmp]
+    cmp eax, [jc_shell_pgid]
+    jne .jce_off                    ; started in the background
+    mov edi, JC_SIG_IGN
+    call jc_tty_signals
+    mov byte [jc_state], 1
+    mov eax, 1
+    ret
+.jce_off:
+    xor eax, eax
+    ret
+.jce_known:
+    xor eax, eax
+    cmp byte [jc_state], 1
+    sete al
+    ret
+
+; jc_child_setup(edi = 1 for a foreground job) - runs in the forked child.
+; Joins the job's group (jc_pgid, 0 = start a new one) and, for a foreground
+; job, makes it the terminal's group before anything can read from it.
+jc_child_setup:
+    cmp byte [jc_state], 1
+    jne .jcs_ret
+    mov r8d, edi
+    mov eax, JC_SYS_SETPGID
+    xor edi, edi
+    mov esi, [jc_pgid]
+    syscall
+    test r8d, r8d
+    jz .jcs_sig
+    mov eax, JC_SYS_GETPGRP
+    syscall
+    mov [jc_tmp], eax
+    mov eax, SYS_IOCTL
+    xor edi, edi
+    mov esi, JC_TIOCSPGRP
+    lea rdx, [jc_tmp]
+    syscall
+.jcs_sig:
+    xor edi, edi                    ; SIGTTOU and SIGTTIN back to the default action
+    call jc_tty_signals
+.jcs_ret:
+    ret
+
+; jc_tty_signals(rdi = JC_SIG_IGN or 0 for the default) - set the disposition
+; of SIGTTOU and SIGTTIN. The shell ignores both so it can hand the terminal
+; back from a background group; jobs must see the default.
+jc_tty_signals:
+    mov r8d, JC_SIGTTOU
+.jts_next:
+    lea rsi, [jc_sa]
+    mov [rsi], rdi
+    mov qword [rsi + 8], 0
+    mov qword [rsi + 16], 0
+    mov qword [rsi + 24], 0
+    mov r9, rdi
+    mov eax, SYS_RT_SIGACTION
+    mov edi, r8d
+    xor edx, edx
+    mov r10d, 8
+    syscall
+    mov rdi, r9
+    cmp r8d, JC_SIGTTIN
+    je .jts_ret
+    mov r8d, JC_SIGTTIN
+    jmp .jts_next
+.jts_ret:
+    ret
+
+; jc_parent_after_fork(edi = child pid, esi = 1 for a foreground job)
+; Does the same grouping from the parent's side, so the group exists before
+; the next pipeline stage forks and no race decides who gets there first.
+jc_parent_after_fork:
+    cmp byte [jc_state], 1
+    jne .jpf_ret
+    mov r8d, esi
+    xor r9d, r9d                    ; r9d = 1 for the first process of the job
+    mov esi, [jc_pgid]
+    test esi, esi
+    jnz .jpf_set
+    mov esi, edi
+    mov [jc_pgid], edi
+    mov r9d, 1
+.jpf_set:
+    mov eax, JC_SYS_SETPGID
+    syscall                         ; setpgid(pid, pgid); EACCES after exec is fine
+    test r9d, r9d
+    jz .jpf_ret
+    test r8d, r8d
+    jz .jpf_ret
+    mov eax, SYS_IOCTL
+    xor edi, edi
+    mov esi, JC_TIOCSPGRP
+    lea rdx, [jc_pgid]
+    syscall
+.jpf_ret:
+    ret
+
+; jc_give_tty(edi = process group) - make it the terminal's foreground group
+jc_give_tty:
+    cmp byte [jc_state], 1
+    jne .jgt_ret
+    mov [jc_tmp], edi
+    mov eax, SYS_IOCTL
+    xor edi, edi
+    mov esi, JC_TIOCSPGRP
+    lea rdx, [jc_tmp]
+    syscall
+.jgt_ret:
+    ret
+
+; jc_reclaim() - the shell becomes the terminal's foreground group again
+jc_reclaim:
+    mov edi, [jc_shell_pgid]
+    jmp jc_give_tty
+
+; jc_prepare() - call before forking a foreground job: probes job control and
+; lets the first process of the job start a new group
+jc_prepare:
+    sub rsp, 8
+    call jc_ensure
+    mov dword [jc_pgid], 0
+    add rsp, 8
+    ret
+
+; jc_wait_fg(edi = pid, rsi = command text or 0 for input_buf) -> eax = status
+; Waits for a foreground job set up with jc_child_setup and
+; jc_parent_after_fork. If Ctrl+Z stopped it, it becomes a stopped job
+; (status 128 + SIGTSTP). Either way the shell gets the terminal back; raw mode
+; is the caller's business.
+jc_wait_fg:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 24                     ; [rsp] = wait status
+    mov ebx, edi
+    mov r12, rsi
+.jw_wait:
+    mov dword [rsp], 0
+    mov edi, ebx
+    mov rsi, rsp
+    xor edx, edx
+    cmp byte [jc_state], 1
+    jne .jw_go
+    mov edx, WUNTRACED              ; also report a job stopped by Ctrl+Z
+.jw_go:
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -EINTR
+    je .jw_wait
+    mov eax, [rsp]
+    mov esi, 1
+    call jc_status
+    mov r13d, eax
+    test edx, edx
+    jnz .jw_stopped
+    call jc_reclaim
+    jmp .jw_ret
+.jw_stopped:
+    mov edi, ebx
+    mov esi, [jc_pgid]
+    mov edx, JOB_STOPPED
+    mov rcx, r12
+    call job_add
+    test eax, eax
+    js .jw_refused
+    mov r12d, eax
+    call jc_reclaim
+    mov edi, r12d
+    call job_notify_stopped
+    call restore_terminal           ; the program may have left the terminal raw
+    jmp .jw_ret
+.jw_refused:
+    ; No room in the job table: let the job carry on rather than lose it
+    lea rdi, [jobs_full_msg]
+    call ash_write_err
+    mov edi, [jc_pgid]
+    neg edi
+    mov esi, SIGCONT
+    mov eax, SYS_KILL
+    syscall
+    jmp .jw_wait
+.jw_ret:
+    mov eax, r13d
+    add rsp, 24
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; jc_status(eax = wait status, esi = 1 when SIGINT means Ctrl+C)
+;   -> eax = exit status (128 + signal when killed or stopped), edx = 1 if stopped
+; A foreground job killed by SIGINT also aborts the running script: with its
+; own process group the shell no longer gets that SIGINT itself.
+jc_status:
+    mov ecx, eax
+    and ecx, 0xFF
+    cmp ecx, 0x7F
+    je .jst_stopped
+    test ecx, ecx
+    jz .jst_exited
+    and ecx, 0x7F
+    test esi, esi
+    jz .jst_signal
+    cmp ecx, SIGINT
+    jne .jst_signal
+    cmp byte [jc_state], 1          ; only a keyboard Ctrl+C aimed at the job
+    jne .jst_signal
+    mov byte [ctrl_c_flag], 1
+.jst_signal:
+    lea eax, [rcx + 128]
+    xor edx, edx
+    ret
+.jst_exited:
+    shr eax, 8
+    and eax, 0xFF
+    xor edx, edx
+    ret
+.jst_stopped:
+    shr eax, 8
+    and eax, 0xFF
+    add eax, 128
+    mov edx, 1
+    ret
+
+; script_isig_apply() - termios for a running command line: raw input like the
+; line editor, but ISIG on so Ctrl+C raises SIGINT and stops a loop that runs
+; only builtins. The suspend and quit keys are switched off because the shell
+; itself must not be stopped or dumped by them.
+script_isig_apply:
+    cmp byte [jc_state], 1
+    jne .sia_ret
+    mov eax, SYS_IOCTL
+    mov edi, STDIN_FD
+    mov esi, TCGETS
+    lea rdx, [script_termios]
+    syscall
+    test rax, rax
+    js .sia_ret
+    or dword [script_termios + TERMIOS_C_LFLAG], ISIG
+    mov byte [script_termios + TERMIOS_C_CC + JC_VQUIT], 0
+    mov byte [script_termios + TERMIOS_C_CC + JC_VSUSP], 0
+    mov eax, SYS_IOCTL
+    mov edi, STDIN_FD
+    mov esi, TCSETS
+    lea rdx, [script_termios]
+    syscall
+.sia_ret:
+    ret
+
+; script_isig_on() - a command line is about to run (interactive shell)
+script_isig_on:
+    sub rsp, 8
+    mov byte [script_running], 1
+    cmp byte [interactive_mode], 0
+    je .sion_ret
+    call jc_ensure
+    call script_isig_apply
+.sion_ret:
+    add rsp, 8
+    ret
+
+; script_isig_off() - the line is done: back to the line editor's raw mode.
+; A Ctrl+C that arrived while it ran has been dealt with by now.
+script_isig_off:
+    mov byte [script_running], 0
+    mov byte [ctrl_c_flag], 0
+    cmp byte [interactive_mode], 0
+    je .sioff_ret
+    cmp byte [jc_state], 1
+    jne .sioff_ret
+    mov eax, SYS_IOCTL
+    mov edi, STDIN_FD
+    mov esi, TCSETS
+    lea rdx, [raw_termios]
+    syscall
+.sioff_ret:
+    ret
+
+; ----------------------------------------------------------------------------
 ; ash_run(edi = number of stages) - run the parsed pipeline in the foreground.
 ; Sets last_exit_status from the last stage (128 + signal if killed).
 ; ----------------------------------------------------------------------------
@@ -586,6 +960,10 @@ ash_run:
     syscall
     test rax, rax
     js .ar_pipe_fail
+    lea rdi, [ash_pipes + rbx * 8]  ; with fd 0-2 closed a pipe end can be 0, 1
+    call ash_pipe_lift              ; or 2, which dup2 in the child would not clear
+    test eax, eax
+    js .ar_pipe_fail                ; ash_pipe_lift closed this pipe's ends
     inc ebx
     jmp .ar_pipes
 
@@ -599,6 +977,8 @@ ash_run:
 
 .ar_pipes_done:
     call restore_terminal           ; children get a cooked terminal
+    call jc_ensure
+    mov dword [jc_pgid], 0          ; the first stage starts the job's group
 
     xor ebx, ebx                    ; ebx = stage index
     xor r15d, r15d                  ; r15d = stages started
@@ -612,6 +992,9 @@ ash_run:
     jz .ar_child
     imul ecx, ebx, STG_SIZE
     mov [ash_stages + rcx + STG_PID], rax
+    mov edi, eax
+    mov esi, 1                      ; foreground: this group owns the terminal
+    call jc_parent_after_fork
     inc ebx
     inc r15d
     jmp .ar_fork
@@ -636,6 +1019,10 @@ ash_run:
     mov rdi, r13
     mov rsi, rsp
     xor edx, edx
+    cmp byte [jc_state], 1
+    jne .ar_wait_go
+    mov edx, WUNTRACED           ; also report a job stopped by Ctrl+Z
+.ar_wait_go:
     lea r10, [ash_rusage]
     mov eax, SYS_WAIT4
     syscall
@@ -646,20 +1033,16 @@ ash_run:
     call stats_note_rusage          ; keep the biggest peak RSS
 .ar_no_rusage:
     mov eax, [rsp]
-    mov edx, eax
-    and edx, 0x7F                   ; WTERMSIG
-    jz .ar_exited
-    lea eax, [rdx + 128]
-    jmp .ar_status
-.ar_exited:
-    shr eax, 8                      ; WEXITSTATUS
-    and eax, 0xFF
-.ar_status:
+    mov esi, 1
+    call jc_status                  ; 128 + signal when killed
     mov r14d, eax
+    test edx, edx
+    jnz .ar_stopped
     inc ebx
     jmp .ar_wait
 
 .ar_waited:
+    call jc_reclaim                 ; the shell owns the terminal again
     cmp r15d, r12d                  ; a fork failed: pipeline failed
     jae .ar_set_status
     mov r14d, 1
@@ -677,8 +1060,39 @@ ash_run:
     pop rbp
     ret
 
+    ; The pipeline was stopped (Ctrl+Z). Its other stages are stopped with it,
+    ; so keep the whole group as a stopped job instead of waiting for them.
+.ar_stopped:
+    lea eax, [r15d - 1]
+    imul ecx, eax, STG_SIZE
+    mov edi, [ash_stages + rcx + STG_PID]   ; the last stage gives the status
+    mov esi, [jc_pgid]
+    mov edx, JOB_STOPPED
+    xor ecx, ecx
+    call job_add
+    test eax, eax
+    js .ar_stop_refused
+    mov r13d, eax
+    call jc_reclaim
+    mov edi, r13d
+    call job_notify_stopped
+    call restore_terminal           ; the program may have left the terminal raw
+    jmp .ar_set_status
+.ar_stop_refused:
+    ; No room in the job table: let the job carry on rather than lose it.
+    lea rdi, [jobs_full_msg]
+    call ash_write_err
+    mov edi, [jc_pgid]
+    neg edi
+    mov esi, SIGCONT
+    mov eax, SYS_KILL
+    syscall
+    jmp .ar_wait_again
+
 ; ====== CHILD (ebx = stage index, r12d = stage count) ======
 .ar_child:
+    mov edi, 1
+    call jc_child_setup             ; own process group, owns the terminal
     imul eax, ebx, STG_SIZE
     lea r13, [ash_stages + rax]
 
@@ -697,6 +1111,10 @@ ash_run:
     xor esi, esi
     mov eax, SYS_DUP2
     syscall
+    test edi, edi                   ; the original must not leak into the command
+    jz .ac_out
+    mov eax, SYS_CLOSE
+    syscall
 
 .ac_out:
     ; stdout: next pipe, or the '>' set up by parse_redirection
@@ -714,6 +1132,10 @@ ash_run:
     mov edi, [redir_stdout_fd]
     mov esi, 1
     mov eax, SYS_DUP2
+    syscall
+    cmp edi, 1
+    je .ac_files
+    mov eax, SYS_CLOSE
     syscall
 
 .ac_files:
@@ -756,7 +1178,8 @@ ash_run:
 
 ; ----------------------------------------------------------------------------
 ; ash_exec_argv(rdi = argv) - child only. Find argv[0] in PATH and execve it.
-; Exits 127 (not found) or 126 (permission denied) on failure.
+; On failure it says why and exits 127 (no such command or file) or 126 (found
+; but cannot be run: permission denied, a directory, a missing interpreter...).
 ; ----------------------------------------------------------------------------
 ash_exec_argv:
     push rbp
@@ -766,11 +1189,40 @@ ash_exec_argv:
     push r13
     push r14
     push r15
-    sub rsp, 8
+    sub rsp, 24                     ; [rbp-64] first errno worth reporting,
+                                    ; [rbp-60] 1 when the name contains a '/'
 
     mov r12, rdi                    ; r12 = argv
     mov r13, [rdi]                  ; r13 = command name
     xor r15d, r15d                  ; r15d = 1 if some candidate was EACCES
+    mov qword [rbp - 64], 0
+
+    ; "exit" as a pipeline stage ends only that stage, as in sh's subshell
+    mov rdi, r13
+    lea rsi, [ash_s_exit]
+    call str_icompare
+    test eax, eax
+    jnz .ax_not_exit
+    mov rdi, [r12 + 8]
+    test rdi, rdi
+    jz .ax_exit_prev
+    call bi_parse_status
+    test edx, edx
+    jz .ax_exit_bad
+    mov edi, eax
+    mov eax, SYS_EXIT
+    syscall
+.ax_exit_prev:
+    mov edi, [prev_exit_status]
+    mov eax, SYS_EXIT
+    syscall
+.ax_exit_bad:
+    lea rdi, [bi_msg_exit_num]
+    call ash_write_err
+    mov edi, 2
+    mov eax, SYS_EXIT
+    syscall
+.ax_not_exit:
 
     call build_merged_envp          ; overlay vars are exported to children
 
@@ -785,6 +1237,7 @@ ash_exec_argv:
     jmp .ax_scan
 
 .ax_direct:
+    mov dword [rbp - 60], 1
     mov rdi, r13
     call .ax_try
     jmp .ax_failed
@@ -856,37 +1309,110 @@ ash_exec_argv:
     jmp .ax_segment
 
 .ax_failed:
+    test r15d, r15d                 ; a program that exists but cannot run, or a
+    jnz .ax_report                  ; path with a slash, is never a builtin
+    cmp dword [rbp - 60], 0
+    jne .ax_report
     call ash_child_builtin          ; a builtin used as a pipeline stage
+.ax_report:
     lea rdi, [ash_msg_prefix]
     call ash_write_err
     mov rdi, r13
     call ash_write_err
-    lea rdi, [ash_msg_notfound]
-    mov ebx, 127
-    test r15d, r15d
-    jz .ax_print_reason
-    lea rdi, [ash_msg_denied]
+    ; Permission denied outranks the other reasons met while searching PATH
     mov ebx, 126
+    lea rdi, [ash_msg_denied]
+    test r15d, r15d
+    jnz .ax_print_reason
+    mov eax, [rbp - 64]
+    test eax, eax
+    jnz .ax_lookup
+    mov ebx, 127
+    lea rdi, [ash_msg_notfound]
+    jmp .ax_print_reason
+.ax_lookup:
+    lea rsi, [ash_exec_errs]
+.ax_lookup_next:
+    mov ecx, [rsi]
+    test ecx, ecx
+    jz .ax_generic
+    cmp ecx, eax
+    je .ax_lookup_hit
+    add rsi, 16
+    jmp .ax_lookup_next
+.ax_lookup_hit:
+    mov ebx, [rsi + 4]
+    mov rdi, [rsi + 8]
+    jmp .ax_print_reason
+.ax_generic:
+    lea rdi, [ash_msg_cantexec]
 .ax_print_reason:
     call ash_write_err
     mov edi, ebx
     mov eax, SYS_EXIT
     syscall
 
-; Try execve(rdi, argv, merged_envp). Returns only on failure.
+; Try execve(rdi, argv, merged_envp). Returns only on failure, having noted
+; the reason: r15d for permission denied, [rbp-64] for anything else but
+; "not there", which is not worth reporting while PATH is still being searched.
 .ax_try:
     mov rbx, rdi
     mov rsi, r12
     lea rdx, [merged_envp]
     mov eax, SYS_EXECVE
     syscall
-    cmp rax, -EACCES
-    jne .ax_try_noexec
+    neg eax                         ; eax = errno
+    mov edx, eax
+    cmp edx, ENOEXEC
+    je .ax_try_noexec
+    cmp edx, EACCES
+    je .ax_try_acces
+    cmp edx, ENOENT
+    je .ax_try_noent
+    cmp edx, ENOTDIR
+    jne .ax_try_note
+    cmp dword [rbp - 60], 0         ; a PATH entry that is a file: keep looking
+    je .ax_try_ret
+.ax_try_note:
+    cmp dword [rbp - 64], 0
+    jne .ax_try_ret
+    mov [rbp - 64], edx
+.ax_try_ret:
+    ret
+.ax_try_noent:
+    ; Either the file is missing, or it exists and its #! interpreter does not
+    mov rdi, rbx
+    xor esi, esi                    ; F_OK
+    mov eax, JC_SYS_ACCESS
+    syscall
+    test rax, rax
+    mov edx, EBADINTERP
+    jz .ax_try_note
+    mov edx, ENOENT
+    cmp dword [rbp - 60], 0
+    jne .ax_try_note
+    ret
+.ax_try_acces:
+    ; execve gives EACCES for a directory as well as for a file without x
+    mov rdi, rbx
+    lea rsi, [stat_buf]
+    mov eax, SYS_STAT
+    syscall
+    test rax, rax
+    jnz .ax_try_denied
+    mov eax, [stat_buf + STAT_ST_MODE]
+    and eax, 0o170000
+    cmp eax, 0o040000
+    jne .ax_try_denied
+    mov edx, EISDIR
+    cmp dword [rbp - 60], 0
+    jne .ax_try_note
+    ret                             ; a directory in PATH is not a command
+.ax_try_denied:
     mov r15d, 1
     ret
 .ax_try_noexec:
-    cmp rax, -ENOEXEC               ; text file without #!: run it with sh
-    jne .ax_try_ret
+    ; text file without #!: run it with sh
     lea rdi, [ash_sh_argv]
     lea rax, [sh_path]
     mov [rdi], rax
@@ -905,7 +1431,6 @@ ash_exec_argv:
     lea rdx, [merged_envp]
     mov eax, SYS_EXECVE
     syscall
-.ax_try_ret:
     ret
 
 ; ----------------------------------------------------------------------------
@@ -1011,6 +1536,56 @@ ash_child_open:
     mov edi, 1
     mov eax, SYS_EXIT
     syscall
+
+; ----------------------------------------------------------------------------
+; ash_pipe_lift(rdi = int fds[2]) -> eax = 0, or -1 with both ends closed.
+; Moves an end that landed on fd 0, 1 or 2 (the shell was started with one of
+; them closed) up to fd 3 or above, keeping close-on-exec.
+; ----------------------------------------------------------------------------
+%define F_DUPFD_CLOEXEC     1030
+
+ash_pipe_lift:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    mov rbx, rdi
+    xor r12d, r12d
+.apl_loop:
+    mov edi, [rbx + r12 * 4]
+    cmp edi, 3
+    jae .apl_next
+    mov esi, F_DUPFD_CLOEXEC
+    mov edx, 3
+    mov eax, SYS_FCNTL
+    syscall
+    test rax, rax
+    js .apl_fail
+    mov edi, [rbx + r12 * 4]
+    mov [rbx + r12 * 4], eax
+    mov eax, SYS_CLOSE
+    syscall
+.apl_next:
+    inc r12d
+    cmp r12d, 2
+    jb .apl_loop
+    xor eax, eax
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+.apl_fail:
+    mov edi, [rbx]
+    mov eax, SYS_CLOSE
+    syscall
+    mov edi, [rbx + 4]
+    mov eax, SYS_CLOSE
+    syscall
+    mov eax, -1
+    pop r12
+    pop rbx
+    pop rbp
+    ret
 
 ; ----------------------------------------------------------------------------
 ; ash_close_pipes(edi = number of pipes) - close both ends of each pipe

@@ -1479,30 +1479,19 @@ ash_sh_run:
     je .sr_fork
     call restore_terminal
 .sr_fork:
+    call jc_prepare
     mov eax, SYS_FORK
     syscall
     test rax, rax
     js .sr_fail
     jz .sr_child
     mov ebx, eax
-.sr_wait:
     mov edi, ebx
-    lea rsi, [ash_sh_wstatus]
-    xor edx, edx
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
-    cmp rax, -EINTR
-    je .sr_wait
-    mov eax, [ash_sh_wstatus]
-    mov edx, eax
-    and edx, 0x7F
-    jz .sr_exited
-    lea eax, [rdx + 128]
-    jmp .sr_status
-.sr_exited:
-    shr eax, 8
-    and eax, 0xFF
+    mov esi, 1
+    call jc_parent_after_fork
+    mov edi, ebx
+    mov rsi, r12
+    call jc_wait_fg                 ; 128 + signal when killed, job control aware
 .sr_status:
     mov [last_exit_status], eax
     jmp .sr_done
@@ -1518,6 +1507,8 @@ ash_sh_run:
     pop rbp
     ret
 .sr_child:
+    mov edi, 1
+    call jc_child_setup
     lea rdi, [ash_shc_argv]
     mov [rdi + 16], r12
     call ash_exec_argv              ; does not return

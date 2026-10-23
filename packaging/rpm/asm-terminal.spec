@@ -41,6 +41,7 @@ install -Dm0644 icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg \
     %{buildroot}%{_datadir}/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg
 
 %files
+%license LICENSE
 %{_bindir}/asm-terminal
 %{_bindir}/asm-terminal-launch
 %{_datadir}/applications/asm-terminal.desktop

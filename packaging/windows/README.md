@@ -5,7 +5,7 @@ Two installers are provided:
 | File | What it does | Requires |
 |------|--------------|----------|
 | `install.bat`   | Copies `terminal.exe` to `%LOCALAPPDATA%\Programs\ASM-Terminal`, creates a Start Menu shortcut, registers `asm` under *App Paths*, and adds an entry to *Add/Remove Programs*. Unsigned. | Nothing — runs on any Windows 10/11 |
-| `installer.nsi` | NSIS script that produces `asm-terminal-2.0.0-windows-x86_64-setup.exe` — a proper GUI installer. | `makensis` (Windows or Linux) |
+| `installer.nsi` | NSIS script that produces `asm-terminal-<version>-windows-x86_64-setup.exe` — a proper GUI installer. | `makensis` (Windows or Linux) |
 
 ## Quick install (batch)
 
@@ -22,8 +22,8 @@ Two installers are provided:
 sudo apt-get install nsis
 cd packaging/windows
 cp ../../terminal.exe .                 # ensure exe sits next to installer.nsi
-makensis installer.nsi
-# produces asm-terminal-2.0.0-windows-x86_64-setup.exe
+makensis /DAPP_VERSION=x.y.z installer.nsi
+# produces asm-terminal-<version>-windows-x86_64-setup.exe
 ```
 
 ### On Windows
@@ -51,6 +51,8 @@ copy ..\..\terminal.exe .
 | Registry `HKCU\...\Uninstall\ASM-Terminal` | Add/Remove Programs entry |
 
 ## Notes on the Windows experience
+
+The Windows shell has a smaller feature set than the Linux one (no scripting, `;` / `&&`, persistent history, `~/.asmrc`, `ls`, `grep`, `update` and more; anything it does not know goes to `cmd.exe /c`). The main README lists what exists on each platform.
 
 `terminal.exe` is a Win32 console app. Double-clicking the Start Menu entry opens it in the default console host (Windows Terminal on recent Windows, conhost on older versions). The shortcut points directly at the binary, so it behaves exactly like cmd.exe or PowerShell shortcuts: a new console window containing the ASM shell.
 
