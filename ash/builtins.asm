@@ -53,7 +53,7 @@ section .data
     bi_msg_kill_esrch   db "kill: no such process: ", 0
     bi_msg_kill_eperm   db "kill: operation not permitted: ", 0
     bi_msg_hist_cleared db "History cleared.", 10, 0
-    bi_msg_hist_usage   db "Usage: history [-c]", 10, 0
+    bi_msg_hist_usage   db "Usage: history [-c | .]", 10, 0
     bi_msg_nl           db 10, 0
     bi_hist_gap         db "  ", 0
 
@@ -659,11 +659,18 @@ handler_history:
     push r14
 
     mov dword [last_exit_status], 0
+    xor ebx, ebx                    ; ebx = folder hash to list, 0 = all
     test rdi, rdi
     jz .hh_list
     call skip_spaces
     cmp byte [rax], 0
     je .hh_list
+    cmp word [rax], '.'             ; "history ." = commands run in this folder
+    jne .hh_not_here
+    call sm_cwd_hash
+    mov ebx, eax
+    jmp .hh_list
+.hh_not_here:
     mov rdi, rax
     lea rsi, [bi_s_dash_c]
     call str_icompare
@@ -688,6 +695,11 @@ handler_history:
     cmp r14d, r12d
     jge .hh_ret
     inc r14d
+    test ebx, ebx
+    jz .hh_print
+    cmp ebx, [hist_meta_hash + r13 * 4]
+    jne .hh_skip
+.hh_print:
     mov eax, r14d
     call print_number_5pad
     lea rdi, [bi_hist_gap]
@@ -695,7 +707,10 @@ handler_history:
     imul eax, r13d, HISTORY_ENTRY_SIZE
     lea rdi, [history_buf + rax]
     call print_cstring
+    mov eax, r13d
+    call sm_hist_fail_mark          ; "  [N]" after a command that failed
     call print_newline
+.hh_skip:
     inc r13d
     cmp r13d, HISTORY_COUNT
     jb .hh_loop
