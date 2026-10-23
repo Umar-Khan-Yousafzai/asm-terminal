@@ -10,7 +10,7 @@ bash packaging/linux/install.sh
 
 - A zenity dialog asks whether to install for the current user (`~/.local`, no sudo) or system-wide (`/usr/local`, pkexec/sudo).
 - Falls back to a text prompt if zenity is missing or `ASM_NOGUI=1` is set.
-- Afterwards, **ASM Terminal** appears in your application menu and `asm` is on your `PATH`.
+- Afterwards, **ASM Terminal** appears in your application menu and `asm-terminal` is on your `PATH`, and so is `asm` unless another program of that name is already installed (it is never overwritten; the installer says so).
 
 ### Headless / scripted install
 
@@ -30,7 +30,7 @@ bash packaging/linux/uninstall.sh
 | Path | Purpose |
 |------|---------|
 | `<prefix>/bin/asm-terminal` | The shell itself (static ELF64) |
-| `<prefix>/bin/asm` | Symlink to `asm-terminal` |
+| `<prefix>/bin/asm` | Symlink to `asm-terminal`, only when `asm` is free or already ours |
 | `<prefix>/bin/asm-terminal-launch` | Wrapper that opens a terminal emulator running `asm` |
 | `<prefix>/share/applications/asm-terminal.desktop` | Desktop entry (shows in app menu) |
 | `<prefix>/share/icons/hicolor/scalable/apps/asm-terminal.svg` | Icon (vector) |

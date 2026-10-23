@@ -2,8 +2,13 @@ dist/
 packaging/appimage/_tools/
 packaging/appimage/AppDir/
 packaging/debian/_stage/
+packaging/rpm/_rpmbuild/
+packaging/windows/asm-terminal-*-setup.exe
+packaging/windows/terminal.exe
 asm-terminal-*.AppImage
-terminal
-terminal.exe
+/terminal
+/terminal.exe
 terminal.obj
 terminal_linux.o
+__pycache__/
+*.pyc

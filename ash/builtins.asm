@@ -37,6 +37,12 @@ section .data
 
     bi_msg_exit_num     db "exit: numeric argument required", 10, 0
     bi_msg_builtin      db ": shell builtin", 10, 0
+    bi_msg_keyword      db ": shell keyword", 10, 0
+    ; Words the script engine runs itself (NUL-separated, list ends with 0)
+    bi_keywords         db "if", 0, "then", 0, "elif", 0, "else", 0, "fi", 0
+                        db "while", 0, "until", 0, "for", 0, "do", 0, "done", 0
+                        db "case", 0, "esac", 0, "{", 0, "}", 0, "!", 0
+                        db "break", 0, "continue", 0, "return", 0, 0
     bi_msg_alias        db ": alias for ", 0
     bi_msg_notfound     db ": not found", 10, 0
     bi_msg_which_usage  db "Usage: which NAME...", 10, 0
@@ -65,9 +71,16 @@ section .data
 
     ; Signal names for kill -NAME (NUL-separated name, then signal byte)
     bi_signals          db "HUP", 0, 1,  "INT", 0, 2,  "QUIT", 0, 3
-                        db "KILL", 0, 9, "USR1", 0, 10, "USR2", 0, 12
-                        db "TERM", 0, 15, "CONT", 0, 18, "STOP", 0, 19
-                        db "TSTP", 0, 20, 0
+                        db "ILL", 0, 4,  "TRAP", 0, 5, "ABRT", 0, 6
+                        db "BUS", 0, 7,  "FPE", 0, 8,  "KILL", 0, 9
+                        db "USR1", 0, 10, "SEGV", 0, 11, "USR2", 0, 12
+                        db "PIPE", 0, 13, "ALRM", 0, 14, "TERM", 0, 15
+                        db "STKFLT", 0, 16, "CHLD", 0, 17, "CONT", 0, 18
+                        db "STOP", 0, 19, "TSTP", 0, 20, "TTIN", 0, 21
+                        db "TTOU", 0, 22, "URG", 0, 23, "XCPU", 0, 24
+                        db "XFSZ", 0, 25, "VTALRM", 0, 26, "PROF", 0, 27
+                        db "WINCH", 0, 28, "IO", 0, 29, "PWR", 0, 30
+                        db "SYS", 0, 31, 0
 
 section .bss
     stats_t0            resq 2          ; timespec at command start
@@ -250,27 +263,66 @@ handler_exit_code:
     mov rdi, rax
     cmp byte [rdi], 0
     je .hec_plain
-    call bi_parse_uint              ; eax = value, edx = 1 if ok
+    call bi_parse_status            ; eax = status, edx = 1 if it was a number
+    mov ebx, eax
     test edx, edx
-    jz .hec_bad
-    movzx ebx, al                   ; status is 0-255
+    jnz .hec_go
+    lea rdi, [bi_msg_exit_num]      ; like sh: say so, then leave with status 2
+    call ash_write_err
+    mov ebx, 2
+.hec_go:
     call restore_terminal
     mov edi, ebx
     mov eax, SYS_EXIT
     syscall
 .hec_plain:
     call handler_exit               ; does not return
-.hec_bad:
-    lea rdi, [bi_msg_exit_num]
-    call print_cstring
-    mov dword [last_exit_status], 2
-    add rsp, 8
-    pop rbx
-    pop rbp
+
+; bi_parse_status(rdi = word) -> eax = status 0-255, edx = 1 if the word is a
+; number (optional sign, digits up to a blank or NUL). Like sh, -1 gives 255
+; and 256 gives 0; very long numbers wrap, which keeps the low 8 bits right.
+bi_parse_status:
+    xor eax, eax
+    xor r8d, r8d                    ; r8d = 1 for a leading '-'
+    xor edx, edx                    ; edx = digits seen
+    cmp byte [rdi], '-'
+    jne .ps_plus
+    mov r8d, 1
+    inc rdi
+    jmp .ps_loop
+.ps_plus:
+    cmp byte [rdi], '+'
+    jne .ps_loop
+    inc rdi
+.ps_loop:
+    movzx ecx, byte [rdi]
+    test cl, cl
+    jz .ps_end
+    cmp cl, ' '
+    je .ps_end
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .ps_bad
+    imul rax, rax, 10
+    add rax, rcx
+    mov edx, 1
+    inc rdi
+    jmp .ps_loop
+.ps_bad:
+    xor edx, edx
+    xor eax, eax
+    ret
+.ps_end:
+    test r8d, r8d
+    jz .ps_ret
+    neg eax
+.ps_ret:
+    and eax, 0xFF
     ret
 
 ; bi_parse_uint(rdi = string) -> eax = value, edx = 1 if the whole word
-; (up to space or NUL) was digits, rdi = pointer after the word
+; (up to space or NUL) was digits and fits in 31 bits, rdi = pointer after
+; the word. A longer number is refused, never wrapped around.
 bi_parse_uint:
     xor eax, eax
     xor edx, edx
@@ -284,8 +336,10 @@ bi_parse_uint:
     sub ecx, '0'
     cmp ecx, 9
     ja .pu_bad
-    imul eax, eax, 10
-    add eax, ecx
+    imul rax, rax, 10
+    add rax, rcx
+    cmp rax, 0x7FFFFFFF
+    ja .pu_bad
     mov edx, 1
     inc rdi
     jmp .pu_loop
@@ -397,6 +451,25 @@ handler_which:
     jmp .hw_alias
 
 .hw_path:
+    ; Words the script engine itself understands
+    lea rbx, [bi_keywords]
+.hw_kw:
+    cmp byte [rbx], 0
+    je .hw_search
+    lea rdi, [bi_word]
+    mov rsi, rbx
+    call str_icompare
+    test eax, eax
+    jz .hw_is_keyword
+.hw_kw_skip:
+    cmp byte [rbx], 0
+    je .hw_kw_past
+    inc rbx
+    jmp .hw_kw_skip
+.hw_kw_past:
+    inc rbx
+    jmp .hw_kw
+.hw_search:
     lea rdi, [bi_word]
     call bi_find_in_path            ; eax = 1 -> bi_path
     test eax, eax
@@ -410,6 +483,13 @@ handler_which:
     lea rdi, [bi_word]
     call print_cstring
     lea rdi, [bi_msg_builtin]
+    call print_cstring
+    jmp .hw_next
+
+.hw_is_keyword:
+    lea rdi, [bi_word]
+    call print_cstring
+    lea rdi, [bi_msg_keyword]
     call print_cstring
     jmp .hw_next
 
@@ -686,8 +766,12 @@ print_number_5pad:
     ret
 
 ; ----------------------------------------------------------------------------
-; kill [-SIGNAL] PID|%JOB ...
+; kill [-SIGNAL | -s SIGNAL] PID|%JOB ...      kill -l
+; A PID is a plain positive number. 0 and -1 (everybody) are refused on
+; purpose, and so is anything that does not fit in a pid.
 ; ----------------------------------------------------------------------------
+%define KILL_PID_MAX        4194304     ; the largest pid_max the kernel allows
+
 handler_kill:
     push rbp
     mov rbp, rsp
@@ -703,7 +787,7 @@ handler_kill:
     mov r13d, SIGTERM               ; r13d = signal
     xor r14d, r14d                  ; r14d = targets seen
 
-    ; Optional -SIGNAL (only as the first word)
+    ; Optional -SIGNAL, -s SIGNAL or -l (only as the first word)
     mov rdi, r12
     call bi_next_word
     test ecx, ecx
@@ -711,7 +795,24 @@ handler_kill:
     cmp byte [bi_word], '-'
     jne .hk_targets_first
     mov r12, rax
-    lea rdi, [bi_word + 1]
+    cmp byte [bi_word + 1], 'l'
+    jne .hk_not_list
+    cmp byte [bi_word + 2], 0
+    je .hk_list
+.hk_not_list:
+    lea rbx, [bi_word + 1]          ; rbx = the signal as written
+    cmp byte [bi_word + 1], 's'
+    jne .hk_signal
+    cmp byte [bi_word + 2], 0
+    jne .hk_signal
+    mov rdi, r12                    ; "-s NAME": the name is the next word
+    call bi_next_word
+    test ecx, ecx
+    jz .hk_usage
+    mov r12, rax
+    lea rbx, [bi_word]
+.hk_signal:
+    mov rdi, rbx
     call bi_signal_number           ; eax = signal or -1
     test eax, eax
     js .hk_badsig
@@ -729,6 +830,7 @@ handler_kill:
 
 .hk_one:
     inc r14d
+    xor ebx, ebx                    ; ebx = group to wake after the signal
     cmp byte [bi_word], '%'
     je .hk_job
     lea rdi, [bi_word]
@@ -737,6 +839,8 @@ handler_kill:
     jz .hk_badpid
     test eax, eax
     jz .hk_badpid
+    cmp eax, KILL_PID_MAX
+    ja .hk_badpid
     mov edi, eax
     jmp .hk_send
 
@@ -758,17 +862,40 @@ handler_kill:
     jz .hk_slot_next
     inc edx
     cmp edx, eax
-    je .hk_send
+    je .hk_job_found
 .hk_slot_next:
     inc ecx
     jmp .hk_slot
+
+.hk_job_found:
+    mov r8, [job_pgids + rcx*8]
+    test r8, r8
+    jz .hk_send                     ; shares the shell's group: signal the pid
+    mov edi, r8d
+    neg edi                         ; the whole job: every stage of a pipeline
+    cmp byte [job_state + rcx], JOB_STOPPED
+    jne .hk_send
+    cmp r13d, SIGTERM               ; a stopped job only acts on TERM or HUP
+    je .hk_wake                     ; once it runs again
+    cmp r13d, SIGHUP
+    jne .hk_send
+.hk_wake:
+    mov ebx, edi
 
 .hk_send:
     mov esi, r13d
     mov eax, SYS_KILL
     syscall
     test rax, rax
+    jnz .hk_failed
+    test ebx, ebx
     jz .hk_next
+    mov edi, ebx
+    mov esi, SIGCONT
+    mov eax, SYS_KILL
+    syscall
+    jmp .hk_next
+.hk_failed:
     lea rdi, [bi_msg_kill_esrch]
     cmp rax, -EPERM
     jne .hk_err
@@ -791,10 +918,31 @@ handler_kill:
 .hk_badsig:
     lea rdi, [bi_msg_kill_badsig]
     call print_cstring
-    lea rdi, [bi_word + 1]
+    mov rdi, rbx
     call print_cstring
     call print_newline
     mov dword [last_exit_status], 1
+    jmp .hk_ret
+
+.hk_list:
+    lea rbx, [bi_signals]
+.hk_list_next:
+    cmp byte [rbx], 0
+    je .hk_list_end
+    mov rdi, rbx
+    call print_cstring
+    lea rdi, [str_space]
+    call print_cstring
+.hk_list_skip:
+    cmp byte [rbx], 0               ; to the NUL after the name...
+    je .hk_list_past
+    inc rbx
+    jmp .hk_list_skip
+.hk_list_past:
+    add rbx, 2                      ; ...then past it and the signal byte
+    jmp .hk_list_next
+.hk_list_end:
+    call print_newline
     jmp .hk_ret
 
 .hk_end:
