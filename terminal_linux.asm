@@ -790,7 +790,8 @@ section .data
     jobs_pid_label      db "PID ", 0
     jobs_running_msg    db " Running  ", 0
     jobs_done_msg       db " Done     ", 0
-    jobs_fg_noarg_msg   db "Usage: fg <job_number>", 10, 0
+    jobs_no_current_fg  db "fg: no current job.", 10, 0
+    jobs_no_current_bg  db "bg: no current job.", 10, 0
     jobs_fg_invalid_msg db "No such job.", 10, 0
     jobs_bg_started_msg db "[bg] PID ", 0
     jobs_full_msg       db "Job table full, running in foreground.", 10, 0
@@ -7292,6 +7293,14 @@ handler_set:
 .hs_assign:
     ; Split at '='
     mov byte [r12], 0              ; null-terminate the name
+    mov rdi, rbx
+    call env_valid_name
+    test eax, eax
+    jnz .hs_name_ok
+    lea rdi, [err_env_name]         ; "1X=2", "A-B=1", "=x" and the like
+    call report_error_cstr
+    jmp .hs_done
+.hs_name_ok:
     lea rsi, [r12 + 1]            ; rsi = value (after '=')
     mov rdi, rbx                   ; rdi = name
     ; If value is empty, still set it
@@ -8878,22 +8887,92 @@ env_slot_exportable:
 handler_unset:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
+    push rbx
+    push r12
 
-    test rdi, rdi
+    mov rbx, rdi
+    test rbx, rbx
     jz .hun_usage
-    cmp byte [rdi], 0
-    je .hun_usage
+    xor r12d, r12d                  ; r12d = names seen
 
-    call unsetenv_internal
-    jmp .hun_done
+.hun_skip:
+    cmp byte [rbx], ' '
+    jne .hun_word
+    inc rbx
+    jmp .hun_skip
+.hun_word:
+    cmp byte [rbx], 0
+    je .hun_end
+    mov rdi, rbx                    ; rdi = start of this name
+.hun_scan:
+    cmp byte [rbx], 0
+    je .hun_have
+    cmp byte [rbx], ' '
+    je .hun_cut
+    inc rbx
+    jmp .hun_scan
+.hun_cut:
+    mov byte [rbx], 0
+    inc rbx
+.hun_have:
+    inc r12d
+    call env_valid_name             ; keeps rdi
+    test eax, eax
+    jz .hun_bad
+    call unsetenv_internal          ; reports a full table itself
+    jmp .hun_skip
+.hun_bad:
+    lea rdi, [err_env_name]
+    call report_error_cstr
+    jmp .hun_skip
 
+.hun_end:
+    test r12d, r12d
+    jnz .hun_done
 .hun_usage:
     lea rdi, [err_unset_usage]
     mov esi, err_unset_usage_len
     call report_error_len
 .hun_done:
-    leave
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; env_valid_name - rdi = name. eax = 1 if it is a shell identifier (letters,
+; digits and '_', not starting with a digit), else 0. Keeps rdi; clobbers
+; ecx, edx.
+env_valid_name:
+    xor ecx, ecx
+.evn_loop:
+    movzx eax, byte [rdi + rcx]
+    test al, al
+    jz .evn_end
+    cmp al, '_'
+    je .evn_next
+    cmp al, '0'
+    jb .evn_bad
+    cmp al, '9'
+    jbe .evn_digit
+    mov edx, eax
+    or edx, 0x20
+    sub edx, 'a'
+    cmp edx, 25
+    ja .evn_bad
+    jmp .evn_next
+.evn_digit:
+    test ecx, ecx
+    jz .evn_bad                     ; no leading digit
+.evn_next:
+    inc ecx
+    jmp .evn_loop
+.evn_end:
+    test ecx, ecx
+    jz .evn_bad
+    mov eax, 1
+    ret
+.evn_bad:
+    xor eax, eax
     ret
 
 ; ============================================================================
@@ -12637,6 +12716,23 @@ job_find:
     mov eax, -1
     ret
 
+; job_last_number() -> eax = number of the most recent job as 'jobs' shows it,
+; 0 when there are no jobs. fg and bg without an argument use it.
+job_last_number:
+    xor eax, eax
+    xor ecx, ecx
+.jln_loop:
+    cmp ecx, JOB_MAX
+    jge .jln_done
+    cmp qword [job_pids + rcx*8], 0
+    je .jln_next
+    inc eax
+.jln_next:
+    inc ecx
+    jmp .jln_loop
+.jln_done:
+    ret
+
 ; job_parse_number(rdi = text) -> eax = job number (1-255), 0 if not one
 job_parse_number:
     xor eax, eax
@@ -12879,6 +12975,7 @@ handler_fg:
     call job_parse_number
     test eax, eax
     jz .hfg_invalid
+.hfg_have_number:
     mov edi, eax
     call job_find
     test eax, eax
@@ -12977,8 +13074,12 @@ handler_fg:
     jmp .hfg_done
 
 .hfg_noarg:
-    lea rdi, [jobs_fg_noarg_msg]
-    call print_cstring
+    ; No argument: the most recent job
+    call job_last_number
+    test eax, eax
+    jnz .hfg_have_number
+    lea rdi, [jobs_no_current_fg]
+    call report_error_cstr
     jmp .hfg_done
 
 .hfg_invalid:
@@ -13013,7 +13114,8 @@ handler_bg:
     je .hbg_noarg
     call job_parse_number
     test eax, eax
-    jz .hbg_noarg
+    jz .hbg_usage
+.hbg_have_number:
     mov r13d, eax                   ; r13d = job number
     mov edi, eax
     call job_find
@@ -13049,9 +13151,18 @@ handler_bg:
     jmp .hbg_done
 
 .hbg_noarg:
+    ; No argument: the most recent job
+    call job_last_number
+    test eax, eax
+    jnz .hbg_have_number
+    lea rdi, [jobs_no_current_bg]
+    call report_error_cstr
+    jmp .hbg_done
+
+.hbg_usage:
     lea rdi, [bg_noarg_msg]
     mov esi, bg_noarg_len
-    call print_string_len
+    call report_error_len
 
 .hbg_done:
     add rsp, 8
