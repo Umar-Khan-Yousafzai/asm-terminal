@@ -9,11 +9,11 @@ A fully-featured terminal/shell written entirely in x86-64 assembly (NASM). Cros
 ```
 asm-terminal/
   terminal.asm          # Windows version (about 2,700 lines, a smaller command set than Linux)
-  terminal_linux.asm    # Linux version (about 9,400 lines, plus about 9,000 in ash/)
+  terminal_linux.asm    # Linux version (about 13,300 lines, plus about 14,300 in ash/)
   ash/ash_exec.asm      # ASH native executor (%included by terminal_linux.asm)
   ash/builtins.asm      # builtins that run inside ASH: exit, true/false, which, history, kill, ...
   ash/script.asm        # ASH script engine: if/while/for, && ||, test, $((...)), functions
-  ash/tools.asm         # bench, undo (+ safe del/move/copy, ~/.asm_trash), trace, sandbox
+  ash/tools.asm         # bench, undo/trash (+ safe del/move/copy, ~/.asm_trash with .journal), trace, sandbox
   ash/highlight.asm     # live command colors (Dark+ palette, danger list for Linux + Windows)
   ash/update.asm        # update / update install, background update check (curl + sha256sum)
   version.inc           # the one place the version is written
@@ -24,7 +24,7 @@ asm-terminal/
   tests/                # tests/run_tests.sh (make test), tests/cases/*.sh|py, pty helper
   packaging/            # .deb, .rpm, AppImage, install scripts, Windows installers, release notes
   .github/workflows/    # ci.yml (build + tests), release.yml (automatic release)
-  terminal              # build output, not committed: Linux binary (about 170 KB, static ELF64)
+  terminal              # build output, not committed: Linux binary (about 250 KB with symbols, static ELF64)
   terminal.exe          # build output, not committed: Windows binary
 ```
 
@@ -52,8 +52,9 @@ build.bat               # Requires: NASM, MinGW ld
 - **Callee-saved registers**: rbx, rbp, r12-r15
 - **Terminal control**: termios via ioctl (TCGETS/TCSETS) for raw mode
 - **Colors/cursor**: ANSI escape sequences
-- **External commands**: ASH (`ash/ash_exec.asm`) parses the line and runs commands/pipelines natively (PATH lookup, pipe2, dup2, fork, execve). Control flow (`if`, `while`, `for`, `&&`, `||`) runs in `ash/script.asm`. Lines it does not understand yet (globs, `$(...)`, here-docs, `&`) fall back to fork + execve(/bin/sh -c)
-- **Signals**: sigaction for SIGINT (Ctrl+C)
+- **External commands**: ASH (`ash/ash_exec.asm`) parses the line and runs commands/pipelines natively (PATH lookup, pipe2, dup2, fork, execve). Control flow (`if`, `while`, `for`, `&&`, `||`) runs in `ash/script.asm`. `$(...)`, backticks and builtins in pipelines run natively. Lines it does not understand yet (globs, `case`, a loop piped into another command, here-docs) fall back to fork + execve(/bin/sh -c). Expanded values are encoded with a private marker byte (0x01 + byte) by `expand_env_vars` so every scanner treats them as plain text; consumers decode them (`ash_sh_decode` for the sh fallback). Never re-scan expanded text for syntax
+- **Signals**: sigaction for SIGINT (Ctrl+C), SIGWINCH, SIGTERM/SIGHUP/SIGQUIT/SIGSEGV (restore the terminal, alternate stack). SIGTSTP/SIGTTIN/SIGTTOU are ignored in the shell. **Job control** (`jc_*` helpers): each foreground pipeline and background job gets its own process group and the tty (`tcsetpgrp`); waits use WUNTRACED; Ctrl+Z makes a Stopped job. ISIG is turned on while a command line runs so Ctrl+C reaches builtin loops
+- **Terminal state**: `raw_active` and `interactive_mode` guard `setup_raw_mode`/`restore_terminal`, which are no-ops when stdin/stdout are not a terminal. Terminal-only output goes through `term_write` (fd 1, never a redirect target). The prompt is built once per command into `prompt_buf` and redrawn with one write per key
 - **Update**: `ash/update.asm` runs `curl` and `sha256sum` (argv arrays, never a shell string). The startup check calls api.github.com in a detached process at most once a day; opt out with `ASM_NO_UPDATE_CHECK=1` in the environment or `set ASM_NO_UPDATE_CHECK=1` in `~/.asmrc` (empty or `0` does not opt out). `update install` verifies the binary against the release's `SHA256SUMS` and never installs an older version. That file is fetched from the same release, so it detects corruption, not a hostile release
 - **Entry point**: `_start` → parses kernel stack for envp → `call main`
 
@@ -85,7 +86,7 @@ build.bat               # Requires: NASM, MinGW ld
 
 ### Environment
 - `getenv_internal(rdi=name) -> rax=value_ptr or 0` — checks overlay then envp
-- `setenv_internal(rdi=name, rsi=value)` — stores in overlay table
+- `setenv_internal(rdi=name, rsi=value)` — stores in overlay table; returns eax=0, or -1 after printing an error (table full, value too long). Names are case-sensitive
 
 ### Command Dispatch
 - `dispatch_command()` — expand env vars, check aliases, parse redirection, match against exact/prefix tables, fallback to execute_external
@@ -101,12 +102,13 @@ build.bat               # Requires: NASM, MinGW ld
 - `pushd <path>` / `popd` — directory stack
 
 ### Files
-- `ls [-la] [dir]` — colored listing with long format support
+- `ls [-la] [dir...]` — sorted listing, symlinks shown, colors only when stdout is a terminal
 - `dir [path]` — classic directory listing with sizes
 - `cat <file>` / `type <file>` — display file contents
-- `copy <src> <dst>` — copy file
-- `move <src> <dst>` / `rename <src> <dst>` — move/rename
-- `del <file>` — delete file
+- `copy <src> <dst>` — copy file (keeps permissions, refuses src == dst and folders)
+- `move <src> <dst>` / `rename <src> <dst>` — move/rename (works across filesystems and for folders)
+- `del <file>` — delete file; `del`/`move`/`copy` keep the old data in `~/.asm_trash`, refuse when the trash is unusable, `-f` overrides
+- `trash` / `trash empty` — list or empty the trash (cap 512 MiB / 30 days); `undo` reverses the last operation, also after a restart
 - `mkdir <dir>` / `rmdir <dir>` — create/remove directory
 - `grep <pattern> <file>` — search with highlighted matches
 
@@ -122,7 +124,7 @@ build.bat               # Requires: NASM, MinGW ld
 
 ### System
 - `ver` — version info
-- `date` / `time` — formatted: `Fri Apr  3 08:14:01 PM PKT 2026`
+- `date` / `time` — formatted: `Fri Apr  3 08:14:01 PM PKT 2026` (zone from `ASM_TZ`, a simple POSIX `TZ`, else the PKT build default)
 - `uptime` — system uptime from /proc/uptime
 - `free` — memory info from /proc/meminfo
 - `calc <expr>` — integer math (`calc 10 + 5 * 2`)
@@ -131,32 +133,33 @@ build.bat               # Requires: NASM, MinGW ld
 - `exit [N]`: exit terminal
 - `about`: developer credit
 - `update` / `update install`: check for, and install, a newer release (Linux)
-- `true` / `false` / `clear` / `which NAME` / `history [-c]` / `kill [-SIG] PID|%JOB`: Linux builtins
-- `bench`, `undo`, `trace`, `sandbox`: ASH tools (`ash/tools.asm`, Linux)
+- `true` / `false` / `clear` / `which NAME` / `history [-c]` / `kill [-SIG|-s NAME] PID|%JOB` / `kill -l`: Linux builtins (`kill` refuses pid 0 and -1)
+- `bench`, `undo`, `trash`, `trace`, `sandbox`: ASH tools (`ash/tools.asm`, Linux). `sandbox` denies sockets, io_uring, ptrace, TIOCSTI, chmod/chown/xattr/truncate and mount/namespace calls with seccomp and limits writes with Landlock (`/tmp`, cwd with `-w`); it fails closed (status 126) unless `-b`
+- Builtin errors go to stderr and set `$?`
 
 ### Customization
 - `alias <name>=<cmd>` — create aliases (e.g., `alias ll=ls -la`)
 - `theme [name]` — switch theme: `default`, `minimal`, `classic`
 
 ### Job Control
-- `<cmd> &` — run in background
-- `jobs` — list background jobs
-- `fg <n>` — bring job to foreground
+- `<cmd> &` — run in background (own process group)
+- `jobs` — list background and stopped jobs
+- `fg <n>` / `bg <n>` — resume a job in the foreground or background; Ctrl+Z stops the foreground job
 
 ## Shell Features
-- **Compound commands**: `cmd1 ; cmd2` and `cmd1 && cmd2`
-- **I/O redirection**: `>`, `>>`, `<`
+- **Compound commands**: `cmd1 ; cmd2`, `cmd1 && cmd2`, `cmd1 || cmd2`
+- **I/O redirection**: `>`, `>>`, `<`, `N>`, `>&N`, `&>`, applied in the order written
 - **Piping**: `cmd1 | cmd2` (native pipes in ASH; `/bin/sh` only for syntax ASH does not handle)
 - **Environment variable expansion**: `$VAR` and `${VAR}`
 - **Tab completion**: file/directory name completion with cycling
 - **Command history**: Up/Down arrows, 500-entry circular buffer
-- **Persistent history**: `~/.asm_history` (saved across sessions)
+- **Persistent history**: `~/.asm_history` (mode 0600, newest 256 KiB loaded; not written by scripts)
 - **Reverse search**: Ctrl+R (incremental backward search)
 - **Line editing**: Backspace, Delete, Left/Right, Home/End
-- **Keyboard shortcuts**: Ctrl+L (clear), Ctrl+W (delete word), Ctrl+U (clear line)
-- **Config file**: `~/.asmrc` executed at startup
-- **Autoexec**: `autoexec.txt` in binary directory
-- **Syntax highlighting**: command word colored as you type (`ash/highlight.asm`): teal = known/on PATH, blue = help, gray = unknown, red = destroys data
+- **Keyboard shortcuts**: Ctrl+L (clear), Ctrl+W (delete word), Ctrl+U (clear line), Ctrl+D (exit on an empty line), Ctrl+Z (stop the running job)
+- **Config file**: `~/.asmrc` executed at startup (files are read whole, up to 64 KiB)
+- **Autoexec**: `autoexec.txt` in binary directory (ignored unless owned by the user or root and not world-writable)
+- **Syntax highlighting**: command word colored as you type (`ash/highlight.asm`): teal = known/on PATH, blue = help, gray = unknown, red = destroys data; matching is by whole word, `NO_COLOR`/`TERM=dumb` turn colors off
 - **Prompt**: `user@host:path$` format with theme colors
 - **Wildcard expansion**: `*` and `?` handled via /bin/sh for external commands
 
@@ -168,19 +171,20 @@ build.bat               # Requires: NASM, MinGW ld
 - Day/month name tables (`dow_names`, `month_names`), color mapping (`win_to_ansi`)
 - Theme tables (3 presets, 64 bytes each)
 
-### .bss Section (about 1.1 MB total; zero-filled, not stored in the ELF file)
+### .bss Section (about 20 MB of address space, mostly the 16 MB script arena; zero-filled, not stored in the ELF file, only touched pages cost memory)
 - Terminal state: `orig_termios`, `raw_termios` (60 bytes each)
 - Line editor: `input_buf`, `line_buf` (512 each), `line_len`, `line_cursor`
 - History: `history_buf` (250KB), circular buffer with 500 entries; `history_read_buf` (256KB) for loading the file
 - ASH, script and tool buffers (`ash/*.asm`): the rest
 - Aliases: `alias_table` (10KB), 32 entries
 - Directory stack: `dir_stack` (64KB), 16 entries
-- Environment overlay: `env_overlay` (32KB), 64 entries
-- Tab completion: `tab_dirent_buf` (8KB), prefix/match tracking
-- Job table: `job_pids` (8 slots), `job_cmds` (1KB)
+- Environment overlay: `env_overlay` (128KB), 256 entries; `merged_envp` hands up to 8191 variables to a child
+- Script engine: `ash_arena` (16MB, a stack of script text, nodes and `for` lists), `ash_pending` (512KB)
+- Tab completion rescans the directory on each press (no persistent dirent buffer)
+- Job table: `job_pids`, `job_pgids`, `job_state` (8 slots), `job_cmds`
 
 ## Timezone
-Currently hardcoded to PKT (UTC+5) via `%define TZ_OFFSET_SECONDS 18000`. Change this value and rebuild for different timezone.
+`ASM_TZ` (UTC offset in seconds) or a simple POSIX `TZ` (`EST5`, `<+0530>-5:30`) wins; otherwise the build default PKT (UTC+5) from `%define TZ_OFFSET_SECONDS 18000`. Zone names and DST are not supported.
 
 ## Key Syscalls Used (partial list)
 ```
