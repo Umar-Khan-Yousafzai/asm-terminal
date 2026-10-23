@@ -176,8 +176,9 @@ default rel
 %define AT_FDCWD            -100
 %define S_IFDIR             0o040000
 
-; Timezone offset: PKT = UTC+5 = 18000 seconds
+; Timezone used when neither $ASM_TZ nor $TZ is usable: PKT = UTC+5 = 18000 seconds
 %define TZ_OFFSET_SECONDS   18000
+%define TZ_NAME_DEFAULT     "PKT"
 
 ; ============================================================================
 ; ANSI escape sequence strings
@@ -238,7 +239,7 @@ section .data
                     db "                    cd /home        go to /home", 10
                     db "                    cd ..           go up one level", 10
                     db "                    cd -            go to previous dir", 10
-                    db "                    cd              show current dir", 10
+                    db "                    cd              go to $HOME", 10
                     db "    pwd             Print working directory", 10
                     db "                    pwd", 10
                     db "    pushd <path>    Push dir onto stack and cd", 10
@@ -283,6 +284,8 @@ section .data
                     db "                    set HOME", 10
                     db "    set <var>=<val> Set environment variable", 10
                     db "                    set EDITOR=vim", 10
+                    db "    export V=val    Same as set V=val", 10
+                    db "    unset <var>     Remove a variable (also an inherited one)", 10
                     db "    whoami          Display current username", 10
                     db "                    whoami", 10
                     db 10
@@ -305,6 +308,7 @@ section .data
                     db "    update          Check for a new version ('update install' installs it)", 10
                     db "    date            Show current date and time", 10
                     db "                    date   -> Fri Apr  3 08:14:01 PM PKT 2026", 10
+                    db "                    zone: ASM_TZ=<seconds east of UTC>, or TZ=EST5", 10
                     db "    time            Same as date", 10
                     db "    uptime          Show system uptime", 10
                     db "                    uptime -> up 2 days, 05:30:12", 10
@@ -337,6 +341,7 @@ section .data
                     db "                    alias ll=ls -la", 10
                     db "                    alias gs=git status", 10
                     db "                    alias          list all aliases", 10
+                    db "    unalias <name>  Remove an alias", 10
                     db "    theme [name]    Switch color theme", 10
                     db "                    theme           list themes", 10
                     db "                    theme default   bold colors", 10
@@ -833,7 +838,6 @@ section .data
                     db "Sep", 0, "Oct", 0, "Nov", 0, "Dec", 0
 
     ; Timezone and AM/PM strings
-    str_pkt         db " PKT ", 0
     str_am          db "AM", 0
     str_pm          db "PM", 0
 
@@ -926,8 +930,6 @@ section .bss
     tab_find_handle     resq 1      ; alias for compatibility
     tab_dirent_buf      resb 8192
     ls_perms_buf        resb 16            ; rendered "drwxr-xr-x" + NUL
-    tz_offset_cache     resq 1             ; cached TZ offset (seconds)
-    tz_offset_resolved  resb 1             ; 0 = unresolved, 1 = resolved
     interactive_mode    resb 1             ; 1 = stdin & stdout are tty
     color_enabled       resb 1             ; 1 = ANSI/color permitted
     termios_probe_buf   resb 60             ; scratch for ioctl probe
@@ -3705,7 +3707,7 @@ handler_date:
     mov eax, SYS_CLOCK_GETTIME
     syscall
 
-    ; Add timezone offset (configurable via $ASM_TZ, default PKT UTC+5)
+    ; Add the timezone offset ($ASM_TZ, $TZ or the build default)
     call resolve_tz_offset
     mov rdi, [timespec_buf]
     add rdi, rax
@@ -3795,8 +3797,12 @@ handler_date:
 .hd_ampm_done:
     call print_cstring
 
-    ; 6. " PKT "
-    lea rdi, [str_pkt]
+    ; 6. Zone name (" PKT ", " +0530 ", " EST ")
+    lea rdi, [str_space]
+    call print_cstring
+    lea rdi, [tz_label]
+    call print_cstring
+    lea rdi, [str_space]
     call print_cstring
 
     ; 7. Year
@@ -3811,75 +3817,253 @@ handler_date:
     ret
 
 ; ============================================================================
-; resolve_tz_offset — return tz offset in seconds (rax)
-; Reads $ASM_TZ once, caches result. Accepts decimal integer with optional
-; leading '-'. Falls back to TZ_OFFSET_SECONDS if unset or unparseable.
+; resolve_tz_offset - return the offset from UTC in seconds (rax) and leave the
+; zone name to print in tz_label. Looked up on every call, so changing the
+; variables takes effect at once. Order:
+;   $ASM_TZ  seconds east of UTC (signed integer, nothing else allowed);
+;            the name shown is the offset as "+HHMM"
+;   $TZ      "NAME", "NAMEh[:mm[:ss]]" or "<NAME>h[:mm[:ss]]" with the POSIX
+;            sign (positive = west of UTC); zone files such as
+;            "Europe/Paris" and daylight saving rules are not understood
+;   build default (TZ_OFFSET_SECONDS, shown as TZ_NAME_DEFAULT)
+; A value that cannot be read is skipped, never half-used.
 ; ============================================================================
+%define TZ_MAX_SECONDS  93600           ; 26 hours, beyond any real zone
+section .data
+    tz_env_tz_str   db "TZ", 0
+    tz_default_name db TZ_NAME_DEFAULT, 0
+section .bss
+    tz_label        resb 24
+section .text
 resolve_tz_offset:
-    cmp byte [tz_offset_resolved], 0
-    jne .rto_cached
-
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 8
+    push r12
 
     lea rdi, [tz_env_name_str]
     call getenv_internal
     test rax, rax
+    jz .rto_posix
+    mov rdi, rax
+    call tz_parse_seconds
+    test edx, edx
+    jnz .rto_posix
+    call tz_numeric_label
+    jmp .rto_ret
+
+.rto_posix:
+    lea rdi, [tz_env_tz_str]
+    call getenv_internal
+    test rax, rax
+    jz .rto_default
+    mov rsi, rax
+    lea rdi, [tz_label]
+    xor ecx, ecx                    ; ecx = length of the name
+    cmp byte [rsi], '<'
+    je .rto_quoted
+
+    ; Plain name: at least three letters
+.rto_name:
+    movzx eax, byte [rsi]
+    mov edx, eax
+    or edx, 0x20
+    sub edx, 'a'
+    cmp edx, 25
+    ja .rto_name_end
+    cmp ecx, 15
+    jae .rto_default
+    mov [rdi + rcx], al
+    inc ecx
+    inc rsi
+    jmp .rto_name
+.rto_name_end:
+    cmp ecx, 3
+    jb .rto_default
+    jmp .rto_after_name
+
+.rto_quoted:
+    inc rsi
+.rto_qloop:
+    movzx eax, byte [rsi]
+    cmp al, '>'
+    je .rto_qend
+    test al, al
+    jz .rto_default
+    cmp ecx, 15
+    jae .rto_default
+    mov [rdi + rcx], al
+    inc ecx
+    inc rsi
+    jmp .rto_qloop
+.rto_qend:
+    inc rsi
+    test ecx, ecx
     jz .rto_default
 
-    ; Parse signed integer from [rax]
-    mov rbx, rax
-    xor r8d, r8d                    ; sign flag (0 = +, 1 = -)
-    cmp byte [rbx], '-'
-    jne .rto_plus
-    mov r8d, 1
-    inc rbx
-    jmp .rto_parse
-.rto_plus:
-    cmp byte [rbx], '+'
-    jne .rto_parse
-    inc rbx
-.rto_parse:
-    xor rax, rax
-    xor r9d, r9d                    ; digits seen
-.rto_digit:
-    movzx ecx, byte [rbx]
-    cmp cl, '0'
-    jb .rto_done_parse
-    cmp cl, '9'
-    ja .rto_done_parse
-    sub cl, '0'
-    imul rax, rax, 10
-    add rax, rcx
-    inc rbx
-    inc r9d
-    jmp .rto_digit
-.rto_done_parse:
-    test r9d, r9d
-    jz .rto_default
-    test r8d, r8d
-    jz .rto_store
+.rto_after_name:
+    mov byte [rdi + rcx], 0
+    xor eax, eax
+    cmp byte [rsi], 0
+    je .rto_ret                     ; a bare name means UTC
+    mov r12d, 1                     ; r12d = 1 while the offset is west of UTC
+    cmp byte [rsi], '-'
+    jne .rto_notminus
+    xor r12d, r12d
+    inc rsi
+    jmp .rto_hours
+.rto_notminus:
+    cmp byte [rsi], '+'
+    jne .rto_hours
+    inc rsi
+.rto_hours:
+    call tz_num2
+    test edx, edx
+    jnz .rto_default
+    cmp eax, 24
+    ja .rto_default
+    imul ebx, eax, 3600
+    cmp byte [rsi], ':'
+    jne .rto_tail
+    inc rsi
+    call tz_num2
+    test edx, edx
+    jnz .rto_default
+    cmp eax, 59
+    ja .rto_default
+    imul eax, eax, 60
+    add ebx, eax
+    cmp byte [rsi], ':'
+    jne .rto_tail
+    inc rsi
+    call tz_num2
+    test edx, edx
+    jnz .rto_default
+    cmp eax, 59
+    ja .rto_default
+    add ebx, eax
+.rto_tail:
+    cmp byte [rsi], 0
+    jne .rto_default                ; daylight saving part or other text
+    mov eax, ebx
+    test r12d, r12d
+    jz .rto_ret
     neg rax
-.rto_store:
-    mov [tz_offset_cache], rax
-    mov byte [tz_offset_resolved], 1
-    add rsp, 8
+    jmp .rto_ret
+
+.rto_default:
+    lea rdi, [tz_label]
+    lea rsi, [tz_default_name]
+    call str_copy
+    mov rax, TZ_OFFSET_SECONDS
+
+.rto_ret:
+    pop r12
     pop rbx
     pop rbp
     ret
 
-.rto_default:
-    mov qword [tz_offset_cache], TZ_OFFSET_SECONDS
-    mov byte [tz_offset_resolved], 1
-    add rsp, 8
-    pop rbx
-    pop rbp
-    ; fall through
+; tz_parse_seconds - rdi = text "[+-]digits". Returns rax = value and edx = 0,
+; or edx = 1 when the text is empty, has other characters or is out of range.
+tz_parse_seconds:
+    xor eax, eax
+    xor r8d, r8d                    ; r8d = 1 for a minus sign
+    xor r9d, r9d                    ; r9d = digits seen
+    cmp byte [rdi], '-'
+    jne .tps_plus
+    mov r8d, 1
+    inc rdi
+    jmp .tps_digit
+.tps_plus:
+    cmp byte [rdi], '+'
+    jne .tps_digit
+    inc rdi
+.tps_digit:
+    movzx ecx, byte [rdi]
+    test ecx, ecx
+    jz .tps_end
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .tps_bad
+    inc r9d
+    cmp r9d, 7
+    ja .tps_bad
+    imul rax, rax, 10
+    add rax, rcx
+    inc rdi
+    jmp .tps_digit
+.tps_end:
+    test r9d, r9d
+    jz .tps_bad
+    cmp rax, TZ_MAX_SECONDS
+    ja .tps_bad
+    test r8d, r8d
+    jz .tps_ok
+    neg rax
+.tps_ok:
+    xor edx, edx
+    ret
+.tps_bad:
+    mov edx, 1
+    ret
 
-.rto_cached:
-    mov rax, [tz_offset_cache]
+; tz_num2 - rsi = text. Reads one or two digits into eax and advances rsi.
+; edx = 0 on success, 1 if no digit is there. Changes only eax, ecx, edx, rsi.
+tz_num2:
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    cmp eax, 9
+    ja .tn_bad
+    inc rsi
+    movzx ecx, byte [rsi]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .tn_ok
+    imul eax, eax, 10
+    add eax, ecx
+    inc rsi
+.tn_ok:
+    xor edx, edx
+    ret
+.tn_bad:
+    mov edx, 1
+    ret
+
+; tz_numeric_label - rax = offset in seconds (|rax| <= TZ_MAX_SECONDS). Writes
+; "+HHMM" to tz_label and leaves rax unchanged.
+tz_numeric_label:
+    push rax
+    lea rdi, [tz_label]
+    mov byte [rdi], '+'
+    test rax, rax
+    jns .tnl_abs
+    mov byte [rdi], '-'
+    neg rax
+.tnl_abs:
+    xor edx, edx
+    mov ecx, 3600
+    div ecx                         ; eax = hours, edx = seconds left
+    mov r8d, edx
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rdi + 1], al
+    add dl, '0'
+    mov [rdi + 2], dl
+    mov eax, r8d
+    xor edx, edx
+    mov ecx, 60
+    div ecx                         ; eax = minutes
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rdi + 3], al
+    add dl, '0'
+    mov [rdi + 4], dl
+    mov byte [rdi + 5], 0
+    pop rax
     ret
 
 ; ---------- handler_time ----------
@@ -3893,7 +4077,6 @@ handler_echo:
     mov rbp, rsp
     push rbx
     push r12
-    sub rsp, 8
 
     test rdi, rdi
     jz .he_empty
@@ -4021,7 +4204,6 @@ handler_echo:
 .he_empty:
     call print_newline
 .he_done:
-    add rsp, 8
     pop r12
     pop rbx
     leave
@@ -7300,45 +7482,6 @@ run_asmrc:
 ; ============================================================================
 ; ==================== BATCH 2 FUNCTIONS ====================================
 ; ============================================================================
-
-; ============================================================================
-; check_wildcard_in_args - Scan input_buf for '*' or '?' characters
-; We skip the first word (the command name) and only check arguments.
-; Returns: eax = 1 if wildcards found in args, 0 if not.
-; ============================================================================
-check_wildcard_in_args:
-    lea rdi, [input_buf]
-
-    ; Skip first word (the command itself)
-.cwa_skip_cmd:
-    movzx eax, byte [rdi]
-    test al, al
-    jz .cwa_not_found               ; no args at all
-    cmp al, ' '
-    je .cwa_in_args
-    inc rdi
-    jmp .cwa_skip_cmd
-
-.cwa_in_args:
-    ; Now scan the argument portion
-    movzx eax, byte [rdi]
-    test al, al
-    jz .cwa_not_found
-    cmp al, '*'
-    je .cwa_found
-    cmp al, '?'
-    je .cwa_found
-    inc rdi
-    jmp .cwa_in_args
-
-.cwa_found:
-    mov eax, 1
-    ret
-
-.cwa_not_found:
-    xor eax, eax
-    ret
-
 
 ; ============================================================================
 ; handler_source - Execute commands from a user-specified file
