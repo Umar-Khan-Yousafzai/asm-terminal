@@ -2965,10 +2965,17 @@ dispatch_command:
     ; expansion so "$?" still sees the previous command's status.
     mov dword [last_exit_status], 0
 
-    ; Check aliases
+    ; Check aliases. The alias text is syntax, so its own $VAR and $( ) are
+    ; expanded now; the part that came from the line is left as it was.
     call check_alias
+    cmp eax, 1
+    je .dc_done
+    cmp eax, 2
+    jne .dc_alias_done
+    call expand_env_vars
     test eax, eax
     jnz .dc_done
+.dc_alias_done:
 
     ; A pipeline goes to the native executor as a whole
     lea rdi, [input_buf]
@@ -3547,7 +3554,7 @@ expand_env_vars:
     test rax, rax
     jz .ev_tilde_literal
     mov rcx, rax
-    jmp .ev_cpval
+    jmp .ev_value
 .ev_tilde_literal:
     cmp r13, r14
     jae .ev_over
@@ -3588,7 +3595,7 @@ expand_env_vars:
     jz .ev_literal_dollar           ; no closing "))"
     mov r12, rax
     lea rcx, [ash_num_buf]
-    jmp .ev_cpval
+    jmp .ev_value
 .ev_status:
     inc r12
     movsxd rsi, dword [last_exit_status]
@@ -3602,7 +3609,7 @@ expand_env_vars:
     lea rdi, [ash_num_buf]
     call ash_fmt_int
     lea rcx, [ash_num_buf]
-    jmp .ev_cpval
+    jmp .ev_value
 
 .ev_subst:
     ; $( ... ): r12 is at the '('
@@ -3622,7 +3629,7 @@ expand_env_vars:
     mov rcx, rax
     mov r12, [rbp - 48]
     inc r12
-    jmp .ev_cpval
+    jmp .ev_value
 .ev_subst_verbatim:
     lea rsi, [r12 - 1]              ; from the '$'
     mov rdx, [rbp - 48]
@@ -3648,7 +3655,7 @@ expand_env_vars:
     mov rcx, rax
     mov r12, [rbp - 48]
     inc r12
-    jmp .ev_cpval
+    jmp .ev_value
 .ev_btick_verbatim:
     mov rsi, r12
     mov rdx, [rbp - 48]
@@ -3826,6 +3833,18 @@ expand_env_vars:
     jz .ev_loop                     ; variable not found, output nothing
     mov rcx, rax
 
+.ev_value:
+    ; rcx = value. When a redirection operator follows, digits are marked
+    ; too, so "echo $N>f" is not read as the descriptor redirection "2>f".
+    xor edx, edx
+    cmp byte [r12], '>'
+    je .ev_value_op
+    cmp byte [r12], '<'
+    jne .ev_value_flag
+.ev_value_op:
+    mov edx, 1
+.ev_value_flag:
+    mov [rbp - 56], edx
 .ev_cpval:
     ; rcx = value. It is data: mark whatever could read as syntax.
     movzx eax, byte [rcx]
@@ -3844,6 +3863,13 @@ expand_env_vars:
 .ev_cp_chk:
     cmp al, EV_MARK
     je .ev_cp_mark
+    cmp al, '0'
+    jb .ev_cp_special
+    cmp al, '9'
+    ja .ev_cp_special
+    cmp dword [rbp - 56], 0
+    jne .ev_cp_mark
+.ev_cp_special:
     call ev_is_special
     test edx, edx
     jz .ev_cp_plain
@@ -4209,7 +4235,8 @@ ev_capture:
 
 ; ============================================================================
 ; check_alias - If first word matches an alias, expand it.
-; Returns eax = 1 (after a message) if the expanded line would not fit.
+; Returns eax = 0 no alias, 2 expanded, 1 (after a message) if the expansion
+; would not fit.
 ; ============================================================================
 check_alias:
     push rbp
@@ -4285,6 +4312,8 @@ check_alias:
     lea rdi, [input_buf]
     lea rsi, [env_expand_buf]
     call str_copy
+    mov eax, 2                      ; expanded
+    jmp .ca_ret
 
 .ca_done:
     xor eax, eax
