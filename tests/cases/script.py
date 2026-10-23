@@ -66,6 +66,11 @@ T.check("script: delegated statements see functions and positional parameters",
 o = out('f() { echo hi; }\nfalse\ncase a in a) echo st=$?;; esac\nf() { case a in a) echo "[$1]";; esac; }\nf "it\'s here"')
 T.check("script: delegated statements get $? and quoted parameters intact", o == ['st=1', "[it's here]"], o)
 
+for bad in ('while do echo x; done', 'until do echo x; done', 'if then echo x; fi', 'if false; then :; elif then echo x; fi'):
+    lines, err, st = run(bad + '\necho next')
+    T.check("script: empty condition is a syntax error, not a loop (%s)" % bad.split(';')[0],
+            'syntax error' in err and 'next' in lines and lines.count('x') == 0, (lines[:5], err))
+
 # --- recursion ---------------------------------------------------------------
 o = out('fact() { if [ $1 -le 1 ]; then r=1; else fact $(($1-1)); r=$(($1*r)); fi; }\nfact 20\necho $r')
 T.check("script: recursion 20 levels deep (factorial 20)", o == ['2432902008176640000'], o)
