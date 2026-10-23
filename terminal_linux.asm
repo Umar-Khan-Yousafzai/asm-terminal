@@ -1162,16 +1162,22 @@ main:
     jz .main_eof                    ; EOF -> exit
 
 .main_after_read:
-    ; Skip empty lines
+    ; Skip empty lines, except inside an open quote or block where the
+    ; blank line is part of the text
     cmp byte [input_buf], 0
+    jne .main_nonempty
+    cmp byte [ash_cont], 0
     je .main_loop
+    jmp .main_run
 
+.main_nonempty:
     ; Add to history and save to persistent file
     lea rdi, [input_buf]
     call history_add
     lea rdi, [input_buf]
     call history_save_entry
 
+.main_run:
     ; OSC 133 C — output region begins
     lea rdi, [osc133_c]
     call print_cstring
