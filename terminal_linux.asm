@@ -3449,10 +3449,10 @@ expand_env_vars:
     je .ev_btick
     cmp al, '~'
     jne .ev_regular
-    test r15d, r15d                 ; only expand at word start
-    jz .ev_regular
     test ebx, ebx
     jnz .ev_regular
+    test r15d, r15d                 ; only expand at word start; anywhere else
+    jz .ev_tilde_mark               ; it is a plain character, also after $VAR
     movzx ecx, byte [r12 + 1]
     test cl, cl
     jz .ev_tilde
@@ -3462,6 +3462,10 @@ expand_env_vars:
     je .ev_tilde
     cmp cl, 9
     je .ev_tilde
+    cmp cl, '$'                     ; "~$x": what follows may expand to nothing,
+    je .ev_tilde_mark               ; the tilde must not become a prefix then
+    cmp cl, '`'
+    je .ev_tilde_mark
 
 .ev_regular:
     ; Regular character -- copy through (bounded)
@@ -3560,6 +3564,16 @@ expand_env_vars:
     jae .ev_over
     mov byte [r13], '~'
     inc r13
+    xor r15d, r15d
+    jmp .ev_loop
+.ev_tilde_mark:
+    lea rax, [r13 + 1]
+    cmp rax, r14
+    jae .ev_over
+    mov byte [r13], EV_MARK
+    mov byte [r13 + 1], '~'
+    add r13, 2
+    inc r12
     xor r15d, r15d
     jmp .ev_loop
 
