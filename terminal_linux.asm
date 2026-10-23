@@ -323,10 +323,12 @@ section .data
                     db "    bench [-n N] CMD  Time CMD over N runs (mean/min/max, memory)", 10
                     db "                    bench -n 20 ls -la", 10
                     db "    undo            Reverse the last del, move/rename or copy", 10
+                    db "    trash [empty]   List what del/move/copy keep, or empty it", 10
+                    db "                    (kept in ~/.asm_trash; del/move/copy -f skip it)", 10
                     db "    trace [-a] CMD  Show programs, files and network used by CMD", 10
-                    db "    sandbox [-w] [-n] CMD  Run CMD without network; file", 10
-                    db "                    changes only in /tmp (-w: also here)", 10
-                    db "                    (del keeps files in ~/.asm_trash)", 10
+                    db "    sandbox [-w] [-n] [-b] CMD  Run CMD with no sockets (-n: IPv4/6", 10
+                    db "                    only); file changes only in /tmp (-w: also here).", 10
+                    db "                    Run 'sandbox' alone for what it does not block", 10
                     db 10
                     db "  CUSTOMIZATION", 10
                     db "  ---------------------------------------------------", 10
