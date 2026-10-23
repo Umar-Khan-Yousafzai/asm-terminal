@@ -928,7 +928,8 @@ section .bss
     term_rows           resw 1             ; cached from TIOCGWINSZ
     term_cols           resw 1             ; cached from TIOCGWINSZ
     winch_sigaction_buf resb 32            ; sigaction struct for SIGWINCH
-    merged_envp         resq 256            ; argv-style envp for child: 256 slots
+%define MERGED_ENVP_MAX 8192
+    merged_envp         resq MERGED_ENVP_MAX ; argv-style envp for child
     merged_envp_count   resd 1
     git_scratch_path    resb 4096          ; for walking up looking for .git
     git_head_buf        resb 512           ; contents of .git/HEAD
@@ -1177,8 +1178,11 @@ main:
     call print_cstring
 
     ; Run it through the ASH script engine (; && || if while for ...).
-    ; An open block waits for more lines behind a "> " prompt.
+    ; An open block waits for more lines behind a "> " prompt. Ctrl+C raises
+    ; SIGINT while it runs, so even a loop of builtins can be stopped.
+    call script_isig_on
     call ash_feed_line
+    call script_isig_off
 
     ; OSC 133 D;<exit_status> — end of command + exit code
     lea rdi, [osc133_d_pre]
@@ -1374,6 +1378,10 @@ setup_raw_mode:
     mov esi, bracketed_paste_on_len
     call print_string_len
 
+    cmp byte [script_running], 0    ; a command line is running: Ctrl+C stays live
+    je .srm_done
+    call script_isig_apply
+.srm_done:
     leave
     ret
 
@@ -2891,6 +2899,8 @@ dispatch_command:
 
     ; Assume success by default (overwritten on failure). Done after the
     ; expansion so "$?" still sees the previous command's status.
+    mov eax, [last_exit_status]
+    mov [prev_exit_status], eax     ; a bare "exit" reports this one
     mov dword [last_exit_status], 0
 
     ; Check aliases
@@ -3631,12 +3641,18 @@ handler_cls:
     ret
 
 ; ---------- handler_exit ----------
+; dispatch_command clears last_exit_status before it runs a handler, so a bare
+; "exit" takes the status the previous command left in prev_exit_status.
+section .bss
+    prev_exit_status    resd 1
+section .text
 handler_exit:
+    sub rsp, 8                      ; keep the call below 16-byte aligned
     ; Restore terminal to cooked mode before exiting
     call restore_terminal
 
     ; exit with the status of the last command (like sh)
-    mov edi, [last_exit_status]
+    mov edi, [prev_exit_status]
     mov eax, SYS_EXIT
     syscall
     ; Does not return
@@ -4531,6 +4547,69 @@ handler_dir:
     pop rbp
     ret
 
+; ---------- open_intr ----------
+; open_intr(rdi = path, esi = flags) -> rax = fd or -errno (read-only opens)
+; Like open(2), but a FIFO whose writer has not arrived yet does not hold the
+; shell until one does: the wait is cut short by Ctrl+C (-EINTR).
+%define O_NONBLOCK          0x800
+%define F_SETFL             4
+%define SYS_POLL            7
+%define SYS_FCNTL           72
+
+open_intr:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 16                     ; [rsp] = struct pollfd
+
+    or esi, O_NONBLOCK
+    xor edx, edx
+    mov eax, SYS_OPEN
+    syscall
+    test rax, rax
+    js .oi_ret
+    mov ebx, eax
+    mov edi, ebx
+    lea rsi, [stat_buf]
+    mov eax, SYS_FSTAT
+    syscall
+    test rax, rax
+    js .oi_blocking
+    mov eax, [stat_buf + STAT_ST_MODE]
+    and eax, 0o170000
+    cmp eax, 0o010000               ; S_IFIFO
+    jne .oi_blocking
+.oi_poll:
+    cmp byte [ctrl_c_flag], 0
+    jne .oi_intr
+    mov [rsp], ebx                  ; pollfd.fd
+    mov dword [rsp + 4], 1          ; events = POLLIN, revents = 0
+    mov rdi, rsp
+    mov esi, 1
+    mov edx, 100                    ; look at Ctrl+C every 100 ms
+    mov eax, SYS_POLL
+    syscall
+    test rax, rax
+    jle .oi_poll                    ; timeout or a signal
+.oi_blocking:
+    mov edi, ebx                    ; reads and writes block again from here on
+    mov esi, F_SETFL
+    xor edx, edx
+    mov eax, SYS_FCNTL
+    syscall
+    mov eax, ebx
+    jmp .oi_ret
+.oi_intr:
+    mov edi, ebx
+    mov eax, SYS_CLOSE
+    syscall
+    mov rax, -4                     ; -EINTR
+.oi_ret:
+    add rsp, 16
+    pop rbx
+    pop rbp
+    ret
+
 ; ---------- handler_type ----------
 ; Display file contents
 handler_type:
@@ -4544,16 +4623,16 @@ handler_type:
     cmp byte [rdi], 0
     je .hty_noargs
 
-    ; open(filename, O_RDONLY, 0)
+    ; open(filename, O_RDONLY, 0); Ctrl+C can end the wait on a FIFO
     mov esi, O_RDONLY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
+    call open_intr
     test rax, rax
     js .hty_err
     mov ebx, eax                    ; ebx = file descriptor
 
 .hty_read:
+    cmp byte [ctrl_c_flag], 0       ; Ctrl+C stops a long or endless file
+    jne .hty_intr
     ; read(fd, read_buffer, READ_BUF_SIZE)
     mov edi, ebx
     lea rsi, [read_buffer]
@@ -4569,6 +4648,8 @@ handler_type:
     call print_string_len
     jmp .hty_read
 
+.hty_intr:
+    mov dword [last_exit_status], 130
 .hty_close:
     mov edi, ebx
     mov eax, SYS_CLOSE
@@ -4582,9 +4663,14 @@ handler_type:
     jmp .hty_done
 
 .hty_err:
+    cmp byte [ctrl_c_flag], 0
+    jne .hty_aborted
     lea rdi, [err_file_msg]
     mov esi, err_file_len
     call print_string_len
+    jmp .hty_done
+.hty_aborted:
+    mov dword [last_exit_status], 130
 
 .hty_done:
     add rsp, 24
@@ -4794,12 +4880,10 @@ handler_copy:
     mov r12, rax                    ; r12 = source path
     mov r13, rdx                    ; r13 = dest path
 
-    ; Open source: open(src, O_RDONLY, 0)
+    ; Open source: open(src, O_RDONLY, 0); Ctrl+C can end the wait on a FIFO
     mov rdi, r12
     mov esi, O_RDONLY
-    xor edx, edx
-    mov eax, SYS_OPEN
-    syscall
+    call open_intr
     test rax, rax
     js .hcp_src_err
     mov ebx, eax                    ; ebx = src fd
@@ -4815,6 +4899,8 @@ handler_copy:
     mov r12d, eax                   ; r12d = dst fd
 
 .hcp_loop:
+    cmp byte [ctrl_c_flag], 0       ; Ctrl+C stops a long or endless copy
+    jne .hcp_intr
     ; read(src_fd, read_buffer, READ_BUF_SIZE)
     mov edi, ebx
     lea rsi, [read_buffer]
@@ -4841,6 +4927,10 @@ handler_copy:
     jnz .hcp_write_loop             ; loop until all bytes written
     jmp .hcp_loop
 
+.hcp_intr:
+    mov dword [last_exit_status], 130
+    jmp .hcp_close_both
+
 .hcp_read_err:
     lea rdi, [err_copy_read_msg]
     mov esi, err_copy_read_len
@@ -4866,9 +4956,14 @@ handler_copy:
     jmp .hcp_done
 
 .hcp_src_err:
+    cmp byte [ctrl_c_flag], 0
+    jne .hcp_src_aborted
     lea rdi, [err_file_msg]
     mov esi, err_file_len
     call print_string_len
+    jmp .hcp_done
+.hcp_src_aborted:
+    mov dword [last_exit_status], 130
     jmp .hcp_done
 
 .hcp_err:
@@ -5310,6 +5405,11 @@ handler_unalias:
 ; Captures exit status in last_exit_status.
 ; ============================================================================
 %define WNOHANG  1
+%define WUNTRACED  2
+%define WCONTINUED 8
+%define EINTR      4
+%define JOB_RUNNING 1                   ; job_state values
+%define JOB_STOPPED 2
 
 execute_external:
     push rbp
@@ -5377,8 +5477,21 @@ execute_external:
     jmp .ee_done
 
 .ee_legacy:
+    ; A background job needs a free slot (finished jobs are dropped first).
+    ; With none left it runs in the foreground instead, as a normal command.
+    test r14d, r14d
+    jz .ee_launch
+    call job_slots_free
+    test eax, eax
+    jnz .ee_launch
+    lea rdi, [jobs_full_msg]
+    call print_cstring
+    xor r14d, r14d
+
+.ee_launch:
     ; Restore terminal to cooked mode so child process gets sane terminal
     call restore_terminal
+    call jc_prepare                 ; the child starts its own process group
 
     ; fork()
     mov eax, SYS_FORK
@@ -5388,6 +5501,12 @@ execute_external:
     jnz .ee_parent                  ; parent: rax = child PID
 
     ; ====== CHILD PROCESS ======
+    mov edi, 1                      ; a foreground job takes the terminal
+    test r14d, r14d
+    jz .ee_child_group
+    xor edi, edi
+.ee_child_group:
+    call jc_child_setup
 
     ; Handle redirection with dup2
     cmp byte [redir_stdout_active], 0
@@ -5438,32 +5557,24 @@ execute_external:
 .ee_parent:
     mov ebx, eax                    ; ebx = child PID
 
+    mov edi, ebx                    ; same grouping from this side, so the
+    mov esi, 1                      ; child's group exists before anyone waits
+    test r14d, r14d
+    jz .ee_parent_group
+    xor esi, esi
+.ee_parent_group:
+    call jc_parent_after_fork
+
     ; Check if background mode
     test r14d, r14d
     jnz .ee_background
 
     ; --- Foreground: wait for child ---
+    ; Exit code, or 128 + signal when the child was killed (as ASH does)
     mov edi, ebx
-    lea rsi, [pid_buf]              ; reuse as status location
-    xor edx, edx                    ; options = 0
-    xor r10d, r10d                  ; rusage = NULL
-    mov eax, SYS_WAIT4
-    syscall
-
-    ; Extract exit status
-    mov eax, [pid_buf]
-    ; Check WIFEXITED: (status & 0x7F) == 0
-    test al, 0x7F
-    jnz .ee_signaled
-    ; WEXITSTATUS: (status >> 8) & 0xFF
-    shr eax, 8
-    and eax, 0xFF
+    xor esi, esi
+    call jc_wait_fg
     mov [last_exit_status], eax
-    jmp .ee_restore
-
-.ee_signaled:
-    ; Child was killed by a signal -- treat as failure
-    mov dword [last_exit_status], 1
 
 .ee_restore:
     ; Re-enable raw mode for our terminal
@@ -5476,51 +5587,11 @@ execute_external:
     ; Re-enable raw mode first
     call setup_raw_mode
 
-    ; Find an empty slot in job table
-    xor ecx, ecx                    ; slot index
-
-.ee_find_slot:
-    cmp ecx, JOB_MAX
-    jge .ee_table_full
-
-    lea rdi, [job_pids]
-    cmp qword [rdi + rcx*8], 0
-    je .ee_store_job
-
-    inc ecx
-    jmp .ee_find_slot
-
-.ee_store_job:
-    ; Store the PID
-    lea rdi, [job_pids]
-    mov rax, rbx                    ; child PID (zero-extended from ebx)
-    mov [rdi + rcx*8], rax
-
-    ; Copy the command string into job_cmds[slot]
-    mov eax, ecx
-    imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
-    lea rsi, [input_buf]
-
-    ; Copy up to JOB_CMD_SIZE-1 chars
-    push rcx                        ; save slot index
-    xor edx, edx
-
-.ee_copy_cmd:
-    cmp edx, JOB_CMD_SIZE - 1
-    jge .ee_copy_cmd_done
-    movzx eax, byte [rsi + rdx]
-    test al, al
-    jz .ee_copy_cmd_done
-    mov [rdi + rdx], al
-    inc edx
-    jmp .ee_copy_cmd
-
-.ee_copy_cmd_done:
-    mov byte [rdi + rdx], 0         ; null-terminate
-    pop rcx
-
-    inc dword [job_count]
+    mov edi, ebx
+    mov esi, [jc_pgid]              ; 0 without job control
+    mov edx, JOB_RUNNING
+    xor ecx, ecx
+    call job_add                    ; a slot was free before the fork
 
     ; Print "[bg] PID XXXX\n"
     lea rdi, [jobs_bg_started_msg]
@@ -5528,21 +5599,6 @@ execute_external:
     mov eax, ebx
     call print_number
     call print_newline
-
-    jmp .ee_done
-
-.ee_table_full:
-    ; Job table full - print warning and wait foreground instead
-    lea rdi, [jobs_full_msg]
-    call print_cstring
-
-    ; Fall back to foreground wait
-    mov edi, ebx
-    lea rsi, [pid_buf]
-    xor edx, edx
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
 
     jmp .ee_done
 
@@ -6197,8 +6253,9 @@ setenv_internal:
 
 ; ============================================================================
 ; build_merged_envp - Fill merged_envp[] with overlay entries + inherited envp
-; Cap at 256 slots including terminating NULL. Overlay entries appear first
-; so getenv() in children returns overridden values.
+; Holds MERGED_ENVP_MAX slots including the terminating NULL. Overlay entries
+; appear first, and an inherited variable of the same name is left out, so a
+; child that reads the last occurrence sees the overlay value too.
 ; ============================================================================
 build_merged_envp:
     push rbp
@@ -6206,10 +6263,13 @@ build_merged_envp:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
     sub rsp, 8
 
     lea r12, [merged_envp]
     xor r13d, r13d                  ; slot index
+    xor r15d, r15d                  ; r15d = 1 if variables had to be dropped
 
     ; --- Copy overlay entries ---
     mov ecx, [env_overlay_count]
@@ -6217,8 +6277,8 @@ build_merged_envp:
     jz .bme_inherited
     lea rbx, [env_overlay]
 .bme_overlay_loop:
-    cmp r13d, 255
-    jge .bme_terminate
+    cmp r13d, MERGED_ENVP_MAX - 1
+    jge .bme_full
     ; Skip empty slots (first byte NUL)
     cmp byte [rbx], 0
     je .bme_next_overlay
@@ -6235,26 +6295,76 @@ build_merged_envp:
     test rbx, rbx
     jz .bme_terminate
 .bme_env_loop:
-    mov rax, [rbx]
-    test rax, rax
+    mov r14, [rbx]
+    test r14, r14
     jz .bme_terminate
-    cmp r13d, 255
-    jge .bme_terminate
-    mov [r12 + r13*8], rax
+    cmp r13d, MERGED_ENVP_MAX - 1
+    jge .bme_full
+    mov rdi, r14
+    call .bme_shadowed
+    test eax, eax
+    jnz .bme_env_next
+    mov [r12 + r13*8], r14
     inc r13d
+.bme_env_next:
     add rbx, 8
     jmp .bme_env_loop
+
+.bme_full:
+    mov r15d, 1
 
 .bme_terminate:
     mov qword [r12 + r13*8], 0
     mov [merged_envp_count], r13d
+    test r15d, r15d
+    jz .bme_ret
+    lea rdi, [err_envp_full]        ; say so instead of silently dropping them
+    call ash_write_err
 
+.bme_ret:
     add rsp, 8
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
     pop rbp
     ret
+
+; eax = 1 if an overlay entry has the same NAME as the NAME=value string at rdi
+.bme_shadowed:
+    mov ecx, [env_overlay_count]
+    lea rsi, [env_overlay]
+.bms_slot:
+    test ecx, ecx
+    jz .bms_no
+    cmp byte [rsi], 0
+    je .bms_next
+    xor edx, edx
+.bms_cmp:
+    movzx eax, byte [rsi + rdx]
+    cmp al, [rdi + rdx]
+    jne .bms_next
+    cmp al, '='
+    je .bms_yes
+    test al, al
+    jz .bms_next
+    inc edx
+    jmp .bms_cmp
+.bms_next:
+    add rsi, ENV_OVERLAY_SIZE
+    dec ecx
+    jmp .bms_slot
+.bms_yes:
+    mov eax, 1
+    ret
+.bms_no:
+    xor eax, eax
+    ret
+
+section .data
+    err_envp_full       db "ash: environment too large, some variables were not passed on", 10, 0
+section .text
 
 ; ============================================================================
 ; handler_unset - Remove a name from env_overlay (env vars set via 'set')
@@ -8249,17 +8359,7 @@ init_prompt_cache:
     call str_copy
 
 .ipc_init_jobs:
-    mov dword [job_count], 0
     mov dword [current_theme], 0    ; default theme
-
-    lea rdi, [job_pids]
-    xor eax, eax
-    mov ecx, JOB_MAX
-.ipc_clear_jobs:
-    mov qword [rdi], 0
-    add rdi, 8
-    dec ecx
-    jnz .ipc_clear_jobs
 
     add rsp, 16
     pop rbx
@@ -8776,6 +8876,304 @@ handler_theme:
 
 
 ; ============================================================================
+; Jobs. job_pids[slot] is the pid whose exit status counts (the last stage of
+; a pipeline), job_pgids[slot] the job's process group (0 when it shares the
+; shell's group), job_state[slot] JOB_RUNNING or JOB_STOPPED and job_cmds the
+; command text. Jobs are numbered by their position among the used slots.
+; ============================================================================
+section .bss
+    job_pgids           resq JOB_MAX
+    job_state           resb JOB_MAX
+section .data
+    jobs_stopped_msg    db " Stopped  ", 0
+section .text
+
+; job_slots_free() -> eax = number of free slots, after dropping finished jobs
+job_slots_free:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    call reap_finished_jobs
+    xor eax, eax
+    xor ecx, ecx
+.jsf_loop:
+    cmp ecx, JOB_MAX
+    jge .jsf_done
+    cmp qword [job_pids + rcx*8], 0
+    jne .jsf_next
+    inc eax
+.jsf_next:
+    inc ecx
+    jmp .jsf_loop
+.jsf_done:
+    leave
+    ret
+
+; job_add(edi = pid, esi = process group or 0, edx = JOB_*, rcx = command text
+; or 0 for input_buf) -> eax = slot or -1
+job_add:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+
+    mov r12d, edi
+    mov r13d, esi
+    mov r14d, edx
+    mov r15, rcx
+    call reap_finished_jobs
+    xor ebx, ebx
+.ja_find:
+    cmp ebx, JOB_MAX
+    jge .ja_full
+    cmp qword [job_pids + rbx*8], 0
+    je .ja_found
+    inc ebx
+    jmp .ja_find
+.ja_found:
+    mov eax, r12d
+    mov [job_pids + rbx*8], rax
+    mov eax, r13d
+    mov [job_pgids + rbx*8], rax
+    mov eax, r14d
+    mov [job_state + rbx], al
+
+    mov eax, ebx
+    imul eax, JOB_CMD_SIZE
+    lea rdi, [job_cmds + rax]
+    lea rsi, [input_buf]
+    test r15, r15
+    cmovnz rsi, r15
+    xor edx, edx
+.ja_copy:
+    cmp edx, JOB_CMD_SIZE - 1
+    jge .ja_copied
+    movzx eax, byte [rsi + rdx]
+    test al, al
+    jz .ja_copied
+    mov [rdi + rdx], al
+    inc edx
+    jmp .ja_copy
+.ja_copied:
+    mov byte [rdi + rdx], 0
+    inc dword [job_count]
+    mov eax, ebx
+    jmp .ja_ret
+.ja_full:
+    mov eax, -1
+.ja_ret:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; job_free(edi = slot) - forget a job
+job_free:
+    cmp qword [job_pids + rdi*8], 0
+    je .jf_ret
+    mov qword [job_pids + rdi*8], 0
+    mov qword [job_pgids + rdi*8], 0
+    mov byte [job_state + rdi], 0
+    dec dword [job_count]
+.jf_ret:
+    ret
+
+; job_ordinal(edi = slot) -> eax = its number as 'jobs' shows it (1-based)
+job_ordinal:
+    xor eax, eax
+    xor ecx, ecx
+.jo_loop:
+    cmp qword [job_pids + rcx*8], 0
+    je .jo_next
+    inc eax
+.jo_next:
+    cmp ecx, edi
+    jae .jo_done
+    inc ecx
+    cmp ecx, JOB_MAX
+    jl .jo_loop
+.jo_done:
+    ret
+
+; job_find(edi = job number) -> eax = slot, or -1 when there is no such job
+job_find:
+    xor eax, eax                    ; eax = number of used slots seen
+    xor ecx, ecx
+.jfind_loop:
+    cmp ecx, JOB_MAX
+    jge .jfind_none
+    cmp qword [job_pids + rcx*8], 0
+    je .jfind_next
+    inc eax
+    cmp eax, edi
+    je .jfind_found
+.jfind_next:
+    inc ecx
+    jmp .jfind_loop
+.jfind_found:
+    mov eax, ecx
+    ret
+.jfind_none:
+    mov eax, -1
+    ret
+
+; job_parse_number(rdi = text) -> eax = job number (1-255), 0 if not one
+job_parse_number:
+    xor eax, eax
+    xor ecx, ecx                    ; digits seen
+.jpn_loop:
+    movzx edx, byte [rdi]
+    test dl, dl
+    jz .jpn_end
+    cmp dl, ' '
+    je .jpn_end
+    sub edx, '0'
+    cmp edx, 9
+    ja .jpn_bad
+    imul eax, eax, 10
+    add eax, edx
+    cmp eax, 255
+    ja .jpn_bad
+    inc ecx
+    inc rdi
+    jmp .jpn_loop
+.jpn_end:
+    test ecx, ecx
+    jz .jpn_bad
+    ret
+.jpn_bad:
+    xor eax, eax
+    ret
+
+; job_print_line(edi = slot) - "  [1] PID 1234 Running  command"
+job_print_line:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    mov ebx, edi
+    call job_ordinal
+    mov r12d, eax
+    lea rdi, [jobs_bracket_open]
+    call print_cstring
+    mov eax, r12d
+    call print_number
+    lea rdi, [jobs_bracket_close]
+    call print_cstring
+    lea rdi, [jobs_pid_label]
+    call print_cstring
+    mov rax, [job_pids + rbx*8]
+    mov eax, eax
+    call print_number
+    lea rdi, [jobs_running_msg]
+    cmp byte [job_state + rbx], JOB_STOPPED
+    jne .jpl_state
+    lea rdi, [jobs_stopped_msg]
+.jpl_state:
+    call print_cstring
+    mov eax, ebx
+    imul eax, JOB_CMD_SIZE
+    lea rdi, [job_cmds + rax]
+    call print_cstring
+    call print_newline
+
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; job_notify_stopped(edi = slot) - tell the user a foreground job was stopped.
+; Goes to the terminal even when the command's stdout was redirected.
+job_notify_stopped:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    mov r12d, edi
+    movzx ebx, byte [redir_stdout_active]
+    mov byte [redir_stdout_active], 0
+    call print_newline
+    mov edi, r12d
+    call job_print_line
+    mov [redir_stdout_active], bl
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; job_poll(edi = slot) -> eax = 1 if the job is gone (its slot is freed),
+; 0 if it still exists. Also notes whether it is running or stopped.
+job_poll:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 16                     ; [rsp] = wait status
+
+    mov ebx, edi
+    mov r12, [job_pids + rbx*8]
+.jp_again:
+    mov edi, r12d
+    mov edx, WNOHANG
+    mov r8, [job_pgids + rbx*8]
+    test r8, r8
+    jz .jp_do
+    mov edi, r8d
+    neg edi                         ; any process of the job's group
+    mov edx, WNOHANG | WUNTRACED | WCONTINUED
+.jp_do:
+    mov dword [rsp], 0
+    mov rsi, rsp
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -EINTR
+    je .jp_again
+    test rax, rax
+    jz .jp_alive
+    js .jp_gone                     ; nothing of the job is left
+    cmp qword [job_pgids + rbx*8], 0
+    je .jp_gone                     ; a single process of the shell's group ended
+    mov eax, [rsp]
+    mov ecx, eax
+    and ecx, 0xFF
+    cmp ecx, 0x7F
+    jne .jp_not_stopped
+    mov byte [job_state + rbx], JOB_STOPPED
+    jmp .jp_again
+.jp_not_stopped:
+    cmp eax, 0xFFFF                 ; continued
+    jne .jp_again                   ; one stage ended; look for the others
+    mov byte [job_state + rbx], JOB_RUNNING
+    jmp .jp_again
+.jp_alive:
+    xor eax, eax
+    jmp .jp_ret
+.jp_gone:
+    mov edi, ebx
+    call job_free
+    mov eax, 1
+.jp_ret:
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
 ; handler_jobs - List active background jobs
 ; ============================================================================
 handler_jobs:
@@ -8783,83 +9181,26 @@ handler_jobs:
     mov rbp, rsp
     push rbx
     push r12
-    push r13
-    push r14
-    sub rsp, 32
+    sub rsp, 16
 
     call reap_finished_jobs
 
-    mov eax, [job_count]
-    test eax, eax
-    jz .hj_none
+    cmp dword [job_count], 0
+    jle .hj_none
 
     lea rdi, [jobs_header_msg]
     call print_cstring
 
-    xor r12d, r12d
-    xor r13d, r13d
-
+    xor ebx, ebx
 .hj_loop:
-    cmp r12d, JOB_MAX
+    cmp ebx, JOB_MAX
     jge .hj_done
-
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    test rax, rax
-    jz .hj_next
-
-    inc r13d
-    mov r14, rax
-
-    lea rdi, [jobs_bracket_open]
-    call print_cstring
-
-    mov eax, r13d
-    call print_number
-
-    lea rdi, [jobs_bracket_close]
-    call print_cstring
-
-    lea rdi, [jobs_pid_label]
-    call print_cstring
-
-    mov rax, r14
-    mov eax, eax
-    call print_number
-
-    ; Check if still running with waitpid WNOHANG
-    mov edi, r14d
-    lea rsi, [pid_buf]
-    mov edx, WNOHANG
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
-
-    test rax, rax
-    jz .hj_still_running
-
-    ; Job finished - mark slot as empty
-    lea rbx, [job_pids]
-    mov qword [rbx + r12*8], 0
-    dec dword [job_count]
-
-    lea rdi, [jobs_done_msg]
-    call print_cstring
-    jmp .hj_print_cmd
-
-.hj_still_running:
-    lea rdi, [jobs_running_msg]
-    call print_cstring
-
-.hj_print_cmd:
-    mov eax, r12d
-    imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
-    call print_cstring
-    call print_newline
-
+    cmp qword [job_pids + rbx*8], 0
+    je .hj_next
+    mov edi, ebx
+    call job_print_line
 .hj_next:
-    inc r12d
+    inc ebx
     jmp .hj_loop
 
 .hj_none:
@@ -8867,9 +9208,7 @@ handler_jobs:
     call print_cstring
 
 .hj_done:
-    add rsp, 32
-    pop r14
-    pop r13
+    add rsp, 16
     pop r12
     pop rbx
     pop rbp
@@ -8891,25 +9230,10 @@ reap_finished_jobs:
 .rfj_loop:
     cmp r12d, JOB_MAX
     jge .rfj_done
-
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    test rax, rax
-    jz .rfj_next
-
-    mov edi, eax
-    lea rsi, [pid_buf]
-    mov edx, WNOHANG
-    xor r10d, r10d
-    mov eax, SYS_WAIT4
-    syscall
-
-    test rax, rax
-    jz .rfj_next
-    lea rbx, [job_pids]
-    mov qword [rbx + r12*8], 0
-    dec dword [job_count]
-
+    cmp qword [job_pids + r12*8], 0
+    je .rfj_next
+    mov edi, r12d
+    call job_poll
 .rfj_next:
     inc r12d
     jmp .rfj_loop
@@ -8923,7 +9247,7 @@ reap_finished_jobs:
 
 
 ; ============================================================================
-; handler_fg - Bring background job to foreground
+; handler_fg - Bring a job to the foreground (resuming it if it was stopped)
 ; rdi = argument string ("1", "2", etc.) or NULL
 ; ============================================================================
 handler_fg:
@@ -8932,59 +9256,22 @@ handler_fg:
     push rbx
     push r12
     push r13
-    sub rsp, 16
+    push r14
+    push r15
+    sub rsp, 24                     ; [rsp] = wait status
 
     test rdi, rdi
     jz .hfg_noarg
     cmp byte [rdi], 0
     je .hfg_noarg
-
-    xor eax, eax
-    xor ecx, ecx
-
-.hfg_parse_num:
-    movzx edx, byte [rdi]
-    test dl, dl
-    jz .hfg_parsed
-    cmp dl, ' '
-    je .hfg_parsed
-    sub dl, '0'
-    cmp dl, 9
-    ja .hfg_invalid
-    imul ecx, ecx, 10
-    movzx edx, dl
-    add ecx, edx
-    inc rdi
-    jmp .hfg_parse_num
-
-.hfg_parsed:
-    test ecx, ecx
+    call job_parse_number
+    test eax, eax
     jz .hfg_invalid
-
-    xor r12d, r12d
-    xor r13d, r13d
-
-.hfg_find:
-    cmp r12d, JOB_MAX
-    jge .hfg_invalid
-
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    test rax, rax
-    jz .hfg_find_next
-
-    inc r13d
-    cmp r13d, ecx
-    je .hfg_found
-
-.hfg_find_next:
-    inc r12d
-    jmp .hfg_find
-
-.hfg_found:
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    mov ebx, eax
+    mov edi, eax
+    call job_find
+    test eax, eax
+    js .hfg_invalid
+    mov r12d, eax                   ; r12d = slot
 
     ; Print the command
     mov eax, r12d
@@ -8993,29 +9280,88 @@ handler_fg:
     call print_cstring
     call print_newline
 
-    call restore_terminal
+    mov rbx, [job_pids + r12*8]     ; rbx = pid that gives the status
+    mov r13, [job_pgids + r12*8]    ; r13 = its process group, 0 if shared
+    mov byte [job_state + r12], JOB_RUNNING
+    xor r14d, r14d                  ; r14d = exit status
 
-    ; Resume the job if stopped (SIGCONT). Harmless if already running.
+    call restore_terminal
+    test r13, r13
+    jz .hfg_plain
+
+    ; Hand the terminal to the job and wake it (harmless if it is running)
+    mov edi, r13d
+    call jc_give_tty
+    mov edi, r13d
+    neg edi
+    mov esi, SIGCONT
+    mov eax, SYS_KILL
+    syscall
+.hfg_wait:
+    mov dword [rsp], 0
+    mov edi, r13d
+    neg edi
+    mov rsi, rsp
+    mov edx, WUNTRACED
+    xor r10d, r10d
+    mov eax, SYS_WAIT4
+    syscall
+    cmp rax, -EINTR
+    je .hfg_wait
+    test rax, rax
+    jle .hfg_finished               ; ECHILD: every process of the job is gone
+    mov r15d, eax
+    mov eax, [rsp]
+    mov esi, 1
+    call jc_status
+    test edx, edx
+    jnz .hfg_stopped
+    cmp r15, rbx
+    jne .hfg_wait
+    mov r14d, eax
+    jmp .hfg_wait
+
+.hfg_stopped:
+    mov [last_exit_status], eax
+    mov byte [job_state + r12], JOB_STOPPED
+    call jc_reclaim
+    mov edi, r12d
+    call job_notify_stopped
+    call restore_terminal           ; the program may have left the terminal raw
+    jmp .hfg_raw
+
+.hfg_finished:
+    call jc_reclaim
+    mov edi, r12d
+    call job_free
+    mov [last_exit_status], r14d
+    jmp .hfg_raw
+
+.hfg_plain:
+    ; The job shares the shell's group: wake it and wait for that one process
     mov edi, ebx
     mov esi, SIGCONT
     mov eax, SYS_KILL
     syscall
-
-    ; Wait on the child
+.hfg_plain_wait:
+    mov dword [rsp], 0
     mov edi, ebx
-    lea rsi, [pid_buf]
+    mov rsi, rsp
     xor edx, edx
     xor r10d, r10d
     mov eax, SYS_WAIT4
     syscall
+    cmp rax, -EINTR
+    je .hfg_plain_wait
+    mov eax, [rsp]
+    xor esi, esi
+    call jc_status
+    mov [last_exit_status], eax
+    mov edi, r12d
+    call job_free
 
+.hfg_raw:
     call setup_raw_mode
-
-    ; Remove from job table
-    lea rdi, [job_pids]
-    mov qword [rdi + r12*8], 0
-    dec dword [job_count]
-
     jmp .hfg_done
 
 .hfg_noarg:
@@ -9026,9 +9372,12 @@ handler_fg:
 .hfg_invalid:
     lea rdi, [jobs_fg_invalid_msg]
     call print_cstring
+    mov dword [last_exit_status], 1
 
 .hfg_done:
-    add rsp, 16
+    add rsp, 24
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -9036,7 +9385,7 @@ handler_fg:
     ret
 
 ; ============================================================================
-; handler_bg - resume a stopped background job (SIGCONT), do NOT wait
+; handler_bg - resume a stopped job in the background, do NOT wait
 ; ============================================================================
 handler_bg:
     push rbp
@@ -9050,56 +9399,41 @@ handler_bg:
     jz .hbg_noarg
     cmp byte [rdi], 0
     je .hbg_noarg
-
-    ; Parse job number
-    xor ecx, ecx
-.hbg_parse:
-    movzx edx, byte [rdi]
-    test dl, dl
-    jz .hbg_parsed
-    cmp dl, ' '
-    je .hbg_parsed
-    sub dl, '0'
-    cmp dl, 9
-    ja .hbg_noarg
-    imul ecx, ecx, 10
-    movzx edx, dl
-    add ecx, edx
-    inc rdi
-    jmp .hbg_parse
-.hbg_parsed:
-    test ecx, ecx
+    call job_parse_number
+    test eax, eax
     jz .hbg_noarg
+    mov r13d, eax                   ; r13d = job number
+    mov edi, eax
+    call job_find
+    test eax, eax
+    js .hbg_nojob
+    mov r12d, eax                   ; r12d = slot
 
-    xor r12d, r12d
-    xor r13d, r13d
-.hbg_find:
-    cmp r12d, JOB_MAX
-    jge .hbg_noarg
-    lea rbx, [job_pids]
-    mov rax, [rbx + r12*8]
-    test rax, rax
-    jz .hbg_next
-    inc r13d
-    cmp r13d, ecx
-    je .hbg_found
-.hbg_next:
-    inc r12d
-    jmp .hbg_find
-
-.hbg_found:
-    lea rbx, [job_pids]
-    mov rbx, [rbx + r12*8]
-    mov edi, ebx
+    mov rdi, [job_pids + r12*8]
+    mov r8, [job_pgids + r12*8]
+    test r8, r8
+    jz .hbg_signal
+    mov edi, r8d
+    neg edi                         ; the whole job
+.hbg_signal:
     mov esi, SIGCONT
     mov eax, SYS_KILL
     syscall
+    test rax, rax
+    jnz .hbg_nojob
+    mov byte [job_state + r12], JOB_RUNNING
 
     lea rdi, [bg_resumed_msg]
     call print_cstring
-    mov eax, ecx
+    mov eax, r13d
     call print_number
     call print_newline
+    jmp .hbg_done
+
+.hbg_nojob:
+    lea rdi, [jobs_fg_invalid_msg]
+    call print_cstring
+    mov dword [last_exit_status], 1
     jmp .hbg_done
 
 .hbg_noarg:
