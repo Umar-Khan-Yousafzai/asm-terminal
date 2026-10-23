@@ -2330,9 +2330,11 @@ ash_for_setup:
     mov rdi, r12
     call ash_needs_sh
     mov [rsp], eax
-    lea rdi, [input_buf]
-    mov rsi, r12
-    call str_copy
+    mov rdi, r12
+    xor esi, esi
+    call ash_load_line              ; "$@" becomes one word per parameter
+    test eax, eax
+    jnz .fs_failed
     cmp dword [rsp], 0
     jne .fs_expand_sh
     call expand_env_vars
@@ -2585,22 +2587,22 @@ ash_run_cmd:
     jmp .rc_ok
 
 .rc_dispatch:
-
+    ; ". file" is "source file": it runs in this shell, so cd and assignments stay
     mov rdi, rbx
-    call str_len
-    cmp eax, MAX_INPUT - 1
-    jae .rc_toolong
-    lea rdi, [input_buf]
-    mov rsi, rbx
-    call str_copy
+    lea rsi, [ash_s_dot]
+    call ash_word_is
+    mov rdi, rbx
+    xor esi, esi
+    test eax, eax
+    jz .rc_load
+    lea rdi, [rbx + 1]
+    lea rsi, [ash_s_source]
+.rc_load:
+    call ash_load_line
+    test eax, eax
+    jnz .rc_ok                      ; too long: message printed, status set
     call dispatch_command
 .rc_ok:
-    xor eax, eax
-    jmp .rc_ret
-.rc_toolong:
-    lea rdi, [ash_e_line]
-    call ash_write_err
-    mov dword [last_exit_status], 2
     xor eax, eax
     jmp .rc_ret
 .rc_break:
@@ -2679,6 +2681,192 @@ ash_run_cmd:
     mov eax, 3
 .rc_ret:
     add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+section .data
+    ash_s_dot           db ".", 0
+    ash_s_source        db "source", 0
+section .text
+
+; ----------------------------------------------------------------------------
+; ash_load_line(rdi = text, rsi = prefix string or 0) -> eax = 0 ok, 1 too long
+; Puts prefix + text into input_buf for dispatch_command and the other
+; expanders. Inside double quotes "$@" becomes one quoted word per positional
+; parameter ("$@" with no parameters becomes no word at all), the way sh does
+; it; expand_env_vars alone could only hand over one joined word. Parameter
+; text is data, so the bytes that could read as syntax get an EV_MARK in front,
+; exactly as expand_env_vars marks a substituted value. Everything else is
+; copied as it is; text in '...' and after a backslash is never looked at.
+; ----------------------------------------------------------------------------
+ash_load_line:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8                      ; [rsp] parameter index
+
+    mov r13, rdi                    ; text
+    lea rdi, [input_buf]
+    lea r12, [input_buf + MAX_INPUT - 2] ; the last byte that may be written
+    test rsi, rsi
+    jz .ll_start
+.ll_prefix:
+    mov al, [rsi]
+    test al, al
+    jz .ll_start
+    cmp rdi, r12
+    jae .ll_long
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .ll_prefix
+.ll_start:
+    mov rsi, r13
+    xor ebx, ebx                    ; inside "..."
+    xor r14d, r14d                  ; where the opening " of that string went
+    xor r13d, r13d                  ; inside '...'
+.ll_loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .ll_end
+    test r13d, r13d
+    jnz .ll_sq
+    cmp al, '\'
+    je .ll_pair
+    cmp al, EV_MARK
+    je .ll_pair
+    cmp al, '"'
+    je .ll_dq
+    test ebx, ebx
+    jnz .ll_in_dq
+    cmp al, 0x27
+    jne .ll_put
+    mov r13d, 1
+    jmp .ll_put
+.ll_in_dq:
+    cmp al, '$'
+    jne .ll_put
+    cmp byte [rsi + 1], '@'
+    je .ll_at
+.ll_put:
+    cmp rdi, r12
+    jae .ll_long
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .ll_loop
+.ll_sq:
+    cmp al, 0x27
+    jne .ll_put
+    xor r13d, r13d
+    jmp .ll_put
+.ll_dq:
+    test ebx, ebx
+    jnz .ll_dq_close
+    mov ebx, 1
+    mov r14, rdi
+    jmp .ll_put
+.ll_dq_close:
+    xor ebx, ebx
+    jmp .ll_put
+.ll_pair:                           ; a backslash or marker and the byte after it
+    lea rax, [r12 - 1]
+    cmp rdi, rax
+    jae .ll_long
+    mov al, [rsi]
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    movzx eax, byte [rsi]
+    test al, al
+    jz .ll_loop
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    jmp .ll_loop
+
+.ll_at:
+    add rsi, 2
+    mov ecx, [ash_pos_argc]
+    test ecx, ecx
+    jnz .ll_words
+    lea rax, [rdi - 1]
+    cmp rax, r14                    ; the string is just "$@": no word at all
+    jne .ll_loop
+    cmp byte [rsi], '"'
+    jne .ll_loop
+    mov rdi, r14
+    inc rsi
+    xor ebx, ebx
+    jmp .ll_loop
+.ll_words:
+    mov r15, [ash_pos_argv]
+    mov dword [rsp], 0
+.ll_word:
+    mov eax, [rsp]
+    test eax, eax
+    jz .ll_arg
+    lea rax, [r12 - 3]              ; " " between two words
+    cmp rdi, rax
+    jae .ll_long
+    mov byte [rdi], '"'
+    mov byte [rdi + 1], ' '
+    mov byte [rdi + 2], '"'
+    add rdi, 3
+.ll_arg:
+    mov eax, [rsp]
+    mov rcx, [r15 + rax * 8]
+.ll_arg_ch:
+    movzx eax, byte [rcx]
+    test al, al
+    jz .ll_arg_end
+    cmp al, EV_MARK
+    je .ll_arg_mark
+    push rsi                        ; ev_is_special clobbers rsi
+    call ev_is_special
+    pop rsi
+    test edx, edx
+    jz .ll_arg_put
+.ll_arg_mark:
+    lea rdx, [r12 - 1]
+    cmp rdi, rdx
+    jae .ll_long
+    mov byte [rdi], EV_MARK
+    inc rdi
+.ll_arg_put:
+    cmp rdi, r12
+    jae .ll_long
+    mov [rdi], al
+    inc rdi
+    inc rcx
+    jmp .ll_arg_ch
+.ll_arg_end:
+    inc dword [rsp]
+    mov eax, [rsp]
+    cmp eax, [ash_pos_argc]
+    jb .ll_word
+    jmp .ll_loop
+
+.ll_end:
+    mov byte [rdi], 0
+    xor eax, eax
+    jmp .ll_ret
+.ll_long:
+    lea rdi, [ash_e_line]
+    call ash_write_err
+    mov dword [last_exit_status], 2
+    mov eax, 1
+.ll_ret:
+    add rsp, 8
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -3135,12 +3323,10 @@ ash_call_func:
 
     ; Expand and split the arguments
     mov rdi, r12
-    call str_len
-    cmp eax, MAX_INPUT - 1
-    jae .cf_toolong
-    lea rdi, [input_buf]
-    mov rsi, r12
-    call str_copy
+    xor esi, esi
+    call ash_load_line              ; "$@" becomes one word per parameter
+    test eax, eax
+    jnz .cf_expand_failed           ; too long: message printed
     call expand_env_vars
     test eax, eax
     jnz .cf_expand_failed           ; message printed: do not call
@@ -3195,12 +3381,6 @@ ash_call_func:
     jmp .cf_restore
 
 .cf_expand_failed:
-    mov ebx, 1
-    jmp .cf_ret
-.cf_toolong:
-    lea rdi, [ash_e_line]
-    call ash_write_err
-    mov dword [last_exit_status], 2
     mov ebx, 1
     jmp .cf_ret
 .cf_nomem:
