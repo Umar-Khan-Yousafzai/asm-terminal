@@ -7,7 +7,8 @@ The version lives in one place: `version.inc`.
 ## [2.4.0] - 2026-10-23
 
 The script engine and the builtins lose the limits that 2.3.0 listed: `"$@"`, `. file`, `case`,
-wildcards in builtins and long command lines now work.
+wildcards in builtins and long command lines now work. The shell also suggests commands from
+history while you type, lists every Tab match, and `help` is a table.
 
 ### Added
 - `case WORD in pat) ...;; esac` runs natively, so assignments, `cd` and functions made in a clause
@@ -22,6 +23,15 @@ wildcards in builtins and long command lines now work.
   sorted; no match keeps the pattern; names with spaces or special characters stay one word.
   `del`, `mkdir` and `rmdir` run once per match; `copy` and `move` take several sources and a target
   folder.
+- **Suggestions while typing**: the rest of a matching command from history shows in grey behind
+  the cursor. Right arrow, End, Ctrl+E or Ctrl+F accepts it; Enter runs only what was typed.
+  Commands run in the same folder that worked come first, then any that worked, then the rest.
+- **Tab lists every match**: while Tab cycles through file names, all matches show under the line
+  with the current one highlighted (folders in blue). Any other key closes the list.
+- **History remembers folder and result**: each entry keeps the folder it ran in and its exit
+  status. `history` marks failed commands with `[N]`, and `history .` lists only the commands run
+  in the current folder. The notes are stored in `~/.asm_history` as `#asm:HASH:STATUS` lines
+  after each command; older versions read them as comments.
 
 ### Changed
 - A command line may be up to 65535 bytes after expansion (scripts, sourced files, long variables,
@@ -34,6 +44,9 @@ wildcards in builtins and long command lines now work.
   an `if`; before, the whole `case` ran in `/bin/sh`.
 - `.bss` grew to about 22 MB of address space (line buffers and glob tables; only touched pages
   cost memory).
+- `help` is now a table with Command, Usage and Example columns, grouped by section. Each run
+  picks a random example per command. Commands that destroy data show in red. On terminals
+  narrower than 95 columns the example moves to its own line.
 
 ### Fixed
 - `cd` no longer prints "variable too long" when the directory does not fit in `PWD`.
