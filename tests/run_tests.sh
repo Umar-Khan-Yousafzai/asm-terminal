@@ -99,6 +99,9 @@ run_case "unalias removes"            "alias pp=echo aa; pp; unalias pp" "^aa$"
 # --- Timezone env ----
 run_case "ASM_TZ=0 shows UTC-ish"     "set ASM_TZ=0; date"            "[0-9]+"
 
+run_case "help table header"         "help"                                      "Command +│ Usage +│ Example"
+run_case "help row with example"     "help"                                      "^  undo +│ Reverse last del/move/copy +│ undo$"
+run_case "help sections"             "help"                                      "^  SCRIPTING \\(ASH\\)$"
 run_case "about shows developer"     "about"                                     "Developed by: Umer Farooq Khan"
 run_case "about shows GitHub"        "about"                                     "GitHub: +https://github.com/Umar-Khan-Yousafzai$"
 
