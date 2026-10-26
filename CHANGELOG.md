@@ -4,6 +4,24 @@ All notable changes to ASM Terminal. Versions follow [Semantic Versioning](https
 MAJOR for breaking changes, MINOR for new features, PATCH for fixes.
 The version lives in one place: `version.inc`.
 
+## [Unreleased]
+
+### Added
+- **Suggestions while typing**: the rest of a matching command from history shows in grey behind
+  the cursor. Right arrow, End, Ctrl+E or Ctrl+F accepts it; Enter runs only what was typed.
+  Commands run in the same folder that worked come first, then any that worked, then the rest.
+- **Tab lists every match**: while Tab cycles through file names, all matches show under the line
+  with the current one highlighted (folders in blue). Any other key closes the list.
+- **History remembers folder and result**: each entry keeps the folder it ran in and its exit
+  status. `history` marks failed commands with `[N]`, and `history .` lists only the commands run
+  in the current folder. The notes are stored in `~/.asm_history` as `#asm:HASH:STATUS` lines
+  after each command; older versions read them as comments.
+
+### Changed
+- `help` is now a table with Command, Usage and Example columns, grouped by section. Each run
+  picks a random example per command. Commands that destroy data show in red. On terminals
+  narrower than 95 columns the example moves to its own line.
+
 ## [2.3.0] - 2026-10-23
 
 A full code review of the shell found about a hundred defects. This release fixes them: command
