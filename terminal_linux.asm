@@ -228,179 +228,6 @@ section .data
                     db 10, 0
     welcome_len     equ $ - welcome_msg - 1
 
-    help_msg        db 10
-                    db "  ASM Terminal v", ASM_VERSION, " - Command Reference", 10
-                    db "  =====================================================", 10
-                    db 10
-                    db "  NAVIGATION", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    cd <path>       Change directory", 10
-                    db "                    cd /home        go to /home", 10
-                    db "                    cd ..           go up one level", 10
-                    db "                    cd -            go to previous dir", 10
-                    db "                    cd              go to $HOME", 10
-                    db "    pwd             Print working directory", 10
-                    db "                    pwd", 10
-                    db "    pushd <path>    Push dir onto stack and cd", 10
-                    db "                    pushd /tmp", 10
-                    db "    popd            Pop dir from stack and cd back", 10
-                    db "                    popd", 10
-                    db 10
-                    db "  FILES", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    ls [opts] [dir] List files (colored)", 10
-                    db "                    ls              compact listing", 10
-                    db "                    ls -l           long format", 10
-                    db "                    ls -a           show hidden files", 10
-                    db "                    ls -la /tmp     combined flags", 10
-                    db "    dir [path]      List directory (classic format)", 10
-                    db "                    dir             current directory", 10
-                    db "                    dir /home       specific path", 10
-                    db "    cat <file>      Display file contents", 10
-                    db "                    cat README.md", 10
-                    db "    type <file>     Display file contents (alias)", 10
-                    db "                    type config.txt", 10
-                    db "    copy <src> <dst>  Copy a file", 10
-                    db "                    copy file.txt backup.txt", 10
-                    db "    move <src> <dst>  Move/rename a file", 10
-                    db "                    move old.txt new.txt", 10
-                    db "    rename <s> <d>  Rename a file", 10
-                    db "                    rename data.csv data_old.csv", 10
-                    db "    del <file>      Delete a file", 10
-                    db "                    del temp.log", 10
-                    db "    mkdir <dir>     Create a directory", 10
-                    db "                    mkdir projects", 10
-                    db "    rmdir <dir>     Remove empty directory", 10
-                    db "                    rmdir old_folder", 10
-                    db "    grep <pat> <f>  Search file for pattern", 10
-                    db "                    grep TODO main.c", 10
-                    db "                    grep error log.txt", 10
-                    db 10
-                    db "  ENVIRONMENT", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    set             List all environment variables", 10
-                    db "    set <var>       Show value of a variable", 10
-                    db "                    set HOME", 10
-                    db "    set <var>=<val> Set environment variable", 10
-                    db "                    set EDITOR=vim", 10
-                    db "    export V=val    Same as set V=val", 10
-                    db "    unset <var>     Remove a variable (also an inherited one)", 10
-                    db "    whoami          Display current username", 10
-                    db "                    whoami", 10
-                    db 10
-                    db "  DISPLAY", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    echo <text>     Print text to screen", 10
-                    db "                    echo Hello World!", 10
-                    db "                    echo $HOME      expand variable", 10
-                    db "    cls             Clear the screen", 10
-                    db "    color <hex>     Set text color (Windows-style)", 10
-                    db "                    color 0A        green on black", 10
-                    db "                    color 0F        white on black", 10
-                    db "    title <text>    Set terminal window title", 10
-                    db "                    title My Shell", 10
-                    db 10
-                    db "  SYSTEM", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    ver             Show version info", 10
-                    db "    about           About ASM Terminal and its developer", 10
-                    db "    update          Check for a new version ('update install' installs it)", 10
-                    db "    date            Show current date and time", 10
-                    db "                    date   -> Fri Apr  3 08:14:01 PM PKT 2026", 10
-                    db "                    zone: ASM_TZ=<seconds east of UTC>, or TZ=EST5", 10
-                    db "    time            Same as date", 10
-                    db "    uptime          Show system uptime", 10
-                    db "                    uptime -> up 2 days, 05:30:12", 10
-                    db "    free            Show memory usage", 10
-                    db "                    free   -> MemTotal, MemFree, ...", 10
-                    db "    calc <expr>     Integer calculator (+, -, *, /), left to right", 10
-                    db "                    calc 2 + 3          -> 5", 10
-                    db "                    calc 100 / 3        -> 33", 10
-                    db "                    calc 10 + 5 * 2     -> 30", 10
-                    db "    source <file>   Execute commands from a file", 10
-                    db "                    source setup.sh", 10
-                    db "    help            This help message", 10
-                    db "    exit [N]        Exit the terminal (with status N)", 10
-                    db "    true / false    Set status 0 / 1", 10
-                    db "    clear           Clear screen (same as cls)", 10
-                    db "    which NAME      Show if NAME is a builtin, alias or program", 10
-                    db "    history [-c]    List command history (-c clears it)", 10
-                    db "    kill [-SIG] ID  Send a signal to a PID or %job", 10
-                    db "    bench [-n N] CMD  Time CMD over N runs (mean/min/max, memory)", 10
-                    db "                    bench -n 20 ls -la", 10
-                    db "    undo            Reverse the last del, move/rename or copy", 10
-                    db "    trash [empty]   List what del/move/copy keep, or empty it", 10
-                    db "                    (kept in ~/.asm_trash; del/move/copy -f skip it)", 10
-                    db "    trace [-a] CMD  Show programs, files and network used by CMD", 10
-                    db "    sandbox [-w] [-n] [-b] CMD  Run CMD with no sockets (-n: IPv4/6", 10
-                    db "                    only); file changes only in /tmp (-w: also here).", 10
-                    db "                    Run 'sandbox' alone for what it does not block", 10
-                    db 10
-                    db "  CUSTOMIZATION", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    alias <n>=<cmd> Create a command alias", 10
-                    db "                    alias ll=ls -la", 10
-                    db "                    alias gs=git status", 10
-                    db "                    alias          list all aliases", 10
-                    db "    unalias <name>  Remove an alias", 10
-                    db "    theme [name]    Switch color theme", 10
-                    db "                    theme           list themes", 10
-                    db "                    theme default   bold colors", 10
-                    db "                    theme minimal   no colors", 10
-                    db "                    theme classic   original look", 10
-                    db 10
-                    db "  JOB CONTROL", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    <cmd> &         Run command in background", 10
-                    db "                    sleep 10 &", 10
-                    db "    jobs            List background jobs", 10
-                    db "    fg <n>          Bring job to foreground", 10
-                    db "                    fg 1", 10
-                    db "    bg <n>          Resume a stopped job in the background", 10
-                    db "    Ctrl+Z          Stop the running command (then fg or bg)", 10
-                    db 10
-                    db "  SHELL FEATURES", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    cmd1 ; cmd2     Run multiple commands", 10
-                    db "                    echo hi ; echo bye", 10
-                    db "    cmd1 && cmd2    Run next only if prev succeeded", 10
-                    db "                    mkdir d && cd d", 10
-                    db "    cmd1 || cmd2    Run next only if prev failed", 10
-                    db "                    cd /x || echo no such dir", 10
-                    db "    cmd > file      Redirect output to file", 10
-                    db "                    ls > files.txt", 10
-                    db "    cmd >> file     Append output to file", 10
-                    db "                    echo log >> out.txt", 10
-                    db "    cmd < file      Redirect input from file", 10
-                    db "    cmd | cmd       Pipe (handled by /bin/sh)", 10
-                    db "                    ls | grep .asm", 10
-                    db "    $VAR            Expand environment variable", 10
-                    db "                    echo $HOME", 10
-                    db "    $? $$ $((1+2))  Last status, shell PID, arithmetic", 10
-                    db "    NAME=value      Set a variable", 10
-                    db 10
-                    db "  SCRIPTING (ASH)", 10
-                    db "  ---------------------------------------------------", 10
-                    db "    if CMD; then ...; elif CMD; then ...; else ...; fi", 10
-                    db "    while CMD; do ...; done     until CMD; do ...; done", 10
-                    db "    for x in a b c; do echo $x; done", 10
-                    db "    break / continue / ! CMD / { cmd1; cmd2; }", 10
-                    db "    name() { echo $1 $#; return 0; }   define a function", 10
-                    db "    test EXPR, [ EXPR ]  -f -d -e -z -n = != -eq -lt -gt ...", 10
-                    db "                    i=0; while [ $i -lt 3 ]; do i=$((i+1)); done", 10
-                    db "    Blocks can span lines; ASH shows '> ' until it is complete.", 10
-                    db "    Tab             Filename completion", 10
-                    db "    Up/Down         Browse command history", 10
-                    db "    Ctrl+R          Reverse search history", 10
-                    db "    Ctrl+L          Clear screen", 10
-                    db "    Ctrl+W          Delete word backward", 10
-                    db "    Ctrl+U          Clear line before cursor", 10
-                    db "    Ctrl+C          Cancel current input", 10
-                    db 10
-                    db "  CONFIG: ~/.asmrc is executed on startup.", 10
-                    db "  HISTORY: ~/.asm_history persists across sessions.", 10
-                    db 10, 0
-    help_len        equ $ - help_msg - 1
 
     ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Linux] - developed by Umer Farooq Khan", 10, 0
     ver_len         equ $ - ver_msg - 1
@@ -1182,6 +1009,7 @@ main:
     lea rdi, [input_buf]
     call history_save_entry
 .main_no_save:
+    call sm_before_run              ; remember the folder for the history note
 
 .main_run:
     ; OSC 133 C — output region begins (only for a terminal that asked for
@@ -1198,6 +1026,7 @@ main:
     call script_isig_on
     call ash_feed_line
     call script_isig_off
+    call sm_after_run               ; note folder and exit status in history
 
     ; OSC 133 D;<exit_status> — end of command + exit code
     cmp byte [osc_enabled], 0
@@ -2058,6 +1887,7 @@ read_line:
 
     ; A ^C that interrupted a child is not meant for this line
     mov byte [ctrl_c_flag], 0
+    call sm_line_start              ; suggestions, Tab menu (ash/smart.asm)
 
 .rl_loop:
     ; Check for pending Ctrl+C
@@ -2097,6 +1927,7 @@ read_line:
     je .rl_dispatch
     ; Tab was active but non-tab pressed - cancel tab state
     mov byte [tab_active], 0
+    call sm_close_menu              ; erase the list of matches
 
 .rl_dispatch:
     cmp bx, VK_RETURN
@@ -2191,6 +2022,7 @@ read_line:
     jmp .rl_loop
 
 .rl_enter:
+    call sm_clear_extras            ; no grey suggestion left on the screen
     ; Park the cursor behind the last character so the newline lands below
     ; the whole (possibly wrapped) line
     mov eax, [line_len]
@@ -2275,7 +2107,7 @@ read_line:
     mov ecx, [line_cursor]
     mov edx, [line_len]
     cmp ecx, edx
-    jge .rl_loop
+    jge .rl_accept                  ; at the end: take the suggestion
     lea rdi, [line_buf]
 .rl_right_fwd:
     inc ecx
@@ -2297,8 +2129,14 @@ read_line:
 
 .rl_end:
     mov eax, [line_len]
+    cmp eax, [line_cursor]
+    je .rl_accept                   ; already at the end: take the suggestion
     mov [line_cursor], eax
     call update_cursor_pos
+    jmp .rl_loop
+
+.rl_accept:
+    call sm_accept
     jmp .rl_loop
 
 .rl_up:
@@ -2475,6 +2313,7 @@ read_line:
 
 .rl_ctrlc:
     mov byte [ctrl_c_flag], 0
+    call sm_clear_extras
     ; ^C goes behind the text, not into the middle of a wrapped line
     mov eax, [line_len]
     cmp eax, [line_cursor]
@@ -2630,12 +2469,15 @@ redraw_line:
 
     ; --- Syntax highlighting for line content (ash/highlight.asm) ---
     call hl_draw_line
+    call sm_draw_suggestion     ; grey rest of a history entry (ash/smart.asm)
+    mov r13d, eax               ; its columns
 
-    ; r12d = cells used by prompt + text = where the cursor is now
+    ; r12d = cells used by prompt + text + suggestion = where the cursor is now
     lea rdi, [line_buf]
     mov esi, [line_len]
     call utf8_cols
     add eax, [prompt_total_len]
+    add eax, r13d
     mov r12d, eax
     call cur_cols
     mov ecx, eax
@@ -2643,6 +2485,7 @@ redraw_line:
     xor edx, edx
     div ecx                     ; eax = end row, edx = end column
     mov r14d, eax
+    mov [rd_end_row], eax
     test edx, edx
     jnz .rd_erase
     test r12d, r12d
@@ -2837,6 +2680,8 @@ history_add:
     jz .ha_done                 ; duplicate, skip
 
 .ha_add:
+    mov eax, [history_write_idx]
+    call sm_note_clear              ; folder and status are not known yet
     ; Copy string to history buffer at write_idx
     mov eax, [history_write_idx]
     imul eax, HISTORY_ENTRY_SIZE
@@ -3157,6 +3002,7 @@ tab_complete:
     jne .tc_find_slash
     lea r15d, [rcx + 1]
 .tc_slash_done:
+    mov [tab_name_off], r15d        ; for the menu (ash/smart.asm)
 
     ; The directory to read goes to find_pattern: "." or the part before the name
     lea rdi, [find_pattern]
@@ -3358,6 +3204,7 @@ tab_complete:
     add eax, [tab_tail_len]
     mov [line_len], eax
     call redraw_line
+    call sm_tab_menu                ; list all matches under the line
     jmp .tc_done
 
 .tc_giveup:
@@ -5722,19 +5569,6 @@ restore_redirection:
 ; Command Handlers - Each takes rdi = args pointer (or NULL/0)
 ; System V AMD64 calling convention
 ; ============================================================================
-
-; ---------- handler_help ----------
-handler_help:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 16
-
-    lea rdi, [help_msg]
-    mov esi, help_len
-    call print_string_len
-
-    leave
-    ret
 
 ; ---------- handler_cls ----------
 handler_cls:
@@ -9688,6 +9522,10 @@ load_history:
     test ecx, ecx
     jz .lh_line
     lea rdi, [cmd_line_buf]
+    call sm_load_meta               ; "#asm:HASH:STATUS" notes the entry before
+    test eax, eax
+    jnz .lh_line
+    lea rdi, [cmd_line_buf]
     call history_add
     jmp .lh_line
 
@@ -9732,12 +9570,16 @@ history_rewrite:
 .hr_loop:
     cmp r13d, [history_count]
     jae .hr_write
+    lea rax, [history_read_buf + 262144 - HISTORY_ENTRY_SIZE - 32]
+    cmp r12, rax
+    jae .hr_write                   ; no room for another entry and its note
     mov eax, [history_write_idx]
     sub eax, [history_count]
     add eax, r13d
     jge .hr_idx
     add eax, HISTORY_COUNT
 .hr_idx:
+    mov ebx, eax                    ; slot, for the note
     imul eax, HISTORY_ENTRY_SIZE
     lea rsi, [history_buf]
     add rsi, rax
@@ -9753,6 +9595,14 @@ history_rewrite:
     mov byte [r12], 10
     inc r12
     inc r13d
+    mov eax, ebx
+    call sm_has_meta
+    test eax, eax
+    jz .hr_loop
+    mov rdi, r12
+    mov eax, ebx
+    call sm_fmt_meta
+    mov r12, rax
     jmp .hr_loop
 
 .hr_write:
@@ -13737,3 +13587,5 @@ align 1
 %include "ash/tools.asm"
 %include "ash/glob.asm"
 %include "ash/highlight.asm"
+%include "ash/help.asm"
+%include "ash/smart.asm"

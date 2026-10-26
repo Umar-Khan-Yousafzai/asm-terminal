@@ -16,6 +16,8 @@ asm-terminal/
   ash/glob.asm          # pathname expansion for builtin arguments
   ash/tools.asm         # bench, undo/trash (+ safe del/move/copy, ~/.asm_trash with .journal), trace, sandbox
   ash/highlight.asm     # live command colors (Dark+ palette, danger list for Linux + Windows)
+  ash/help.asm          # `help` table: HSEC/HROW rows (Command | Usage | random Example)
+  ash/smart.asm         # grey history suggestions, Tab match list, history folder/status notes (#asm: lines)
   ash/update.asm        # update / update install, background update check (curl + sha256sum)
   version.inc           # the one place the version is written
   CHANGELOG.md          # release notes source (the release workflow requires an entry)
@@ -130,7 +132,7 @@ build.bat               # Requires: NASM, MinGW ld
 - `free` — memory info from /proc/meminfo
 - `calc <expr>` — integer math (`calc 10 + 5 * 2`)
 - `source <file>` — execute commands from file
-- `help` — full command reference with examples
+- `help` — table of commands with usage and a random example (`ash/help.asm`)
 - `exit [N]`: exit terminal
 - `about`: developer credit
 - `update` / `update install`: check for, and install, a newer release (Linux)
