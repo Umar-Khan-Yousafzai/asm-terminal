@@ -8,5 +8,5 @@
 ; The Makefile, release workflow and 'update' command all read it.
 ; ============================================================================
 %ifndef ASM_VERSION
-    %define ASM_VERSION "2.3.0"
+    %define ASM_VERSION "2.4.0"
 %endif

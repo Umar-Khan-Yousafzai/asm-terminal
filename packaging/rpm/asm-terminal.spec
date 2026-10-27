@@ -49,6 +49,9 @@ install -Dm0644 icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg \
 %{_datadir}/icons/hicolor/symbolic/apps/asm-terminal-symbolic.svg
 
 %changelog
+* Fri Oct 23 2026 Umar Khan Yousafzai <ionkhan@gmail.com> - 2.4.0-1
+- Release 2.4.0, see CHANGELOG.md
+
 * Fri Oct 23 2026 Umar Khan Yousafzai <ionkhan@gmail.com> - 2.3.0-1
 - Release 2.3.0, see CHANGELOG.md
 

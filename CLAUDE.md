@@ -13,6 +13,7 @@ asm-terminal/
   ash/ash_exec.asm      # ASH native executor (%included by terminal_linux.asm)
   ash/builtins.asm      # builtins that run inside ASH: exit, true/false, which, history, kill, ...
   ash/script.asm        # ASH script engine: if/while/for, && ||, test, $((...)), functions
+  ash/glob.asm          # pathname expansion for builtin arguments
   ash/tools.asm         # bench, undo/trash (+ safe del/move/copy, ~/.asm_trash with .journal), trace, sandbox
   ash/highlight.asm     # live command colors (Dark+ palette, danger list for Linux + Windows)
   ash/help.asm          # `help` table: HSEC/HROW rows (Command | Usage | random Example)
@@ -54,7 +55,7 @@ build.bat               # Requires: NASM, MinGW ld
 - **Callee-saved registers**: rbx, rbp, r12-r15
 - **Terminal control**: termios via ioctl (TCGETS/TCSETS) for raw mode
 - **Colors/cursor**: ANSI escape sequences
-- **External commands**: ASH (`ash/ash_exec.asm`) parses the line and runs commands/pipelines natively (PATH lookup, pipe2, dup2, fork, execve). Control flow (`if`, `while`, `for`, `&&`, `||`) runs in `ash/script.asm`. `$(...)`, backticks and builtins in pipelines run natively. Lines it does not understand yet (globs, `case`, a loop piped into another command, here-docs) fall back to fork + execve(/bin/sh -c). Expanded values are encoded with a private marker byte (0x01 + byte) by `expand_env_vars` so every scanner treats them as plain text; consumers decode them (`ash_sh_decode` for the sh fallback). Never re-scan expanded text for syntax
+- **External commands**: ASH (`ash/ash_exec.asm`) parses the line and runs commands/pipelines natively (PATH lookup, pipe2, dup2, fork, execve). Control flow (`if`, `while`, `for`, `&&`, `||`) runs in `ash/script.asm`. `$(...)`, backticks and builtins in pipelines run natively. `case`/`esac`, `"$@"` and `. file` run natively. Lines it does not understand yet (globs in pipelines, background jobs and `for` lists, a piped or redirected `case` or loop, here-docs) fall back to fork + execve(/bin/sh -c). Expanded values are encoded with a private marker byte (0x01 + byte) by `expand_env_vars` so every scanner treats them as plain text; consumers decode them (`ash_sh_decode` for the sh fallback). Never re-scan expanded text for syntax
 - **Signals**: sigaction for SIGINT (Ctrl+C), SIGWINCH, SIGTERM/SIGHUP/SIGQUIT/SIGSEGV (restore the terminal, alternate stack). SIGTSTP/SIGTTIN/SIGTTOU are ignored in the shell. **Job control** (`jc_*` helpers): each foreground pipeline and background job gets its own process group and the tty (`tcsetpgrp`); waits use WUNTRACED; Ctrl+Z makes a Stopped job. ISIG is turned on while a command line runs so Ctrl+C reaches builtin loops
 - **Terminal state**: `raw_active` and `interactive_mode` guard `setup_raw_mode`/`restore_terminal`, which are no-ops when stdin/stdout are not a terminal. Terminal-only output goes through `term_write` (fd 1, never a redirect target). The prompt is built once per command into `prompt_buf` and redrawn with one write per key
 - **Update**: `ash/update.asm` runs `curl` and `sha256sum` (argv arrays, never a shell string). The startup check calls api.github.com in a detached process at most once a day; opt out with `ASM_NO_UPDATE_CHECK=1` in the environment or `set ASM_NO_UPDATE_CHECK=1` in `~/.asmrc` (empty or `0` does not opt out). `update install` verifies the binary against the release's `SHA256SUMS` and never installs an older version. That file is fetched from the same release, so it detects corruption, not a hostile release
@@ -163,7 +164,8 @@ build.bat               # Requires: NASM, MinGW ld
 - **Autoexec**: `autoexec.txt` in binary directory (ignored unless owned by the user or root and not world-writable)
 - **Syntax highlighting**: command word colored as you type (`ash/highlight.asm`): teal = known/on PATH, blue = help, gray = unknown, red = destroys data; matching is by whole word, `NO_COLOR`/`TERM=dumb` turn colors off
 - **Prompt**: `user@host:path$` format with theme colors
-- **Wildcard expansion**: `*` and `?` handled via /bin/sh for external commands
+- **Wildcard expansion**: `*`, `?`, `[...]` natively for builtins (`ash/glob.asm`, called from `dc_run_handler`); external commands in pipelines, background jobs and `for` lists via /bin/sh
+- **Line length**: `LINE_MAX` (65536) bounds a command line after expansion; `MAX_INPUT` (512) is only the line editor and history entry size
 
 ## Data Layout
 
@@ -173,7 +175,7 @@ build.bat               # Requires: NASM, MinGW ld
 - Day/month name tables (`dow_names`, `month_names`), color mapping (`win_to_ansi`)
 - Theme tables (3 presets, 64 bytes each)
 
-### .bss Section (about 20 MB of address space, mostly the 16 MB script arena; zero-filled, not stored in the ELF file, only touched pages cost memory)
+### .bss Section (about 22 MB of address space, mostly the 16 MB script arena; zero-filled, not stored in the ELF file, only touched pages cost memory)
 - Terminal state: `orig_termios`, `raw_termios` (60 bytes each)
 - Line editor: `input_buf`, `line_buf` (512 each), `line_len`, `line_cursor`
 - History: `history_buf` (250KB), circular buffer with 500 entries; `history_read_buf` (256KB) for loading the file
