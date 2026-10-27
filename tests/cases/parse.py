@@ -128,7 +128,7 @@ o, e, st, _ = sh(['echo $' + long, 'echo ${' + long + '}', 'echo alive'], cwd=c)
 T.check("very long variable names do not crash", 'alive' in o, (o, st))
 
 c = T.tmpdir()
-o, e, st, _ = sh(['set A=' + 'x' * 300, 'echo $A $A $A END', 'echo st=$?', 'touch $A$A$A'], cwd=c)
+o, e, st, _ = sh(['set A=' + 'x' * 450, 'echo ' + '$A ' * 160 + 'END', 'echo st=$?', 'touch ' + '$A' * 160], cwd=c)
 T.check("expansion that does not fit is an error, not a cut", 'line too long' in e and not any('END' in l for l in o)
         and 'st=1' in o and not os.listdir(c), (o, e, os.listdir(c)))
 
