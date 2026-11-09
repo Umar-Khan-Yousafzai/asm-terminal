@@ -15,32 +15,7 @@
 ; Included from terminal_linux.asm (Linux x86-64, System V ABI).
 ; ============================================================================
 
-%define SYS_PIPE2           293
-%define O_CLOEXEC           0x80000
-%define ENOENT              2
-%define E2BIG               7
-%define ENOEXEC             8
-%define ENOMEM              12
-%define EACCES              13
-%define EISDIR              21
-%define ENOTDIR             20
-%define ETXTBSY             26
-%define ENAMETOOLONG        36
-%define ELOOP               40
-%define EINTR               4
 %define EBADINTERP          1000        ; not an errno: file exists but its #! interpreter does not
-
-; Job control
-%define JC_SYS_SETPGID      109
-%define JC_SYS_GETPGRP      111
-%define JC_SYS_ACCESS       21
-%define JC_TIOCGPGRP        0x540F
-%define JC_TIOCSPGRP        0x5410
-%define JC_SIGTTIN          21
-%define JC_SIGTTOU          22
-%define JC_SIG_IGN          1
-%define JC_VQUIT            1
-%define JC_VSUSP            10
 
 %define ASH_MAX_STAGES      16
 %define ASH_MAX_ARGS        256         ; argv slots for all stages, NULLs included
@@ -137,8 +112,8 @@ section .bss
     jc_shell_pgid       resd 1          ; the shell's own process group
     jc_pgid             resd 1          ; group of the job being started, 0 = none yet
     jc_tmp              resd 1          ; argument cell for the TIOC*PGRP ioctls
-    jc_sa               resb 32         ; struct sigaction scratch
-    script_termios      resb 60
+    jc_sa               resb SIGACTION_SIZE         ; struct sigaction scratch
+    script_termios      resb TERMIOS_SIZE
 
 section .text
 
@@ -640,20 +615,20 @@ jc_ensure:
     mov byte [jc_state], 2
     cmp byte [interactive_mode], 0
     je .jce_off
-    mov eax, JC_SYS_GETPGRP
-    syscall
+    mov eax, SYS_GETPGRP
+    SYSCALL
     mov [jc_shell_pgid], eax
     mov eax, SYS_IOCTL
     xor edi, edi
-    mov esi, JC_TIOCGPGRP
+    mov esi, TIOCGPGRP
     lea rdx, [jc_tmp]
-    syscall
+    SYSCALL
     test rax, rax
     js .jce_off                     ; no controlling terminal
     mov eax, [jc_tmp]
     cmp eax, [jc_shell_pgid]
     jne .jce_off                    ; started in the background
-    mov edi, JC_SIG_IGN
+    mov edi, SIG_IGN
     call jc_tty_signals
     mov byte [jc_state], 1
     mov eax, 1
@@ -674,31 +649,31 @@ jc_child_setup:
     cmp byte [jc_state], 1
     jne .jcs_ret
     mov r8d, edi
-    mov eax, JC_SYS_SETPGID
+    mov eax, SYS_SETPGID
     xor edi, edi
     mov esi, [jc_pgid]
-    syscall
+    SYSCALL
     test r8d, r8d
     jz .jcs_sig
-    mov eax, JC_SYS_GETPGRP
-    syscall
+    mov eax, SYS_GETPGRP
+    SYSCALL
     mov [jc_tmp], eax
     mov eax, SYS_IOCTL
     xor edi, edi
-    mov esi, JC_TIOCSPGRP
+    mov esi, TIOCSPGRP
     lea rdx, [jc_tmp]
-    syscall
+    SYSCALL
 .jcs_sig:
     xor edi, edi                    ; SIGTTOU and SIGTTIN back to the default action
     call jc_tty_signals
 .jcs_ret:
     ret
 
-; jc_tty_signals(rdi = JC_SIG_IGN or 0 for the default) - set the disposition
+; jc_tty_signals(rdi = SIG_IGN or 0 for the default) - set the disposition
 ; of SIGTTOU and SIGTTIN. The shell ignores both so it can hand the terminal
 ; back from a background group; jobs must see the default.
 jc_tty_signals:
-    mov r8d, JC_SIGTTOU
+    mov r8d, SIGTTOU
 .jts_next:
     lea rsi, [jc_sa]
     mov [rsi], rdi
@@ -710,11 +685,11 @@ jc_tty_signals:
     mov edi, r8d
     xor edx, edx
     mov r10d, 8
-    syscall
+    SYSCALL
     mov rdi, r9
-    cmp r8d, JC_SIGTTIN
+    cmp r8d, SIGTTIN
     je .jts_ret
-    mov r8d, JC_SIGTTIN
+    mov r8d, SIGTTIN
     jmp .jts_next
 .jts_ret:
     ret
@@ -734,17 +709,17 @@ jc_parent_after_fork:
     mov [jc_pgid], edi
     mov r9d, 1
 .jpf_set:
-    mov eax, JC_SYS_SETPGID
-    syscall                         ; setpgid(pid, pgid); EACCES after exec is fine
+    mov eax, SYS_SETPGID
+    SYSCALL                         ; setpgid(pid, pgid); EACCES after exec is fine
     test r9d, r9d
     jz .jpf_ret
     test r8d, r8d
     jz .jpf_ret
     mov eax, SYS_IOCTL
     xor edi, edi
-    mov esi, JC_TIOCSPGRP
+    mov esi, TIOCSPGRP
     lea rdx, [jc_pgid]
-    syscall
+    SYSCALL
 .jpf_ret:
     ret
 
@@ -755,9 +730,9 @@ jc_give_tty:
     mov [jc_tmp], edi
     mov eax, SYS_IOCTL
     xor edi, edi
-    mov esi, JC_TIOCSPGRP
+    mov esi, TIOCSPGRP
     lea rdx, [jc_tmp]
-    syscall
+    SYSCALL
 .jgt_ret:
     ret
 
@@ -800,7 +775,7 @@ jc_wait_fg:
 .jw_go:
     xor r10d, r10d
     mov eax, SYS_WAIT4
-    syscall
+    SYSCALL
     cmp rax, -EINTR
     je .jw_wait
     mov eax, [rsp]
@@ -833,7 +808,7 @@ jc_wait_fg:
     neg edi
     mov esi, SIGCONT
     mov eax, SYS_KILL
-    syscall
+    SYSCALL
     jmp .jw_wait
 .jw_ret:
     mov eax, r13d
@@ -890,17 +865,17 @@ script_isig_apply:
     mov edi, STDIN_FD
     mov esi, TCGETS
     lea rdx, [script_termios]
-    syscall
+    SYSCALL
     test rax, rax
     js .sia_ret
     or dword [script_termios + TERMIOS_C_LFLAG], ISIG
-    mov byte [script_termios + TERMIOS_C_CC + JC_VQUIT], 0
-    mov byte [script_termios + TERMIOS_C_CC + JC_VSUSP], 0
+    mov byte [script_termios + TERMIOS_C_CC + VQUIT_INDEX], 0
+    mov byte [script_termios + TERMIOS_C_CC + VSUSP_INDEX], 0
     mov eax, SYS_IOCTL
     mov edi, STDIN_FD
     mov esi, TCSETS
     lea rdx, [script_termios]
-    syscall
+    SYSCALL
 .sia_ret:
     ret
 
@@ -929,7 +904,7 @@ script_isig_off:
     mov edi, STDIN_FD
     mov esi, TCSETS
     lea rdx, [raw_termios]
-    syscall
+    SYSCALL
 .sioff_ret:
     ret
 
@@ -958,7 +933,7 @@ ash_run:
     lea rdi, [ash_pipes + rbx * 8]
     mov esi, O_CLOEXEC
     mov eax, SYS_PIPE2
-    syscall
+    SYSCALL_X pipe2
     test rax, rax
     js .ar_pipe_fail
     lea rdi, [ash_pipes + rbx * 8]  ; with fd 0-2 closed a pipe end can be 0, 1
@@ -987,7 +962,7 @@ ash_run:
     cmp ebx, r12d
     jae .ar_forked
     mov eax, SYS_FORK
-    syscall
+    SYSCALL_X fork
     test rax, rax
     js .ar_fork_fail
     jz .ar_child
@@ -1026,7 +1001,7 @@ ash_run:
 .ar_wait_go:
     lea r10, [ash_rusage]
     mov eax, SYS_WAIT4
-    syscall
+    SYSCALL
     cmp rax, -EINTR
     je .ar_wait_again
     test rax, rax
@@ -1087,7 +1062,7 @@ ash_run:
     neg edi
     mov esi, SIGCONT
     mov eax, SYS_KILL
-    syscall
+    SYSCALL
     jmp .ar_wait_again
 
 ; ====== CHILD (ebx = stage index, r12d = stage count) ======
@@ -1103,7 +1078,7 @@ ash_run:
     mov edi, [ash_pipes + rbx * 8 - 8]      ; read end of pipe (i-1)
     xor esi, esi
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     jmp .ac_out
 .ac_first_in:
     cmp byte [redir_stdin_active], 0
@@ -1111,11 +1086,11 @@ ash_run:
     mov edi, [redir_stdin_fd]
     xor esi, esi
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     test edi, edi                   ; the original must not leak into the command
     jz .ac_out
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .ac_out:
     ; stdout: next pipe, or the '>' set up by parse_redirection
@@ -1125,7 +1100,7 @@ ash_run:
     mov edi, [ash_pipes + rbx * 8 + 4]      ; write end of pipe i
     mov esi, 1
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     jmp .ac_files
 .ac_last_out:
     cmp byte [redir_stdout_active], 0
@@ -1133,11 +1108,11 @@ ash_run:
     mov edi, [redir_stdout_fd]
     mov esi, 1
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     cmp edi, 1
     je .ac_files
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .ac_files:
     ; Redirections in the order they were written
@@ -1167,7 +1142,7 @@ ash_run:
     mov edi, [r15 + 8]
     mov esi, edx
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
 .ac_op_next:
     inc r14d
     jmp .ac_op_loop
@@ -1214,17 +1189,17 @@ ash_exec_argv:
     jz .ax_exit_bad
     mov edi, eax
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 .ax_exit_prev:
     mov edi, [prev_exit_status]
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 .ax_exit_bad:
     lea rdi, [bi_msg_exit_num]
     call ash_write_err
     mov edi, 2
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 .ax_not_exit:
 
     call build_merged_envp          ; overlay vars are exported to children
@@ -1353,7 +1328,7 @@ ash_exec_argv:
     call ash_write_err
     mov edi, ebx
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 
 ; Try execve(rdi, argv, merged_envp). Returns only on failure, having noted
 ; the reason: r15d for permission denied, [rbp-64] for anything else but
@@ -1363,7 +1338,7 @@ ash_exec_argv:
     mov rsi, r12
     lea rdx, [merged_envp]
     mov eax, SYS_EXECVE
-    syscall
+    SYSCALL
     neg eax                         ; eax = errno
     mov edx, eax
     cmp edx, ENOEXEC
@@ -1386,8 +1361,8 @@ ash_exec_argv:
     ; Either the file is missing, or it exists and its #! interpreter does not
     mov rdi, rbx
     xor esi, esi                    ; F_OK
-    mov eax, JC_SYS_ACCESS
-    syscall
+    mov eax, SYS_ACCESS
+    SYSCALL
     test rax, rax
     mov edx, EBADINTERP
     jz .ax_try_note
@@ -1400,7 +1375,7 @@ ash_exec_argv:
     mov rdi, rbx
     lea rsi, [stat_buf]
     mov eax, SYS_STAT
-    syscall
+    SYSCALL
     test rax, rax
     jnz .ax_try_denied
     mov eax, [stat_buf + STAT_ST_MODE]
@@ -1433,7 +1408,7 @@ ash_exec_argv:
     lea rsi, [ash_sh_argv]
     lea rdx, [merged_envp]
     mov eax, SYS_EXECVE
-    syscall
+    SYSCALL
     ret
 
 ; ----------------------------------------------------------------------------
@@ -1491,7 +1466,7 @@ ash_child_builtin:
     call dc_run_handler
     mov edi, [last_exit_status]
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 .cb_ret:
     add rsp, 8
     pop rbx
@@ -1514,7 +1489,7 @@ ash_child_open:
     mov r12d, edx
     mov edx, FILE_MODE_DEFAULT
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .aco_fail
     cmp eax, r12d
@@ -1523,10 +1498,10 @@ ash_child_open:
     mov edi, r13d
     mov esi, r12d
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     mov edi, r13d
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .aco_done:
     add rsp, 8
     pop r13
@@ -1543,15 +1518,13 @@ ash_child_open:
     call ash_write_err
     mov edi, 1
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 
 ; ----------------------------------------------------------------------------
 ; ash_pipe_lift(rdi = int fds[2]) -> eax = 0, or -1 with both ends closed.
 ; Moves an end that landed on fd 0, 1 or 2 (the shell was started with one of
 ; them closed) up to fd 3 or above, keeping close-on-exec.
 ; ----------------------------------------------------------------------------
-%define F_DUPFD_CLOEXEC     1030
-
 ash_pipe_lift:
     push rbp
     mov rbp, rsp
@@ -1566,13 +1539,13 @@ ash_pipe_lift:
     mov esi, F_DUPFD_CLOEXEC
     mov edx, 3
     mov eax, SYS_FCNTL
-    syscall
+    SYSCALL
     test rax, rax
     js .apl_fail
     mov edi, [rbx + r12 * 4]
     mov [rbx + r12 * 4], eax
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .apl_next:
     inc r12d
     cmp r12d, 2
@@ -1585,10 +1558,10 @@ ash_pipe_lift:
 .apl_fail:
     mov edi, [rbx]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov edi, [rbx + 4]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov eax, -1
     pop r12
     pop rbx
@@ -1609,10 +1582,10 @@ ash_close_pipes:
     jge .acp_done
     mov edi, [ash_pipes + rbx * 8]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov edi, [ash_pipes + rbx * 8 + 4]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     inc ebx
     jmp .acp_loop
 .acp_done:
@@ -1635,5 +1608,5 @@ ash_write_err:
 .awe_write:
     mov edi, 2
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     ret

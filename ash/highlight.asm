@@ -857,27 +857,27 @@ hl_in_path:
 
 ; access(rdi, X_OK) and not a directory -> eax = 1
 .access:
-    mov eax, 21                         ; SYS_access
-    mov esi, 1                          ; X_OK
-    syscall
+    mov eax, SYS_ACCESS
+    mov esi, X_OK
+    SYSCALL
     test eax, eax
     jnz .acc_no
     ; directories are "executable" too; reject them
-    sub rsp, 152                        ; struct stat (144) + align
+    sub rsp, STAT_SIZE + 8              ; struct stat + align
     mov rsi, rsp
-    mov eax, 4                          ; SYS_stat
-    syscall
+    mov eax, SYS_STAT
+    SYSCALL
     test eax, eax
     jnz .acc_no_pop
     mov eax, [rsp + 24]                 ; st_mode
     and eax, 0xF000
     cmp eax, 0x4000
     je .acc_no_pop
-    add rsp, 152
+    add rsp, STAT_SIZE + 8
     mov eax, 1
     ret
 .acc_no_pop:
-    add rsp, 152
+    add rsp, STAT_SIZE + 8
 .acc_no:
     xor eax, eax
     ret

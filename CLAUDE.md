@@ -19,6 +19,7 @@ asm-terminal/
   ash/help.asm          # `help` table: HSEC/HROW rows (Command | Usage | random Example)
   ash/smart.asm         # grey history suggestions, Tab match list, history folder/status notes (#asm: lines)
   ash/update.asm        # update / update install, background update check (curl + sha256sum)
+  platform/linux.inc    # Linux ABI: syscall numbers, flags, errno, struct layouts, SYSCALL macros
   version.inc           # the one place the version is written
   CHANGELOG.md          # release notes source (the release workflow requires an entry)
   LICENSE               # MIT
@@ -50,6 +51,7 @@ build.bat               # Requires: NASM, MinGW ld
 
 ### Linux Version (`terminal_linux.asm`)
 - **Target**: Linux x86-64, ELF64, pure syscalls (no libc dependency)
+- **Platform layer**: `platform/linux.inc` holds every number the kernel defines (syscall numbers, `O_*`, `SIG*`, `E*`, ioctl requests) and the struct layouts (`STAT_*`, `TERMIOS_*`, `DIRENT64_*`, `STACK_T_*`, `SIGACT_FILL`). Shared code never writes one of these numbers itself. Every system call ends in `SYSCALL` (rax >= 0 or -errno) or, for calls another system has under a different shape, `SYSCALL_X name` (fork, pipe2, getcwd, getdents64, clock_gettime, uname, utimensat, time, readlink_self); both keep all registers but rax, rcx, r11. `SYSNO SYS_READ` loads a number that is 0 on Linux. Linux-only code is inside `%ifdef PLATFORM_LINUX`
 - **Calling convention**: System V AMD64 (args: rdi, rsi, rdx, rcx, r8, r9)
 - **Syscall convention**: rdi, rsi, rdx, r10, r8, r9 (number in rax, clobbers rcx/r11)
 - **Callee-saved registers**: rbx, rbp, r12-r15

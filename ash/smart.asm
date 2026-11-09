@@ -61,7 +61,7 @@ sm_cwd_hash:
     lea rdi, [sm_cwd_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     mov edx, 1
     test rax, rax
     jle .h_ret
@@ -352,10 +352,10 @@ sm_after_run:
     mov rbx, rax
     sub rbx, rsi                        ; bytes
     lea rdi, [history_file_path]
-    mov esi, O_WRONLY | O_APPEND | 0x80000
+    mov esi, O_WRONLY | O_APPEND | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .r_ret
     mov edi, eax
@@ -363,10 +363,10 @@ sm_after_run:
     lea rsi, [sm_meta_line]
     mov rdx, rbx
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     pop rdi
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .r_ret:
     pop rbx
     ret
@@ -536,10 +536,10 @@ sm_tab_menu:
 
     mov byte [tab_menu_shown], 0
     lea rdi, [find_pattern]
-    mov esi, O_RDONLY | O_DIRECTORY | 0x80000
+    mov esi, O_RDONLY | O_DIRECTORY | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .t_ret
     mov [rsp + 24], eax
@@ -553,7 +553,7 @@ sm_tab_menu:
     lea rsi, [dirent_buf]
     mov edx, DIRENT_BUF_SIZE
     mov eax, SYS_GETDENTS64
-    syscall
+    SYSCALL_X getdents64
     test rax, rax
     jle .t_closed
     mov r14d, eax
@@ -650,7 +650,7 @@ sm_tab_menu:
 .t_closed:
     mov edi, [rsp + 24]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     cmp dword [rsp], 2
     jb .t_ret                           ; one match: no menu
 

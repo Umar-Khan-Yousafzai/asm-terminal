@@ -56,7 +56,7 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(LD) $(OBJ) -o $(TARGET) -e _start
 
-$(OBJ): $(SRC) version.inc $(wildcard ash/*.asm)
+$(OBJ): $(SRC) version.inc $(wildcard ash/*.asm) $(wildcard platform/*)
 	$(NASM) -f elf64 $(SRC) -o $(OBJ)
 
 version:
