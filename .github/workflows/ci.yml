@@ -114,7 +114,14 @@ jobs:
 
       - name: Run test harness
         run: |
-          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          # The runner's long generated host name wraps the 80-column prompt
+          # the terminal tests draw on
+          sudo scutil --set HostName asm-ci
+          sudo hostname asm-ci
+          # Expected outputs are GNU's (wc padding, ls messages)
+          gnubin="$(brew --prefix coreutils)/libexec/gnubin"
+          export PATH="$gnubin:$PATH"
+          export ASM_TEST_PATH="$gnubin:/usr/bin:/bin"
           bash tests/run_tests.sh
 
       - name: Upload binary artifact

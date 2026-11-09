@@ -180,16 +180,16 @@ T.check(">&2 writes builtin output to stderr", 'err' in e and 'err' not in o and
 c = T.tmpdir()
 write(c, 'sc.txt', 'echo from-script\n/bin/echo from-ext\n')
 o = lines_of(['source sc.txt > out.txt', 'echo back', '/bin/true > a1 > a2', 'echo b > f9 > f10',
-              '/bin/ls -l /proc/self/fd > fdlist'], cwd=c)
+              T.FDLIST + ' > fdlist'], cwd=c)
 T.check("source with > keeps the outer redirection", ANSI.sub('', read(c, 'out.txt') or '') == 'from-script\nfrom-ext\n'
         and 'from-script' not in o and 'back' in o, (o, read(c, 'out.txt')))
 T.check("repeated > creates every file", all(has(c, n) for n in ('a1', 'a2', 'f9', 'f10')), os.listdir(c))
 fds = [l for l in (read(c, 'fdlist') or '').split('\n') if '->' in l]
-T.check("no stray descriptors reach the child", len(fds) == 4 and sum('fdlist' in l for l in fds) == 1, fds)
+T.check("no stray descriptors reach the child", len(fds) == 3 and sum('fdlist' in l for l in fds) == 1, fds)
 
 c = T.tmpdir()
-o = lines_of(['for i in 1 2 3 4 5 6 7 8; do echo x > a$i > b$i; done', '/bin/ls /proc/$$/fd | /usr/bin/wc -l'], cwd=c)
-T.check("redirections do not leak descriptors in the shell", o and o[-1].isdigit() and int(o[-1]) < 8, o)
+o = lines_of(['for i in 1 2 3 4 5 6 7 8; do echo x > a$i > b$i; done', T.FDLIST + ' $$ | /usr/bin/wc -l'], cwd=c)
+T.check("redirections do not leak descriptors in the shell", o and o[-1].isdigit() and int(o[-1].strip()) < 8, o)
 
 # ---------------------------------------------------------------- builtin arguments
 c = T.tmpdir()
@@ -257,14 +257,15 @@ for line in ['x=$(/usr/bin/printf %s hi); echo "$x" > cap1.txt',
              'cd $(/usr/bin/dirname /tmp/x); pwd > ' + c + '/cap4.txt',
              'cd ' + c,
              'ls $(/usr/bin/printf %s ' + c + ') > cap5.txt',
-             'sandbox /usr/bin/printf sb | /usr/bin/cat > cap6.txt',
-             'echo piped | trace /usr/bin/cat > cap7.txt']:
+             # trace and sandbox need Linux; echo is the builtin stage there
+             ('echo -n sb' if T.MACOS else 'sandbox /usr/bin/printf sb') + ' | /usr/bin/cat > cap6.txt',
+             'echo piped | ' + ('/usr/bin/cat' if T.MACOS else 'trace /usr/bin/cat') + ' > cap7.txt']:
     s.run(line)
 s.close()
 T.check("tty: x=$(external) holds only the output", read(c, 'cap1.txt') == 'hi\n', repr(read(c, 'cap1.txt')))
 T.check("tty: $(external) in an argument holds only the output", read(c, 'cap2.txt') == 'hi\n', repr(read(c, 'cap2.txt')))
 T.check("tty: backticks hold only the output", read(c, 'cap3.txt') == 'hi\n', repr(read(c, 'cap3.txt')))
-T.check("tty: cd $(dirname) works", (read(c, 'cap4.txt') or '').strip() == '/tmp', repr(read(c, 'cap4.txt')))
+T.check("tty: cd $(dirname) works", (read(c, 'cap4.txt') or '').strip() == os.path.realpath('/tmp'), repr(read(c, 'cap4.txt')))
 T.check("tty: ls $(printf dir) lists the directory", 'esc.bin' in (read(c, 'cap5.txt') or ''), repr(read(c, 'cap5.txt')))
 T.check("tty: a builtin stage leaves the pipe clean", read(c, 'cap6.txt') == 'sb', repr(read(c, 'cap6.txt')))
 T.check("tty: trace stage gets its stdin", 'piped' in (read(c, 'cap7.txt') or '') and '\x1b' not in (read(c, 'cap7.txt') or ''),

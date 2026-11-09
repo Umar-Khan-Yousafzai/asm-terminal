@@ -6646,6 +6646,20 @@ handler_whoami:
     jmp .hw_print
 
 .hw_env:
+%ifdef PLATFORM_MACOS
+    ; macOS keeps most accounts in Directory Services, not /etc/passwd:
+    ; the login name of this session comes from the kernel
+    lea rdi, [passwd_buf]
+    mov esi, 256
+    mov eax, SYS_GETLOGIN
+    SYSCALL
+    test rax, rax
+    jnz .hw_user
+    lea rdi, [passwd_buf]
+    cmp byte [rdi], 0
+    jne .hw_print
+.hw_user:
+%endif
     lea rdi, [str_user]
     call getenv_internal
     test rax, rax
@@ -9313,7 +9327,7 @@ load_history:
     mov ebx, eax                    ; fd
 
     ; The commands typed here may hold passwords: keep the file private
-    mov eax, 91                     ; SYS_fchmod
+    mov eax, SYS_FCHMOD
     mov edi, ebx
     mov esi, 0o600
     SYSCALL

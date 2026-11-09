@@ -72,7 +72,7 @@ section .data
     upd_msg_dlfail      db "Download failed. Nothing was changed.", 10, 0
     upd_msg_nosums      db "Could not get checksums for this release. Nothing was changed.", 10, 0
     upd_msg_badsum      db "Checksum mismatch. The download was deleted and nothing was changed.", 10, 0
-    upd_msg_nosha       db "Could not run 'sha256sum', so the download cannot be checked. Nothing was changed.", 10, 0
+    upd_msg_nosha       db "Could not run '", SHA256_TOOL, "', so the download cannot be checked. Nothing was changed.", 10, 0
     upd_msg_replaced    db "This program was replaced on disk after it started.", 10
                         db "Type 'exit', start the terminal again, then run 'update install'.", 10, 0
     upd_msg_managed     db "This copy belongs to a package manager or an AppImage. Update it there.", 10, 0
@@ -499,7 +499,7 @@ upd_read_self:
     lea rsi, [upd_self]
     mov edx, UPD_SELF_MAX
     mov eax, SYS_READLINK
-    SYSCALL
+    SYSCALL_X readlink_self
     test rax, rax
     jle .rs_fail
     cmp rax, UPD_SELF_MAX

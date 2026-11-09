@@ -63,6 +63,11 @@ section .data
     ash_msg_nomem       db ": Cannot allocate memory", 10, 0
     ash_msg_cantexec    db ": cannot execute", 10, 0
     ash_s_exit          db "exit", 0
+    ; Builtins that a pipeline stage runs even when PATH has a program of that
+    ; name: macOS ships /usr/bin/alias, cd, type, jobs, fg, bg ... as sh
+    ; scripts, which only see the state of a throwaway sh
+    ash_stage_first     db "alias", 0, "unalias", 0, "cd", 0, "type", 0
+                        db "jobs", 0, "fg", 0, "bg", 0, 0
     ; Why an exec failed: errno, exit status, message. Anything not listed
     ; is "cannot execute" (126).
     ash_exec_errs:
@@ -1210,6 +1215,24 @@ ash_exec_argv:
     mov eax, SYS_EXIT
     SYSCALL
 .ax_not_exit:
+
+    lea rbx, [ash_stage_first]
+.ax_first:
+    cmp byte [rbx], 0
+    je .ax_first_done
+    mov rdi, r13
+    mov rsi, rbx
+    call str_icompare
+    test eax, eax
+    jz .ax_first_run
+.ax_first_skip:
+    inc rbx
+    cmp byte [rbx - 1], 0
+    jne .ax_first_skip
+    jmp .ax_first
+.ax_first_run:
+    call ash_child_builtin          ; returns only outside a pipeline stage
+.ax_first_done:
 
     call build_merged_envp          ; overlay vars are exported to children
 

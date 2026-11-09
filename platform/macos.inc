@@ -20,6 +20,7 @@
 %define PLATFORM_MACOS      1
 %define PLATFORM_NAME       "macOS"
 %define UPDATE_ASSET        "asm-terminal-macos-x86_64"  ; release file `update` installs
+%define SHA256_TOOL         "shasum"                     ; run as shasum -a 256
 
 %macro SYSCALL 0
     syscall
@@ -56,6 +57,7 @@
 %define SYS_GETPID          MAC_SYS(20)
 %define SYS_GETUID          MAC_SYS(24)
 %define SYS_GETEUID         MAC_SYS(25)
+%define SYS_GETLOGIN        MAC_SYS(49)
 %define SYS_ACCESS          MAC_SYS(33)
 %define SYS_KILL            MAC_SYS(37)
 %define SYS_PIPE            MAC_SYS(42)

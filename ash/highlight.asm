@@ -881,7 +881,7 @@ hl_in_path:
     SYSCALL
     test eax, eax
     jnz .acc_no_pop
-    mov eax, [rsp + 24]                 ; st_mode
+    mov eax, [rsp + STAT_ST_MODE]       ; st_mode (masked below)
     and eax, 0xF000
     cmp eax, 0x4000
     je .acc_no_pop

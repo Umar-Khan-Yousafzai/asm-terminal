@@ -23,10 +23,10 @@ def fake_env(tag="v99.0.0"):
         f.write("""#!/bin/bash
 PATH=/usr/bin:/bin
 echo "call $*" >> "%(d)s/log"
-for n in 0 1 2; do echo "fd$n $(readlink /proc/$PPID/fd/$n)" >> "%(d)s/log"; done
+%(fdlist)s $PPID | while read -r n _ t; do case $n in 0|1|2) echo "fd$n $t";; esac; done >> "%(d)s/log"
 [ -f "%(d)s/fail" ] && exit 22
 cat "%(d)s/latest"
-""" % {"d": d})
+""" % {"d": d, "fdlist": T.FDLIST})
     os.chmod(sh, 0o755)
     env = {"PATH": d + "/bin:/usr/bin:/bin"}
     return d, env
@@ -176,7 +176,7 @@ s = start(None, env9)
 s.run("echo still-alive")
 T.check("startup: 40 KB HOME does not break the shell", "still-alive" in s.screen(), s.screen()[-200:])
 s.send("exit\r")
-T.check("startup: 40 KB HOME exits cleanly", wait_for(lambda: not s.alive(), 5) and s.p.returncode == 0, s.p.returncode)
+T.check("startup: 40 KB HOME exits cleanly", wait_for(lambda: (s.settle(0.05, 0.1), not s.alive())[1], 5) and s.p.returncode == 0, s.p.returncode)
 s.close()
 
 T.cleanup()

@@ -14,9 +14,28 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
+# The shell prints physical paths (getcwd), so temporary folders are named
+# that way too: on macOS /tmp and $TMPDIR are links into /private.
+TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+export TMPDIR
+PHYS_TMP="$(cd /tmp && pwd -P)"
+OS="$(uname -s)"
+# Commands for the tests' own shells: GNU tools on macOS (ASM_TEST_PATH),
+# because the expected outputs are GNU's (wc padding, ls messages)
+export ASM_TEST_PATH="${ASM_TEST_PATH:-/usr/bin:/bin}"
+# The release asset `update` downloads, and the checksum tool it runs
+if [[ "$OS" == Darwin ]]; then
+    ASSET=asm-terminal-macos-x86_64 SHA_TOOL=shasum
+    sha256() { shasum -a 256 "$@"; }
+else
+    ASSET=asm-terminal-linux-x86_64 SHA_TOOL=sha256sum
+    sha256() { sha256sum "$@"; }
+fi
+export ASSET
+
 # Hermetic: a throwaway HOME so tests never read or write the real
 # ~/.asm_history, ~/.asm_trash or ~/.asmrc, and no update check goes online.
-TEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/asm-tests.XXXXXX")"
+TEST_HOME="$(mktemp -d "$TMPDIR/asm-tests.XXXXXX")"
 trap 'rm -rf -- "$TEST_HOME"' EXIT
 export HOME="$TEST_HOME"
 export ASM_NO_UPDATE_CHECK=1
@@ -56,7 +75,7 @@ echo "=== ASM Terminal smoke tests ==="
 # --- Basic commands ----
 run_case "echo prints arg"            "echo hello world"              "hello world"
 run_case "pwd prints cwd"             "pwd"                           "^/"
-run_case "cd + pwd roundtrip"         "cd /tmp; pwd"                  "^/tmp$"
+run_case "cd + pwd roundtrip"         "cd /tmp; pwd"                  "^$PHYS_TMP$"
 run_case "whoami returns something"   "whoami"                        "\S+"
 
 # --- Variable expansion ----
@@ -155,8 +174,8 @@ VER=$(sed -n 's/.*ASM_VERSION "\(.*\)".*/\1/p' "$HERE/../version.inc")
 run_case "ver shows version.inc"      "ver"                                       "v$VER "
 UPD=$(mktemp -d)
 mkdir -p "$UPD/bin" "$UPD/srv" "$UPD/inst"
-cp "$BIN" "$UPD/srv/asm-terminal-linux-x86_64"; printf X >> "$UPD/srv/asm-terminal-linux-x86_64"
-(cd "$UPD/srv" && sha256sum asm-terminal-linux-x86_64 > SHA256SUMS)
+cp "$BIN" "$UPD/srv/$ASSET"; printf X >> "$UPD/srv/$ASSET"
+(cd "$UPD/srv" && sha256 "$ASSET" > SHA256SUMS)
 echo '{"tag_name": "v99.0.0"}' > "$UPD/srv/latest"
 cat > "$UPD/bin/curl" <<CURL
 #!/usr/bin/env bash
@@ -176,7 +195,7 @@ fi
 # install: run a copy so the real binary is untouched
 cp "$BIN" "$UPD/inst/asm"
 printf 'update install\nexit\n' | env PATH="$UPD/bin:$PATH" HOME="$UPD" "$UPD/inst/asm" >/dev/null 2>&1
-if cmp -s "$UPD/inst/asm" "$UPD/srv/asm-terminal-linux-x86_64" && [[ ! -e "$UPD/inst/asm.new" ]]; then
+if cmp -s "$UPD/inst/asm" "$UPD/srv/$ASSET" && [[ ! -e "$UPD/inst/asm.new" ]]; then
     pass=$((pass + 1)); echo "  [pass] update install replaces binary"
 else
     fail=$((fail + 1)); failures+=("update install replaces binary"); echo "  [FAIL] update install replaces binary"
@@ -217,10 +236,13 @@ run_case "bench reports timing"       "bench -n 3 true"                         
 run_case "bench counts failures"      "bench -n 2 false"                          "failed 2$"
 UT=$(mktemp -d)
 printf 'one\n' > "$UT/a.txt"; printf 'two\n' > "$UT/b.txt"
-HOME="$UT" run_case "undo del"                   "cd $UT; del a.txt; undo; cat a.txt"        "^one$"
-HOME="$UT" run_case "undo move restores both"    "cd $UT; move a.txt b.txt; undo; cat b.txt" "^two$"
-HOME="$UT" run_case "undo copy overwrite"        "cd $UT; copy a.txt b.txt; undo; cat b.txt" "^two$"
-HOME="$UT" run_case "undo empty"                 "undo"                                      "^undo: nothing to undo$"
+# Not "HOME=... run_case": bash 3.2 (macOS) keeps such an assignment after a function
+HOME="$UT"
+run_case "undo del"                   "cd $UT; del a.txt; undo; cat a.txt"        "^one$"
+run_case "undo move restores both"    "cd $UT; move a.txt b.txt; undo; cat b.txt" "^two$"
+run_case "undo copy overwrite"        "cd $UT; copy a.txt b.txt; undo; cat b.txt" "^two$"
+run_case "undo empty"                 "undo"                                      "^undo: nothing to undo$"
+HOME="$TEST_HOME"
 rm -rf "$UT"
 run_case "trace lists programs"       "trace /bin/true"                           "exec +/bin/true"
 run_case "trace shows file writes"    "trace /bin/cp /etc/hostname /tmp/asm_trace_probe" "write +/tmp/asm_trace_probe"

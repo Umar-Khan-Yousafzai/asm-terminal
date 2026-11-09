@@ -242,8 +242,11 @@ T.check('bench gives the command an empty stdin', 'after' in out and 'mean' in o
 d = T.tmpdir()
 h = T.tmpdir()
 open(d + '/in', 'w').write('input-data\n')
-for name, cmd in (('sandbox', 'sandbox -b /usr/bin/printf sb'), ('trace', 'trace /usr/bin/printf sb'),
-                  ('bench', 'bench -n 2 /usr/bin/printf sb')):
+tool_cmds = (('sandbox', 'sandbox -b /usr/bin/printf sb'), ('trace', 'trace /usr/bin/printf sb'),
+             ('bench', 'bench -n 2 /usr/bin/printf sb'))
+if T.MACOS:   # trace and sandbox need Linux (tools_trace.py, tools_sandbox.py)
+    tool_cmds = tool_cmds[2:]
+for name, cmd in tool_cmds:
     for op in ('>', '>>'):
         if os.path.exists(d + '/f'):
             os.unlink(d + '/f')
@@ -255,10 +258,11 @@ for name, cmd in (('sandbox', 'sandbox -b /usr/bin/printf sb'), ('trace', 'trace
             ok_ = got == b'sb'
         T.check('%s %s file receives the output' % (name, op), ok_ and 'mean' not in out if name != 'bench' else ok_, (got, out[-200:]))
         T.check('%s %s file: nothing leaks to the terminal' % (name, op), (name == 'bench' and 'mean' not in out) or (name != 'bench' and 'sb' not in out.replace(cmd, '').replace('printf sb', '')), out[-200:])
-out, err, st = sh('sandbox -b /usr/bin/cat < in > f\nexit\n', home=h, cwd=d)
-T.check('sandbox < in > f copies the file', rd(d + '/f') == b'input-data\n', (rd(d + '/f'), out[-200:]))
-out, err, st = sh('trace /usr/bin/cat < in > f\nexit\n', home=h, cwd=d)
-T.check('trace < in > f copies the file', rd(d + '/f') == b'input-data\n', (rd(d + '/f'), out[-200:]))
+if not T.MACOS:
+    out, err, st = sh('sandbox -b /usr/bin/cat < in > f\nexit\n', home=h, cwd=d)
+    T.check('sandbox < in > f copies the file', rd(d + '/f') == b'input-data\n', (rd(d + '/f'), out[-200:]))
+    out, err, st = sh('trace /usr/bin/cat < in > f\nexit\n', home=h, cwd=d)
+    T.check('trace < in > f copies the file', rd(d + '/f') == b'input-data\n', (rd(d + '/f'), out[-200:]))
 out, err, st = sh('bench -n 3 /usr/bin/cat < in > f\nexit\n', home=h, cwd=d)
 T.check('bench does not feed its stdin or stdout to the runs', b'input-data' not in (rd(d + '/f') or b''), rd(d + '/f'))
 

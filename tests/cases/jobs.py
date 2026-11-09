@@ -3,31 +3,12 @@ import os, sys, time, subprocess, signal
 import ptytest as T
 
 
-def pstat(pid):
-    """(state, ppid, pgrp) of a process, or None when it is gone."""
-    try:
-        st = open('/proc/%d/stat' % pid).read()
-    except OSError:
-        return None
-    rest = st[st.rindex(')') + 2:].split()
-    if rest[0] == 'Z':
-        return None
-    return rest[0], int(rest[1]), int(rest[2])
+pstat = T.proc_stat     # (state, ppid, pgrp) or None
 
 
 def find(tag, under=None):
     """Pids of live processes whose argv contains the exact word `tag`."""
-    out = []
-    for d in os.listdir('/proc'):
-        if not d.isdigit():
-            continue
-        try:
-            argv = open('/proc/%s/cmdline' % d, 'rb').read().split(b'\0')
-        except OSError:
-            continue
-        if tag.encode() in argv and pstat(int(d)):
-            out.append(int(d))
-    return sorted(out)
+    return T.find_procs(tag)
 
 
 def waitfor(fn, t=3.0):
@@ -265,7 +246,7 @@ T.check("2>&1 before > keeps stderr on the pipe", any("nonexistent_xx" in l for 
 o, e, st = sh("/bin/ls /nonexistent_xx >/dev/null 2>&1 | /bin/cat\necho end\nexit\n", cwd=d)
 T.check("> before 2>&1 sends stderr to the file", not any("nonexistent_xx" in l for l in o), o)
 open(os.path.join(d, 'in.txt'), 'w').write('in')
-sh("/bin/ls -l /proc/self/fd > out.txt\n/bin/ls -l /proc/self/fd < in.txt > out2.txt\nexit\n", cwd=d)
+sh("%s > out.txt\n%s < in.txt > out2.txt\nexit\n" % (T.FDLIST, T.FDLIST), cwd=d)
 fds = open(os.path.join(d, 'out.txt')).read() + open(os.path.join(d, 'out2.txt')).read()
 T.check("redirect source descriptor is not inherited", 'out.txt' in fds and fds.count('out.txt') == 1 and 'out2.txt' in fds
         and fds.count('out2.txt') == 1 and fds.count('in.txt') == 1, fds)

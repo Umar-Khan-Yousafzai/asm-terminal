@@ -17,6 +17,7 @@
 %define PLATFORM_LINUX      1
 %define PLATFORM_NAME       "Linux"
 %define UPDATE_ASSET        "asm-terminal-linux-x86_64"  ; release file `update` installs
+%define SHA256_TOOL         "sha256sum"                  ; checks the download
 
 %macro SYSCALL 0
     syscall

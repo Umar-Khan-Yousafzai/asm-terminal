@@ -34,6 +34,7 @@ section .data
     mac_s_free_err      db "free: cannot read the memory size", 10, 0
     tr_s_trace          db "trace", 0
     sb_s_sandbox        db "sandbox", 0
+    mac_s_deleted       db " (deleted)", 0
     mac_s_no_trace      db "trace: not available on macOS (it needs Linux ptrace)", 10, 0
     mac_s_no_sandbox    db "sandbox: not available on macOS (it needs Linux seccomp and Landlock); the command was not run", 10, 0
 
@@ -43,6 +44,10 @@ section .bss
     mac_fdset           resb 128        ; select() set for fds 0..1023
     mac_oid             resd 16
     mac_sysval          resq 1
+    mac_stat_tmp        resb 144        ; struct stat64
+    mac_self_ino        resq 1
+    mac_self_dev        resd 1
+    mac_self_known      resb 1
 
 section .text
 
@@ -52,6 +57,7 @@ section .text
 _start:
     mov [saved_envp], rdx
     and rsp, -16
+    call mac_self_record
     call main
     mov edi, eax
     mov eax, SYS_EXIT
@@ -461,6 +467,9 @@ mac_utimensat:
 ; ----------------------------------------------------------------------------
 ; mac_readlink_self(rdi = ignored, rsi = buf, edx = size) -> rax = length
 ; What readlink("/proc/self/exe") gives on Linux: proc_info PIDPATHINFO.
+; Linux adds " (deleted)" when that file is gone or was replaced; here the
+; same happens when the path no longer names the file seen at startup
+; (mac_self_record), so `update install` never writes over a newer program.
 ; ----------------------------------------------------------------------------
 mac_readlink_self:
     push rdi
@@ -469,20 +478,46 @@ mac_readlink_self:
     push r8
     push r9
     push r10
-    mov eax, SYS_GETPID
-    SYSCALL
-    mov esi, eax
-    mov edi, MAC_PROC_PIDINFO
-    mov edx, MAC_PIDPATHINFO
-    xor r10d, r10d
-    lea r8, [mac_path_tmp]
-    mov r9d, MAC_PATH_MAX
-    mov eax, SYS_PROC_INFO
-    SYSCALL
+    call mac_self_path
     test rax, rax
     js .ret
-    mov rsi, [rsp + 32]             ; buf
-    mov edx, [rsp + 24]             ; size
+    cmp byte [mac_self_known], 0
+    je .copy_start
+    lea rdi, [mac_path_tmp]
+    lea rsi, [mac_stat_tmp]
+    mov eax, SYS_STAT
+    SYSCALL
+    test rax, rax
+    jnz .gone
+    mov eax, [mac_stat_tmp]             ; st_dev
+    cmp eax, [mac_self_dev]
+    jne .gone
+    mov rax, [mac_stat_tmp + 8]         ; st_ino
+    cmp rax, [mac_self_ino]
+    je .copy_start
+.gone:
+    lea rdi, [mac_path_tmp]
+    xor eax, eax
+.end:
+    cmp byte [rdi + rax], 0
+    je .append
+    inc eax
+    jmp .end
+.append:
+    cmp eax, MAC_PATH_MAX - 16
+    jae .copy_start
+    lea rsi, [mac_s_deleted]
+    add rdi, rax
+.app:
+    mov cl, [rsi]
+    mov [rdi], cl
+    inc rsi
+    inc rdi
+    test cl, cl
+    jnz .app
+.copy_start:
+    mov rsi, [rsp + 32]                 ; buf
+    mov edx, [rsp + 24]                 ; size
     lea rdi, [mac_path_tmp]
     xor eax, eax
 .copy:
@@ -501,6 +536,42 @@ mac_readlink_self:
     pop rdx
     pop rsi
     pop rdi
+    ret
+
+; mac_self_path() -> mac_path_tmp = this program's path, rax < 0 on error
+; (clobbers rdi, rsi, rdx, r8, r9, r10)
+mac_self_path:
+    mov eax, SYS_GETPID
+    SYSCALL
+    mov esi, eax
+    mov edi, MAC_PROC_PIDINFO
+    mov edx, MAC_PIDPATHINFO
+    xor r10d, r10d
+    lea r8, [mac_path_tmp]
+    mov r9d, MAC_PATH_MAX - 16          ; room for " (deleted)"
+    mov eax, SYS_PROC_INFO
+    SYSCALL
+    ret
+
+; mac_self_record() - remember the device and inode of this program's file
+mac_self_record:
+    push rbx
+    call mac_self_path
+    test rax, rax
+    js .done
+    lea rdi, [mac_path_tmp]
+    lea rsi, [mac_stat_tmp]
+    mov eax, SYS_STAT
+    SYSCALL
+    test rax, rax
+    jnz .done
+    mov eax, [mac_stat_tmp]
+    mov [mac_self_dev], eax
+    mov rax, [mac_stat_tmp + 8]
+    mov [mac_self_ino], rax
+    mov byte [mac_self_known], 1
+.done:
+    pop rbx
     ret
 
 ; ----------------------------------------------------------------------------

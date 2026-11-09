@@ -10,7 +10,7 @@ def tty_flags(fd):
 def wait_dead(s, t=3):
     end = time.time() + t
     while time.time() < end and s.alive():
-        time.sleep(0.05)
+        s.settle(0.05, 0.1)             # keep reading: a full pty blocks the exit
     return not s.alive()
 
 
@@ -254,7 +254,7 @@ s.settle()
 s.send("ls zzz\t"); s.settle(0.5)
 T.check("Tab without match returns", s.alive() and "zzz" in s.screen())
 try:
-    st = open("/proc/%d/stat" % s.p.pid).read().split(")")[1].split()[0]
+    st = T.proc_stat(s.p.pid)[0]
 except Exception:
     st = "?"
 T.check("Tab without match does not spin", st != "R", st)
@@ -267,10 +267,10 @@ clear(s)
 s.send("cat be bar baz" + "\x1b[D" * 8 + "\t"); s.settle(0.4)
 T.check("Tab keeps text after the cursor", s.screen().rstrip().endswith("cat beta bar baz"), s.screen())
 clear(s)
-fds_before = len(os.listdir("/proc/%d/fd" % s.p.pid))
+fds_before = len(T.fds_of(s.p.pid))
 for _ in range(5):
     s.send("al\tx\x15"); s.settle(0.3)
-fds_after = len(os.listdir("/proc/%d/fd" % s.p.pid))
+fds_after = len(T.fds_of(s.p.pid))
 T.check("abandoned Tab cycles leak no fd", fds_after == fds_before, (fds_before, fds_after))
 s.send("al\t\t"); s.settle(0.4)
 T.check("Tab cycles through matches", re.search(r"(cat |\$ )al(pha|pine)$", s.screen().rstrip(), re.M) is not None, s.screen())

@@ -1,6 +1,8 @@
 import os, re, sys, time, subprocess
 import ptytest as T
 
+T.linux_only("trace")   # needs ptrace
+
 # trace runs a helper under ptrace; skip everything if the sandbox we are
 # in does not allow ptrace at all.
 home = T.tmpdir()
