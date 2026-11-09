@@ -1,8 +1,8 @@
 # ASM Terminal
 
-A terminal/shell written **entirely in x86-64 assembly** (NASM) for Linux and Windows. No libc, no runtime, just raw syscalls (Linux) or Win32 API (Windows). The Linux version is the full-featured one; the Windows version has a smaller command set (see [Windows version](#windows-version)).
+A terminal/shell written **entirely in x86-64 assembly** (NASM) for Linux, macOS and Windows. No libc, no runtime, just raw syscalls (Linux, macOS) or Win32 API (Windows). The Linux version is the full-featured one, and macOS runs the same code (see [macOS](#macos)); the Windows version has a smaller command set (see [Windows version](#windows-version)).
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![arch](https://img.shields.io/badge/arch-x86__64-green) ![asm](https://img.shields.io/badge/language-NASM-red) ![platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
+![license](https://img.shields.io/badge/license-MIT-blue) ![arch](https://img.shields.io/badge/arch-x86__64-green) ![asm](https://img.shields.io/badge/language-NASM-red) ![platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 
 ```
  █████╗ ███████╗███╗   ███╗    ████████╗███████╗██████╗ ███╗   ███╗
@@ -110,6 +110,7 @@ Every [release](https://github.com/Umar-Khan-Yousafzai/asm-terminal/releases/lat
 - Fedora / RHEL / openSUSE: `sudo dnf install ./asm-terminal-<version>-1.x86_64.rpm` (command: `asm-terminal`)
 - Debian / Ubuntu: `sudo apt install ./asm-terminal_<version>_amd64.deb`
 - Any distro: the `.AppImage`, or the `asm-terminal-<version>-linux-x86_64.tar.gz` tarball
+- macOS 11+ (Intel, or Apple Silicon through Rosetta 2): `asm-terminal-macos-x86_64`. Make it executable (`chmod +x`) and put it on your `PATH`; it is not notarized, so a downloaded copy may first need `xattr -d com.apple.quarantine asm-terminal-macos-x86_64`
 - Windows: `asm-terminal-<version>-windows-x86_64-setup.exe`, or the `.zip` with `install.bat`
 
 The packages install the command `asm-terminal`; they do not install `asm`.
@@ -140,6 +141,15 @@ Releases are automatic. To ship one:
 The Release workflow sees that tag `v2.2.0` does not exist yet, runs the test suite, builds every package, and publishes the release with notes built from that CHANGELOG section (plus install commands, platforms and checksums). It fails without a CHANGELOG entry, when a test fails, or when an asset is missing. Preview the notes with `bash packaging/release-notes.sh 2.2.0`.
 
 A release is only published from `main` (or a `v*` tag). Running the workflow by hand from another branch builds and tests but does not publish, and a manual run refuses to touch a version that already has a release unless `replace_existing` is set.
+
+### macOS
+Requires NASM (`brew install nasm`) and the Xcode Command Line Tools (`xcode-select --install`).
+```bash
+make
+```
+Produces `terminal`, a Mach-O x86-64 binary for macOS 11 and later; on Apple Silicon it runs through Rosetta 2 (`softwareupdate --install-rosetta`). `make terminal-macos` cross-builds it on Linux with `ld64.lld`.
+
+The macOS build has the Linux feature set except `trace` and `sandbox`, which need Linux (ptrace, seccomp, Landlock) and say so. `free` shows total and free memory, and `update install` checks downloads with `shasum -a 256`.
 
 ### Windows
 Requires NASM and MinGW `ld`.

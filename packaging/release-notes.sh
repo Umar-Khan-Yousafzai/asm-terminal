@@ -56,6 +56,7 @@ Remove with \`curl -fsSL $REPO_URL/releases/latest/download/install.sh | sh -s -
 | Debian / Ubuntu / Mint | \`asm-terminal_${VERSION}_amd64.deb\` | \`sudo apt install ./asm-terminal_${VERSION}_amd64.deb\` |
 | Any Linux | \`asm-terminal-$VERSION-x86_64.AppImage\` | \`chmod +x\` it, then run it |
 | Windows 10/11 | \`asm-terminal-$VERSION-windows-x86_64-setup.exe\` | run the installer |
+| macOS 11+ (Intel, Apple Silicon via Rosetta 2) | \`asm-terminal-macos-x86_64\` | \`chmod +x\` it; the first run may need \`xattr -d com.apple.quarantine\` because it is not notarized |
 
 ## Update
 
@@ -65,8 +66,9 @@ Package installs update through their package manager.
 ## Supported platforms
 
 - Linux x86-64: any distribution. Static binary with no libc. The update check and \`update install\` use \`curl\` and \`sha256sum\`.
+- macOS 11 or later, x86-64 (Apple Silicon runs it through Rosetta 2). \`trace\` and \`sandbox\` need Linux and say so; \`update install\` checks with \`shasum -a 256\`.
 - Windows 10/11 x64.
-- Not yet: ARM64, macOS, 32-bit.
+- Not yet: native ARM64, 32-bit.
 EOF
 
 if [ -n "$SUMS" ] && [ -f "$SUMS" ]; then
