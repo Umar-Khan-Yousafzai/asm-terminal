@@ -875,8 +875,8 @@ script_isig_apply:
     test rax, rax
     js .sia_ret
     or dword [script_termios + TERMIOS_C_LFLAG], ISIG
-    mov byte [script_termios + TERMIOS_C_CC + VQUIT_INDEX], 0
-    mov byte [script_termios + TERMIOS_C_CC + VSUSP_INDEX], 0
+    mov byte [script_termios + TERMIOS_C_CC + VQUIT_INDEX], POSIX_VDISABLE
+    mov byte [script_termios + TERMIOS_C_CC + VSUSP_INDEX], POSIX_VDISABLE
     mov eax, SYS_IOCTL
     mov edi, STDIN_FD
     mov esi, TCSETS

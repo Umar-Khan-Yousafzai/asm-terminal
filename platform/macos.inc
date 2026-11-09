@@ -130,6 +130,7 @@
 %define VTIME_INDEX         17
 %define VQUIT_INDEX         9
 %define VSUSP_INDEX         10
+%define POSIX_VDISABLE      0xFF            ; a c_cc value that turns the key off
 
 ; ----------------------------------------------------------------------------
 ; Signals

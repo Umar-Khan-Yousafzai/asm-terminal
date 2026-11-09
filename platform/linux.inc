@@ -114,6 +114,7 @@
 %define VTIME_INDEX         5       ; c_cc[VTIME]
 %define VQUIT_INDEX         1       ; c_cc[VQUIT]
 %define VSUSP_INDEX         10      ; c_cc[VSUSP]
+%define POSIX_VDISABLE      0               ; a c_cc value that turns the key off
 
 ; ----------------------------------------------------------------------------
 ; Signals
