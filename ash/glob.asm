@@ -602,7 +602,8 @@ glob_level:
     cmp byte [glob_err], 0
     jne .gl_ret
     mov r13d, [glob_plen]
-    mov r12, [glob_comps + rbx * 8]
+    lea r11, [glob_comps]
+    mov r12, [r11 + rbx * 8]
     mov eax, [glob_ncomp]
     dec eax
     xor r14d, r14d
@@ -754,7 +755,8 @@ glob_level:
     jae .gl_release
     cmp byte [glob_err], 0
     jne .gl_release
-    mov rdi, [glob_ptrs + r14 * 8]
+    lea r11, [glob_ptrs]
+    mov rdi, [r11 + r14 * 8]
     xor esi, esi
     call glob_append
     test eax, eax
@@ -1202,7 +1204,8 @@ glob_multi:
     call str_copy
     lea rdi, [glob_out_buf]
     call str_len
-    lea rdi, [glob_out_buf + rax]
+    lea r11, [glob_out_buf]
+    lea rdi, [r11 + rax]
     mov byte [rdi], ' '
     inc rdi
 .gm_each_name:

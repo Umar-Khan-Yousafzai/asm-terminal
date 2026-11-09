@@ -140,7 +140,8 @@ ash_parse:
     cmp ebx, ASH_MAX_STAGES
     jae .ap_fail
     imul eax, ebx, STG_SIZE
-    lea r15, [ash_stages + rax]     ; r15 = current stage
+    lea r11, [ash_stages]
+    lea r15, [r11 + rax]     ; r15 = current stage
     mov [r15 + STG_ARGV], r14
     mov [r15 + STG_SRC], r12
     xor eax, eax
@@ -930,13 +931,15 @@ ash_run:
     lea eax, [r12d - 1]
     cmp ebx, eax
     jae .ar_pipes_done
-    lea rdi, [ash_pipes + rbx * 8]
+    lea r11, [ash_pipes]
+    lea rdi, [r11 + rbx * 8]
     mov esi, O_CLOEXEC
     mov eax, SYS_PIPE2
     SYSCALL_X pipe2
     test rax, rax
     js .ar_pipe_fail
-    lea rdi, [ash_pipes + rbx * 8]  ; with fd 0-2 closed a pipe end can be 0, 1
+    lea r11, [ash_pipes]
+    lea rdi, [r11 + rbx * 8]  ; with fd 0-2 closed a pipe end can be 0, 1
     call ash_pipe_lift              ; or 2, which dup2 in the child would not clear
     test eax, eax
     js .ar_pipe_fail                ; ash_pipe_lift closed this pipe's ends
@@ -967,7 +970,8 @@ ash_run:
     js .ar_fork_fail
     jz .ar_child
     imul ecx, ebx, STG_SIZE
-    mov [ash_stages + rcx + STG_PID], rax
+    lea r11, [ash_stages]
+    mov [r11 + rcx + STG_PID], rax
     mov edi, eax
     mov esi, 1                      ; foreground: this group owns the terminal
     call jc_parent_after_fork
@@ -989,7 +993,8 @@ ash_run:
     cmp ebx, r15d
     jae .ar_waited
     imul ecx, ebx, STG_SIZE
-    mov r13, [ash_stages + rcx + STG_PID]
+    lea r11, [ash_stages]
+    mov r13, [r11 + rcx + STG_PID]
 .ar_wait_again:
     mov dword [rsp], 0
     mov rdi, r13
@@ -1041,7 +1046,8 @@ ash_run:
 .ar_stopped:
     lea eax, [r15d - 1]
     imul ecx, eax, STG_SIZE
-    mov edi, [ash_stages + rcx + STG_PID]   ; the last stage gives the status
+    lea r11, [ash_stages]
+    mov edi, [r11 + rcx + STG_PID]   ; the last stage gives the status
     mov esi, [jc_pgid]
     mov edx, JOB_STOPPED
     xor ecx, ecx
@@ -1070,12 +1076,14 @@ ash_run:
     mov edi, 1
     call jc_child_setup             ; own process group, owns the terminal
     imul eax, ebx, STG_SIZE
-    lea r13, [ash_stages + rax]
+    lea r11, [ash_stages]
+    lea r13, [r11 + rax]
 
     ; stdin: previous pipe, or the '<' set up by parse_redirection
     test ebx, ebx
     jz .ac_first_in
-    mov edi, [ash_pipes + rbx * 8 - 8]      ; read end of pipe (i-1)
+    lea r11, [ash_pipes]
+    mov edi, [r11 + rbx * 8 - 8]      ; read end of pipe (i-1)
     xor esi, esi
     mov eax, SYS_DUP2
     SYSCALL
@@ -1097,7 +1105,8 @@ ash_run:
     lea eax, [r12d - 1]
     cmp ebx, eax
     jae .ac_last_out
-    mov edi, [ash_pipes + rbx * 8 + 4]      ; write end of pipe i
+    lea r11, [ash_pipes]
+    mov edi, [r11 + rbx * 8 + 4]      ; write end of pipe i
     mov esi, 1
     mov eax, SYS_DUP2
     SYSCALL
@@ -1580,10 +1589,12 @@ ash_close_pipes:
 .acp_loop:
     cmp ebx, r12d
     jge .acp_done
-    mov edi, [ash_pipes + rbx * 8]
+    lea r11, [ash_pipes]
+    mov edi, [r11 + rbx * 8]
     mov eax, SYS_CLOSE
     SYSCALL
-    mov edi, [ash_pipes + rbx * 8 + 4]
+    lea r11, [ash_pipes]
+    mov edi, [r11 + rbx * 8 + 4]
     mov eax, SYS_CLOSE
     SYSCALL
     inc ebx

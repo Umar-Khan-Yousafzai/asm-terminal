@@ -12,3 +12,7 @@ terminal.obj
 terminal_linux.o
 __pycache__/
 *.pyc
+/terminal-macos
+/terminal-high
+terminal_macos.o
+terminal_high.o

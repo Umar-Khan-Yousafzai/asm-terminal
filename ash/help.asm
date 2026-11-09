@@ -449,9 +449,11 @@ handler_help:
     je .fw_done
     cmp ecx, 120
     jae .fw_done
-    mov [hl_word + rcx], al
+    lea r11, [hl_word]
+    mov [r11 + rcx], al
     inc ecx
     jmp .fw_loop
 .fw_done:
-    mov byte [hl_word + rcx], 0
+    lea r11, [hl_word]
+    mov byte [r11 + rcx], 0
     ret

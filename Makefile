@@ -23,6 +23,13 @@
 #   make dist            - tarball + README + LICENSE
 #   make release         - build all (deb, appimage, tarball, windows zip)
 #
+# macOS (x86-64 Mach-O; runs on Apple Silicon through Rosetta 2):
+#   make                 - on a Mac builds the macOS binary (needs nasm + Xcode
+#                          Command Line Tools)
+#   make terminal-macos  - cross-build it on Linux with ld64.lld (package lld)
+#   make check-high      - link the Linux build above 4 GiB, where Mach-O loads
+#                          code: fails on any absolute 32-bit address
+#
 # Test / introspect:
 #   make test            - run tests/run_tests.sh
 #   make size            - print binary size + ELF header + symbol count
@@ -34,6 +41,22 @@ LD      ?= ld
 TARGET  = terminal
 SRC     = terminal_linux.asm
 OBJ     = terminal_linux.o
+DEPS    = $(SRC) version.inc $(wildcard ash/*.asm) $(wildcard platform/*)
+
+# macOS: Mach-O, entry _start called by dyld. libSystem is linked because
+# dyld requires it; the program calls nothing in it.
+MACOS_MIN ?= 11.0
+LD64      ?= ld64.lld
+UNAME_S   := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+NASMFLAGS  = -f macho64 -DPLATFORM_MACOS
+MACOS_SDK ?= $(shell xcrun --show-sdk-path 2>/dev/null)
+LINK       = $(LD) -arch x86_64 -platform_version macos $(MACOS_MIN) $(MACOS_MIN) \
+             -e _start -L$(MACOS_SDK)/usr/lib -lSystem
+else
+NASMFLAGS  = -f elf64
+LINK       = $(LD) -e _start
+endif
 
 PREFIX        ?= $(HOME)/.local
 BINDIR        ?= $(PREFIX)/bin
@@ -49,21 +72,33 @@ DIST_NAME  = asm-terminal-$(VERSION)-linux-x86_64
 WIN_DIST   = asm-terminal-$(VERSION)-windows-x86_64
 
 .PHONY: version all clean install install-desktop install-gui uninstall check-path \
-        test size dist deb rpm desktop-tarball appimage zip-windows release
+        test size dist deb rpm desktop-tarball appimage zip-windows release check-high
 
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-	$(LD) $(OBJ) -o $(TARGET) -e _start
+	$(LINK) $(OBJ) -o $(TARGET)
 
-$(OBJ): $(SRC) version.inc $(wildcard ash/*.asm) $(wildcard platform/*)
-	$(NASM) -f elf64 $(SRC) -o $(OBJ)
+$(OBJ): $(DEPS)
+	$(NASM) $(NASMFLAGS) $(SRC) -o $(OBJ)
+
+# Cross-build of the macOS binary on Linux. packaging/macos/libSystem.tbd
+# stands in for the SDK: it only names the library dyld loads.
+terminal-macos: $(DEPS) packaging/macos/libSystem.tbd
+	$(NASM) -f macho64 -DPLATFORM_MACOS $(SRC) -o terminal_macos.o
+	$(LD64) -arch x86_64 -platform_version macos $(MACOS_MIN) $(MACOS_MIN) \
+	        -e _start -L packaging/macos -lSystem terminal_macos.o -o $@
+
+check-high: $(DEPS)
+	$(NASM) -f elf64 $(SRC) -o terminal_high.o
+	$(LD) -e _start -Ttext-segment=0x200000000 terminal_high.o -o terminal-high
+	@echo "OK: no absolute 32-bit addresses (terminal-high runs above 4 GiB)"
 
 version:
 	@echo $(VERSION)
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(TARGET) terminal_macos.o terminal-macos terminal_high.o terminal-high
 	rm -rf dist packaging/appimage/AppDir packaging/appimage/_tools \
 	       packaging/debian/_stage packaging/rpm/_rpmbuild asm-terminal-*.AppImage
 

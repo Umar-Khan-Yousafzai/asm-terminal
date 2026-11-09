@@ -228,7 +228,8 @@ hl_draw_line:
     call .skip_sp
     cmp r13d, r12d
     jae .sudo_alone
-    cmp byte [line_buf + r13], '-'
+    lea r11, [line_buf]
+    cmp byte [r11 + r13], '-'
     jne .sudo_cmd
     mov r14d, r13d
     call .word_end                      ; r14 = end of the option word
@@ -236,9 +237,11 @@ hl_draw_line:
     sub eax, r13d
     cmp eax, 2
     jne .sudo_next                      ; --long-option or -abc: no value
-    cmp byte [line_buf + r13 + 1], '-'
+    lea r11, [line_buf]
+    cmp byte [r11 + r13 + 1], '-'
     je .sudo_dashdash                   ; "--" ends the options
-    movzx eax, byte [line_buf + r13 + 1]
+    lea r11, [line_buf]
+    movzx eax, byte [r11 + r13 + 1]
     lea rdi, [hl_sudo_valopts]
 .sudo_vo:
     cmp byte [rdi], 0
@@ -310,7 +313,8 @@ hl_draw_line:
     mov rdi, rbx
     mov esi, r15d
     call print_string_len
-    lea rdi, [line_buf + r13]
+    lea r11, [line_buf]
+    lea rdi, [r11 + r13]
     mov esi, r14d
     sub esi, r13d
     call print_string_len
@@ -320,7 +324,8 @@ hl_draw_line:
     mov esi, r12d
     sub esi, r14d
     jle .out
-    lea rdi, [line_buf + r14]
+    lea r11, [line_buf]
+    lea rdi, [r11 + r14]
     call print_string_len
     jmp .out
 
@@ -354,7 +359,8 @@ hl_draw_line:
 .skip_sp:
     cmp r13d, r12d
     jae .ss_ret
-    cmp byte [line_buf + r13], ' '
+    lea r11, [line_buf]
+    cmp byte [r11 + r13], ' '
     jne .ss_ret
     inc r13d
     jmp .skip_sp
@@ -364,7 +370,8 @@ hl_draw_line:
 .word_end:
     cmp r14d, r12d
     jae .we_ret
-    mov al, [line_buf + r14]
+    lea r11, [line_buf]
+    mov al, [r11 + r14]
     cmp al, ' '
     je .we_ret
     cmp al, ';'
@@ -387,7 +394,8 @@ hl_draw_line:
     mov ecx, r13d
     cmp ecx, r14d
     jae .ia_no
-    mov al, [line_buf + rcx]
+    lea r11, [line_buf]
+    mov al, [r11 + rcx]
     cmp al, '_'
     je .ia_loop
     or al, 0x20
@@ -399,7 +407,8 @@ hl_draw_line:
     inc ecx
     cmp ecx, r14d
     jae .ia_no
-    mov al, [line_buf + rcx]
+    lea r11, [line_buf]
+    mov al, [r11 + rcx]
     cmp al, '='
     je .ia_yes
     cmp al, '_'
@@ -434,13 +443,16 @@ hl_draw_line:
     push rcx
     mov ecx, r13d
     add ecx, eax
-    mov cl, [line_buf + rcx]
-    mov [hl_word + rax], cl
+    lea r11, [line_buf]
+    mov cl, [r11 + rcx]
+    lea r11, [hl_word]
+    mov [r11 + rax], cl
     pop rcx
     inc eax
     jmp .cw_loop
 .cw_done:
-    mov byte [hl_word + rax], 0
+    lea r11, [hl_word]
+    mov byte [r11 + rax], 0
     ret
 
 ; ----------------------------------------------------------------------------

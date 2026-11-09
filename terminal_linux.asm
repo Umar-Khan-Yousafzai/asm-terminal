@@ -1188,7 +1188,7 @@ setup_raw_mode:
     ; background.
     lea rax, [raw_termios]
     mov edx, [rax + TERMIOS_C_LFLAG]
-    and edx, ~(ICANON | ECHO_FLAG | ISIG)  ; clear ICANON, ECHO, ISIG
+    and edx, ~RAW_LFLAG_CLEAR       ; clear ICANON, ECHO, ISIG
     mov [rax + TERMIOS_C_LFLAG], edx
 
     ; Set VMIN=1 (minimum 1 char for read), VTIME=0 (no timeout)
@@ -1498,7 +1498,7 @@ rk_getc_wait:
     mov rdi, rsp
     mov esi, 1
     mov edx, 100
-    SYSCALL
+    SYSCALL_X poll
     add rsp, 16
     cmp rax, 1
     jge rk_getc                     ; ready, or hung up (rk_getc sees the EOF)
@@ -1908,7 +1908,8 @@ read_line:
 .rl_ins:
     xor ecx, ecx
 .rl_ins_copy:
-    movzx eax, byte [key_ubuf + rcx]
+    lea r11, [key_ubuf]
+    movzx eax, byte [r11 + rcx]
     lea r9, [rdx + rcx]
     mov [rdi + r9], al
     inc ecx
@@ -4648,7 +4649,8 @@ ev_capture:
     sub edx, r13d
     jz .cap_drain
     mov edi, [rsp + 8]
-    lea rsi, [ev_cap_buf + r13]
+    lea r11, [ev_cap_buf]
+    lea rsi, [r11 + r13]
     SYSNO SYS_READ
     SYSCALL
     cmp rax, -EINTR
@@ -4668,7 +4670,8 @@ ev_capture:
     test rax, rax
     jg .cap_drain
 .cap_read_done:
-    mov byte [ev_cap_buf + r13], 0
+    lea r11, [ev_cap_buf]
+    mov byte [r11 + r13], 0
     mov edi, [rsp + 8]
     mov eax, SYS_CLOSE
     SYSCALL
@@ -4697,10 +4700,12 @@ ev_capture:
 .cap_strip:                         ; trailing newlines are not part of the value
     test r13d, r13d
     jz .cap_ret
-    cmp byte [ev_cap_buf + r13 - 1], 10
+    lea r11, [ev_cap_buf]
+    cmp byte [r11 + r13 - 1], 10
     jne .cap_ret
     dec r13d
-    mov byte [ev_cap_buf + r13], 0
+    lea r11, [ev_cap_buf]
+    mov byte [r11 + r13], 0
     jmp .cap_strip
 
 .cap_fork_error:
@@ -4812,7 +4817,8 @@ check_alias:
     lea rdi, [rbx + ALIAS_NAME_SIZE]
     call str_len
     mov r12d, eax
-    lea rdi, [input_buf + r13]
+    lea r11, [input_buf]
+    lea rdi, [r11 + r13]
     call str_len
     add eax, r12d
     cmp eax, LINE_MAX - 1
@@ -6855,7 +6861,7 @@ open_intr:
     mov esi, 1
     mov edx, 100                    ; look at Ctrl+C every 100 ms
     mov eax, SYS_POLL
-    SYSCALL
+    SYSCALL_X poll
     test rax, rax
     jle .oi_poll                    ; timeout or a signal
 .oi_blocking:
@@ -10873,7 +10879,8 @@ handler_grep:
     cmp ecx, r13d
     jge .grep_read_chunk
 
-    movzx eax, byte [io_buf + rcx]
+    lea r11, [io_buf]
+    movzx eax, byte [r11 + rcx]
     cmp al, 10
     je .grep_end_line
     test al, al
@@ -10882,7 +10889,8 @@ handler_grep:
 .grep_store:
     cmp r15d, GREP_LINE_MAX - 1
     jge .grep_cut_byte
-    mov [grep_line_buf + r15], al
+    lea r11, [grep_line_buf]
+    mov [r11 + r15], al
     inc r15d
     jmp .grep_skip_byte
 
@@ -10902,7 +10910,8 @@ handler_grep:
     jmp .grep_scan_byte
 
 .grep_end_line:
-    mov byte [grep_line_buf + r15], 0
+    lea r11, [grep_line_buf]
+    mov byte [r11 + r15], 0
 
     mov [rbp - 80], ecx
     mov [rbp - 84], r13d
@@ -10930,7 +10939,8 @@ handler_grep:
 .grep_flush_last:
     test r15d, r15d
     jz .grep_close
-    mov byte [grep_line_buf + r15], 0
+    lea r11, [grep_line_buf]
+    mov byte [r11 + r15], 0
 
     lea rdi, [grep_line_buf]
     mov esi, r15d
@@ -12118,7 +12128,8 @@ build_prompt_line:
     mov r12d, [current_theme]
     mov eax, r12d
     imul eax, THEME_ENTRY_SIZE
-    lea rbx, [theme_table + rax]
+    lea r11, [theme_table]
+    lea rbx, [r11 + rax]
 
     lea rdi, [path_buf]
     mov esi, MAX_PATH_BUF
@@ -12216,7 +12227,8 @@ read_git_branch:
 
 .rgb_try_here:
     ; Append "/.git/HEAD" at offset r12
-    lea rdi, [git_scratch_path + r12]
+    lea r11, [git_scratch_path]
+    lea rdi, [r11 + r12]
     lea rsi, [str_git_head]
     call str_copy
 
@@ -12234,7 +12246,8 @@ read_git_branch:
     jne .rgb_done                   ; anything else (EACCES...): give up
 
     ; Not here - truncate git_scratch_path at last '/' and retry
-    mov byte [git_scratch_path + r12], 0
+    lea r11, [git_scratch_path]
+    mov byte [r11 + r12], 0
     mov r13d, r12d
     test r13d, r13d
     jz .rgb_done
@@ -12242,7 +12255,8 @@ read_git_branch:
 .rgb_trunc:
     cmp r13d, 0
     jl .rgb_done
-    cmp byte [git_scratch_path + r13], '/'
+    lea r11, [git_scratch_path]
+    cmp byte [r11 + r13], '/'
     je .rgb_trunc_hit
     dec r13d
     jmp .rgb_trunc
@@ -12250,13 +12264,15 @@ read_git_branch:
     ; don't slice off the leading '/' root itself
     test r13d, r13d
     jz .rgb_done
-    mov byte [git_scratch_path + r13], 0
+    lea r11, [git_scratch_path]
+    mov byte [r11 + r13], 0
     mov r12d, r13d
     jmp .rgb_try_here
 
 .rgb_gitfile:
     ; "<dir>/.git" is a plain file: read "gitdir: PATH" from it
-    mov byte [git_scratch_path + r12 + 5], 0
+    lea r11, [git_scratch_path]
+    mov byte [r11 + r12 + 5], 0
     lea rdi, [git_scratch_path]
     mov esi, O_RDONLY | O_CLOEXEC
     xor edx, edx
@@ -12276,7 +12292,8 @@ read_git_branch:
     SYSCALL
     test r14d, r14d
     jle .rgb_done
-    mov byte [git_head_buf + r14], 0
+    lea r11, [git_head_buf]
+    mov byte [r11 + r14], 0
     lea rdi, [git_head_buf]
     lea rsi, [str_gitdir_prefix]
     call str_startswith
@@ -12343,7 +12360,8 @@ read_git_branch:
 
     test r14d, r14d
     jle .rgb_done
-    mov byte [git_head_buf + r14], 0
+    lea r11, [git_head_buf]
+    mov byte [r11 + r14], 0
 
     ; "ref: refs/heads/NAME" shows NAME; any other ref shows its last path
     ; component; a bare SHA (detached HEAD) shows its first 8 characters.
@@ -12638,7 +12656,8 @@ job_slots_free:
 .jsf_loop:
     cmp ecx, JOB_MAX
     jge .jsf_done
-    cmp qword [job_pids + rcx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rcx*8], 0
     jne .jsf_next
     inc eax
 .jsf_next:
@@ -12669,21 +12688,26 @@ job_add:
 .ja_find:
     cmp ebx, JOB_MAX
     jge .ja_full
-    cmp qword [job_pids + rbx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rbx*8], 0
     je .ja_found
     inc ebx
     jmp .ja_find
 .ja_found:
     mov eax, r12d
-    mov [job_pids + rbx*8], rax
+    lea r11, [job_pids]
+    mov [r11 + rbx*8], rax
     mov eax, r13d
-    mov [job_pgids + rbx*8], rax
+    lea r11, [job_pgids]
+    mov [r11 + rbx*8], rax
     mov eax, r14d
-    mov [job_state + rbx], al
+    lea r11, [job_state]
+    mov [r11 + rbx], al
 
     mov eax, ebx
     imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
+    lea r11, [job_cmds]
+    lea rdi, [r11 + rax]
     lea rsi, [input_buf]
     test r15, r15
     cmovnz rsi, r15
@@ -12716,11 +12740,15 @@ job_add:
 
 ; job_free(edi = slot) - forget a job
 job_free:
-    cmp qword [job_pids + rdi*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rdi*8], 0
     je .jf_ret
-    mov qword [job_pids + rdi*8], 0
-    mov qword [job_pgids + rdi*8], 0
-    mov byte [job_state + rdi], 0
+    lea r11, [job_pids]
+    mov qword [r11 + rdi*8], 0
+    lea r11, [job_pgids]
+    mov qword [r11 + rdi*8], 0
+    lea r11, [job_state]
+    mov byte [r11 + rdi], 0
     dec dword [job_count]
 .jf_ret:
     ret
@@ -12730,7 +12758,8 @@ job_ordinal:
     xor eax, eax
     xor ecx, ecx
 .jo_loop:
-    cmp qword [job_pids + rcx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rcx*8], 0
     je .jo_next
     inc eax
 .jo_next:
@@ -12749,7 +12778,8 @@ job_find:
 .jfind_loop:
     cmp ecx, JOB_MAX
     jge .jfind_none
-    cmp qword [job_pids + rcx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rcx*8], 0
     je .jfind_next
     inc eax
     cmp eax, edi
@@ -12772,7 +12802,8 @@ job_last_number:
 .jln_loop:
     cmp ecx, JOB_MAX
     jge .jln_done
-    cmp qword [job_pids + rcx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rcx*8], 0
     je .jln_next
     inc eax
 .jln_next:
@@ -12829,18 +12860,21 @@ job_print_line:
     call print_cstring
     lea rdi, [jobs_pid_label]
     call print_cstring
-    mov rax, [job_pids + rbx*8]
+    lea r11, [job_pids]
+    mov rax, [r11 + rbx*8]
     mov eax, eax
     call print_number
     lea rdi, [jobs_running_msg]
-    cmp byte [job_state + rbx], JOB_STOPPED
+    lea r11, [job_state]
+    cmp byte [r11 + rbx], JOB_STOPPED
     jne .jpl_state
     lea rdi, [jobs_stopped_msg]
 .jpl_state:
     call print_cstring
     mov eax, ebx
     imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
+    lea r11, [job_cmds]
+    lea rdi, [r11 + rax]
     call print_cstring
     call print_newline
 
@@ -12880,11 +12914,13 @@ job_poll:
     sub rsp, 16                     ; [rsp] = wait status
 
     mov ebx, edi
-    mov r12, [job_pids + rbx*8]
+    lea r11, [job_pids]
+    mov r12, [r11 + rbx*8]
 .jp_again:
     mov edi, r12d
     mov edx, WNOHANG
-    mov r8, [job_pgids + rbx*8]
+    lea r11, [job_pgids]
+    mov r8, [r11 + rbx*8]
     test r8, r8
     jz .jp_do
     mov edi, r8d
@@ -12901,19 +12937,22 @@ job_poll:
     test rax, rax
     jz .jp_alive
     js .jp_gone                     ; nothing of the job is left
-    cmp qword [job_pgids + rbx*8], 0
+    lea r11, [job_pgids]
+    cmp qword [r11 + rbx*8], 0
     je .jp_gone                     ; a single process of the shell's group ended
     mov eax, [rsp]
     mov ecx, eax
     and ecx, 0xFF
     cmp ecx, 0x7F
     jne .jp_not_stopped
-    mov byte [job_state + rbx], JOB_STOPPED
+    lea r11, [job_state]
+    mov byte [r11 + rbx], JOB_STOPPED
     jmp .jp_again
 .jp_not_stopped:
     cmp eax, 0xFFFF                 ; continued
     jne .jp_again                   ; one stage ended; look for the others
-    mov byte [job_state + rbx], JOB_RUNNING
+    lea r11, [job_state]
+    mov byte [r11 + rbx], JOB_RUNNING
     jmp .jp_again
 .jp_alive:
     xor eax, eax
@@ -12951,7 +12990,8 @@ handler_jobs:
 .hj_loop:
     cmp ebx, JOB_MAX
     jge .hj_done
-    cmp qword [job_pids + rbx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rbx*8], 0
     je .hj_next
     mov edi, ebx
     call job_print_line
@@ -12986,7 +13026,8 @@ reap_finished_jobs:
 .rfj_loop:
     cmp r12d, JOB_MAX
     jge .rfj_done
-    cmp qword [job_pids + r12*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + r12*8], 0
     je .rfj_next
     mov edi, r12d
     call job_poll
@@ -13033,13 +13074,17 @@ handler_fg:
     ; Print the command
     mov eax, r12d
     imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
+    lea r11, [job_cmds]
+    lea rdi, [r11 + rax]
     call print_cstring
     call print_newline
 
-    mov rbx, [job_pids + r12*8]     ; rbx = pid that gives the status
-    mov r13, [job_pgids + r12*8]    ; r13 = its process group, 0 if shared
-    mov byte [job_state + r12], JOB_RUNNING
+    lea r11, [job_pids]
+    mov rbx, [r11 + r12*8]     ; rbx = pid that gives the status
+    lea r11, [job_pgids]
+    mov r13, [r11 + r12*8]    ; r13 = its process group, 0 if shared
+    lea r11, [job_state]
+    mov byte [r11 + r12], JOB_RUNNING
     xor r14d, r14d                  ; r14d = exit status
 
     call restore_terminal
@@ -13080,7 +13125,8 @@ handler_fg:
 
 .hfg_stopped:
     mov [last_exit_status], eax
-    mov byte [job_state + r12], JOB_STOPPED
+    lea r11, [job_state]
+    mov byte [r11 + r12], JOB_STOPPED
     call jc_reclaim
     mov edi, r12d
     call job_notify_stopped
@@ -13171,8 +13217,10 @@ handler_bg:
     js .hbg_nojob
     mov r12d, eax                   ; r12d = slot
 
-    mov rdi, [job_pids + r12*8]
-    mov r8, [job_pgids + r12*8]
+    lea r11, [job_pids]
+    mov rdi, [r11 + r12*8]
+    lea r11, [job_pgids]
+    mov r8, [r11 + r12*8]
     test r8, r8
     jz .hbg_signal
     mov edi, r8d
@@ -13183,7 +13231,8 @@ handler_bg:
     SYSCALL
     test rax, rax
     jnz .hbg_nojob
-    mov byte [job_state + r12], JOB_RUNNING
+    lea r11, [job_state]
+    mov byte [r11 + r12], JOB_RUNNING
 
     lea rdi, [bg_resumed_msg]
     call print_cstring
@@ -13484,3 +13533,7 @@ align 1
 %include "ash/highlight.asm"
 %include "ash/help.asm"
 %include "ash/smart.asm"
+
+%ifdef PLATFORM_MACOS
+%include "platform/macos.asm"
+%endif

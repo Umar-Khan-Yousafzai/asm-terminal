@@ -104,7 +104,16 @@ section .data
                         dq upd_s_fsSL, upd_s_maxtime, upd_s_t8
                         dq upd_s_maxsize, upd_s_size_text
                         dq 0, 0                      ; [11] = url
+%ifdef PLATFORM_MACOS
+    upd_s_shasum        db "shasum", 0                ; macOS has no sha256sum
+    upd_s_alg           db "-a", 0
+    upd_s_256           db "256", 0
+    upd_argv_sha        dq upd_s_shasum, upd_s_alg, upd_s_256, 0, 0   ; [3] = file
+%define UPD_SHA_FILE_SLOT 3
+%else
     upd_argv_sha        dq upd_s_sha256sum, 0, 0     ; [1] = file
+%define UPD_SHA_FILE_SLOT 1
+%endif
 
 section .bss
     upd_buf             resb UPD_BUF_SIZE
@@ -277,7 +286,8 @@ upd_install:
     ; The folder name is copied to upd_tmp so upd_self stays whole.
     lea rdi, [upd_self]
     call str_len
-    lea rdi, [upd_self + rax]
+    lea r11, [upd_self]
+    lea rdi, [r11 + rax]
 .ui_find_slash:
     lea rdx, [upd_self]
     cmp rdi, rdx
@@ -363,7 +373,7 @@ upd_install:
 
     ; Actual hash of what we downloaded
     lea rax, [upd_tmp]
-    mov [upd_argv_sha + 8], rax
+    mov [upd_argv_sha + UPD_SHA_FILE_SLOT * 8], rax
     lea rdi, [upd_argv_sha]
     mov esi, 1
     call upd_capture
@@ -494,7 +504,8 @@ upd_read_self:
     jle .rs_fail
     cmp rax, UPD_SELF_MAX
     jae .rs_fail
-    mov byte [upd_self + rax], 0
+    lea r11, [upd_self]
+    mov byte [r11 + rax], 0
     mov eax, 1
     ret
 .rs_fail:
@@ -725,7 +736,8 @@ update_startup:
     pop rax
     test rax, rax
     jle .us_age
-    mov byte [upd_latest + rax], 0
+    lea r11, [upd_latest]
+    mov byte [r11 + rax], 0
     lea rdi, [upd_latest]           ; cut at the first newline
 .us_strip:
     mov al, [rdi]
@@ -886,7 +898,8 @@ upd_capture:
     sub edx, r14d
     jz .uc_drain
     mov edi, [rsp + 8]
-    lea rsi, [upd_buf + r14]
+    lea r11, [upd_buf]
+    lea rsi, [r11 + r14]
     SYSNO SYS_READ
     SYSCALL
     cmp rax, -EINTR
@@ -906,7 +919,8 @@ upd_capture:
     test rax, rax
     jg .uc_drain
 .uc_read_done:
-    mov byte [upd_buf + r14], 0
+    lea r11, [upd_buf]
+    mov byte [r11 + r14], 0
     mov edi, [rsp + 8]
     mov eax, SYS_CLOSE
     SYSCALL

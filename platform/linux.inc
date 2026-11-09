@@ -102,6 +102,7 @@
 %define ICANON              0x0002
 %define ECHO_FLAG           0x0008
 %define ISIG                0x0001
+%define RAW_LFLAG_CLEAR     (ICANON | ECHO_FLAG | ISIG)   ; raw mode turns these off
 
 %define TERMIOS_SIZE        60      ; the buffers TCGETS / TCSETS use
 %define TERMIOS_C_LFLAG     12      ; offset of c_lflag (only its low 32 bits are touched)

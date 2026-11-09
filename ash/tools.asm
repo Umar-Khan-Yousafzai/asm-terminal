@@ -1016,7 +1016,8 @@ tl_xmove:
     SYSCALL
     test rax, rax
     js .xm_neg
-    mov byte [tl_lbuf + rax], 0
+    lea r11, [tl_lbuf]
+    mov byte [r11 + rax], 0
     lea rdi, [tl_lbuf]
     mov rsi, r13
     mov eax, SYS_SYMLINK
@@ -1298,7 +1299,8 @@ tl_j_begin:
     xor r12d, r12d                  ; bytes read
 .jb_read:
     mov edi, ebx
-    lea rsi, [tl_jbuf + r12]
+    lea r11, [tl_jbuf]
+    lea rsi, [r11 + r12]
     mov edx, TL_JBUF_MAX
     sub edx, r12d
     jz .jb_read_end
@@ -1320,14 +1322,17 @@ tl_j_begin:
     lea eax, [rcx + J_STR + 3]
     cmp eax, r12d
     ja .jb_valid_end
-    mov eax, [tl_jbuf + rcx + J_LEN]
+    lea r11, [tl_jbuf]
+    mov eax, [r11 + rcx + J_LEN]
     cmp eax, J_STR + 3
     jb .jb_valid_end
     lea r8d, [rcx + rax]            ; end of this record
     cmp r8d, r12d
     ja .jb_valid_end
-    lea rsi, [tl_jbuf + rcx + J_STR]
-    lea r9, [tl_jbuf + r8]
+    lea r11, [tl_jbuf]
+    lea rsi, [r11 + rcx + J_STR]
+    lea r11, [tl_jbuf]
+    lea r9, [r11 + r8]
     mov r10d, 3                     ; three NUL ended strings
 .jb_str:
     cmp rsi, r9
@@ -1391,7 +1396,8 @@ tl_j_end:
     sub edx, r12d
     jz .je_written
     mov edi, ebx
-    lea rsi, [tl_jbuf + r12]
+    lea r11, [tl_jbuf]
+    lea rsi, [r11 + r12]
     mov eax, SYS_WRITE
     SYSCALL
     cmp rax, -EINTR
@@ -1492,7 +1498,8 @@ tl_j_drop_first:
     add rsp, 16
 .df_forget:
     lea rdi, [tl_jbuf]
-    lea rsi, [tl_jbuf + rbx]
+    lea r11, [tl_jbuf]
+    lea rsi, [r11 + rbx]
     mov ecx, [tl_jlen]
     sub ecx, ebx
     cld
@@ -1534,8 +1541,10 @@ tl_j_trim:
 .tj_sum_loop:
     cmp ecx, [tl_jlen]
     jae .tj_fit
-    add r14, [tl_jbuf + rcx + J_SIZE]
-    add ecx, [tl_jbuf + rcx + J_LEN]
+    lea r11, [tl_jbuf]
+    add r14, [r11 + rcx + J_SIZE]
+    lea r11, [tl_jbuf]
+    add ecx, [r11 + rcx + J_LEN]
     jmp .tj_sum_loop
 .tj_fit:
     cmp dword [tl_jlen], 0
@@ -1592,7 +1601,8 @@ undo_record:
     mov rsi, [tl_held]
     call tl_j_trim
     mov eax, [tl_jlen]
-    lea r14, [tl_jbuf + rax]
+    lea r11, [tl_jbuf]
+    lea r14, [r11 + rax]
     mov [r14 + J_LEN], ebx
     mov [r14 + J_TYPE], r12d
     mov [r14 + J_SAVED], r13d
@@ -2134,12 +2144,14 @@ handler_undo:
     cmp ecx, edx
     jae .un_found
     mov ebx, ecx
-    add ecx, [tl_jbuf + rcx + J_LEN]
+    lea r11, [tl_jbuf]
+    add ecx, [r11 + rcx + J_LEN]
     jmp .un_last
 .un_found:
     test edx, edx
     jz .un_none
-    lea r12, [tl_jbuf + rbx]        ; the record
+    lea r11, [tl_jbuf]
+    lea r12, [r11 + rbx]        ; the record
     lea r13, [r12 + J_STR]          ; A
     mov rsi, r13
 .un_skip_a:
@@ -2452,8 +2464,10 @@ handler_trash:
     cmp ecx, [tl_jlen]
     jae .tc_head
     inc r12d
-    add r13, [tl_jbuf + rcx + J_SIZE]
-    add ecx, [tl_jbuf + rcx + J_LEN]
+    lea r11, [tl_jbuf]
+    add r13, [r11 + rcx + J_SIZE]
+    lea r11, [tl_jbuf]
+    add ecx, [r11 + rcx + J_LEN]
     jmp .tc_count
 .tc_head:
     lea rdi, [tl_s_trash_hdr1]
@@ -2476,7 +2490,8 @@ handler_trash:
     cmp ebx, [tl_jlen]
     jae .tc_done
     inc r12d
-    lea r14, [tl_jbuf + rbx]
+    lea r11, [tl_jbuf]
+    lea r14, [r11 + rbx]
     lea rdi, [tl_s_2sp]
     call print_cstring
     mov eax, r12d
@@ -2560,7 +2575,8 @@ handler_trash:
 .tc_entry:
     cmp r14, r13
     jae .tc_getdents
-    lea rsi, [tl_dents + r14]
+    lea r11, [tl_dents]
+    lea rsi, [r11 + r14]
     movzx eax, word [rsi + DIRENT64_D_RECLEN]
     add r14, rax
     lea rsi, [rsi + DIRENT64_D_NAME]
@@ -3230,10 +3246,12 @@ tr_put_str:
     mov byte [rdi + 1], 'x'
     mov ecx, eax
     shr ecx, 4
-    movzx ecx, byte [tr_hexd + rcx]
+    lea r11, [tr_hexd]
+    movzx ecx, byte [r11 + rcx]
     mov [rdi + 2], cl
     and eax, 15
-    movzx ecx, byte [tr_hexd + rax]
+    lea r11, [tr_hexd]
+    movzx ecx, byte [r11 + rax]
     mov [rdi + 3], cl
     add rdi, 4
     inc rsi
@@ -3405,7 +3423,8 @@ tr_fmt_sockaddr:
     cmp eax, 1
     jne .fa_none
     ; unix: the name ends at the length given, or at a NUL
-    mov byte [tr_sockaddr + r13], 0
+    lea r11, [tr_sockaddr]
+    mov byte [r11 + r13], 0
     lea rsi, [tr_s_unix]
     mov rdi, r12
     call upd_stpcpy
@@ -3429,7 +3448,8 @@ tr_fmt_sockaddr:
     mov rdi, r12
     xor ebx, ebx
 .fa_ip:
-    movzx esi, byte [tr_sockaddr + 4 + rbx]
+    lea r11, [tr_sockaddr]
+    movzx esi, byte [r11 + 4 + rbx]
     call ash_fmt_int
     mov rdi, rax
     inc ebx
@@ -3446,9 +3466,11 @@ tr_fmt_sockaddr:
     inc rdi
     xor ebx, ebx                    ; group 0..7
 .fa_group:
-    movzx eax, byte [tr_sockaddr + 8 + rbx * 2]
+    lea r11, [tr_sockaddr]
+    movzx eax, byte [r11 + 8 + rbx * 2]
     shl eax, 8
-    movzx ecx, byte [tr_sockaddr + 9 + rbx * 2]
+    lea r11, [tr_sockaddr]
+    movzx ecx, byte [r11 + 9 + rbx * 2]
     or eax, ecx
     mov r9d, eax
     mov ecx, 12
@@ -3465,7 +3487,8 @@ tr_fmt_sockaddr:
     jnz .fa_next_digit              ; leading zero
 .fa_wr:
     mov r10d, 1
-    movzx eax, byte [tr_hexd + rax]
+    lea r11, [tr_hexd]
+    movzx eax, byte [r11 + rax]
     mov [rdi], al
     inc rdi
 .fa_next_digit:

@@ -2,7 +2,7 @@
 
 The version lives in `version.inc` (see `CHANGELOG.md`); `make version` prints it.
 
-A fully-featured terminal/shell written entirely in x86-64 assembly (NASM). Cross-platform: Windows and Linux.
+A fully-featured terminal/shell written entirely in x86-64 assembly (NASM). Cross-platform: Linux, macOS (x86-64, also on Apple Silicon through Rosetta 2) and Windows.
 
 ## Project Structure
 
@@ -20,6 +20,8 @@ asm-terminal/
   ash/smart.asm         # grey history suggestions, Tab match list, history folder/status notes (#asm: lines)
   ash/update.asm        # update / update install, background update check (curl + sha256sum)
   platform/linux.inc    # Linux ABI: syscall numbers, flags, errno, struct layouts, SYSCALL macros
+  platform/macos.inc    # the same names with XNU values (built with -DPLATFORM_MACOS)
+  platform/macos.asm    # macOS entry point, signal trampoline, mac_* SYSCALL_X routines, free/trace/sandbox
   version.inc           # the one place the version is written
   CHANGELOG.md          # release notes source (the release workflow requires an entry)
   LICENSE               # MIT
@@ -38,6 +40,11 @@ asm-terminal/
 ```bash
 make                    # Requires: nasm, ld (binutils)
 ```
+On a Mac `make` builds the macOS binary (nasm from Homebrew, Xcode Command Line Tools for `ld`).
+`make terminal-macos` cross-builds it on Linux with `ld64.lld`. `make check-high` links the Linux build
+above 4 GiB (where Mach-O loads code) and fails on any absolute 32-bit address: write `lea r11, [label]`
+then `[r11 + index]`, never `[label + index]`.
+
 `make install` puts `asm-terminal` in `~/.local/bin` (honours `PREFIX`, `BINDIR`, `DESTDIR`) and links
 `asm` to it unless another program already uses that name (pwntools does). `make install-desktop` adds
 the launcher, menu entry and icons. `make test` runs `tests/run_tests.sh`.
@@ -62,6 +69,13 @@ build.bat               # Requires: NASM, MinGW ld
 - **Terminal state**: `raw_active` and `interactive_mode` guard `setup_raw_mode`/`restore_terminal`, which are no-ops when stdin/stdout are not a terminal. Terminal-only output goes through `term_write` (fd 1, never a redirect target). The prompt is built once per command into `prompt_buf` and redrawn with one write per key
 - **Update**: `ash/update.asm` runs `curl` and `sha256sum` (argv arrays, never a shell string). The startup check calls api.github.com in a detached process at most once a day; opt out with `ASM_NO_UPDATE_CHECK=1` in the environment or `set ASM_NO_UPDATE_CHECK=1` in `~/.asmrc` (empty or `0` does not opt out). `update install` verifies the binary against the release's `SHA256SUMS` and never installs an older version. That file is fetched from the same release, so it detects corruption, not a hostile release
 - **Entry point**: `_start` → parses kernel stack for envp → `call main`
+
+### macOS Version (same sources, `-DPLATFORM_MACOS`)
+- **Target**: macOS x86-64, Mach-O PIE, linked with libSystem only because dyld requires it (no libSystem call is made). Runs on Apple Silicon through Rosetta 2
+- **System calls**: raw BSD calls (0x2000000 + n). `SYSCALL` turns XNU's carry-flag errors into -errno. `SYSCALL_X name` calls `mac_name` in `platform/macos.asm`: fork (child flag in rdx), pipe2 (pipe + FD_CLOEXEC), getcwd (fcntl F_GETPATH on "."), getdents64 (getdirentries64), clock_gettime/time (gettimeofday), uname (sysctl), utimensat (utimes/futimes), readlink_self (proc_info PIDPATHINFO), poll (select: XNU poll fails on ttys)
+- **Signals**: `SIGACT_FILL` puts `mac_sigtramp` in the struct; it runs the handler and calls sigreturn with the kernel's token
+- **Differences**: `free` reads sysctl (total and free memory only), `uptime` reads kern.boottime, `trace` and `sandbox` print that they need Linux (`sandbox` exits 126), `update` installs `asm-terminal-macos-x86_64` and checks it with `shasum -a 256`. `st_mode` is 16 bits with `st_nlink` above it, so every dword read of `STAT_ST_MODE` must be masked
+- **Entry point**: `_start(argc, argv, envp, apple)` called by dyld
 
 ### Windows Version (`terminal.asm`)
 - **Target**: Windows x64, PE, linked with kernel32.dll + user32.dll

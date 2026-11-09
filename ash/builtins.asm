@@ -685,7 +685,8 @@ handler_history:
     inc r14d
     test ebx, ebx
     jz .hh_print
-    cmp ebx, [hist_meta_hash + r13 * 4]
+    lea r11, [hist_meta_hash]
+    cmp ebx, [r11 + r13 * 4]
     jne .hh_skip
 .hh_print:
     mov eax, r14d
@@ -693,7 +694,8 @@ handler_history:
     lea rdi, [bi_hist_gap]
     call print_cstring
     imul eax, r13d, HISTORY_ENTRY_SIZE
-    lea rdi, [history_buf + rax]
+    lea r11, [history_buf]
+    lea rdi, [r11 + rax]
     call print_cstring
     mov eax, r13d
     call sm_hist_fail_mark          ; "  [N]" after a command that failed
@@ -860,7 +862,8 @@ handler_kill:
 .hk_slot:
     cmp ecx, JOB_MAX
     jge .hk_nojob
-    mov rdi, [job_pids + rcx*8]
+    lea r11, [job_pids]
+    mov rdi, [r11 + rcx*8]
     test rdi, rdi
     jz .hk_slot_next
     inc edx
@@ -871,12 +874,14 @@ handler_kill:
     jmp .hk_slot
 
 .hk_job_found:
-    mov r8, [job_pgids + rcx*8]
+    lea r11, [job_pgids]
+    mov r8, [r11 + rcx*8]
     test r8, r8
     jz .hk_send                     ; shares the shell's group: signal the pid
     mov edi, r8d
     neg edi                         ; the whole job: every stage of a pipeline
-    cmp byte [job_state + rcx], JOB_STOPPED
+    lea r11, [job_state]
+    cmp byte [r11 + rcx], JOB_STOPPED
     jne .hk_send
     cmp r13d, SIGTERM               ; a stopped job only acts on TERM or HUP
     je .hk_wake                     ; once it runs again
