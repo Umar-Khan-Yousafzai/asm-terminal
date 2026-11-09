@@ -150,8 +150,9 @@ s = T.Sess()
 s.settle()
 s.send("while true; do :; done\r")
 # Ctrl+C is a signal only once the line runs (ISIG on); before that it is a
-# key the line editor reads. The macOS runner can take over 0.5 s to get there.
-loop_running = waitfor(lambda: cooked(s), 5)
+# key the line editor reads. Keep reading the screen meanwhile: the macOS pty
+# buffer is small, and a full one blocks the shell's echo of the line.
+loop_running = waitfor(lambda: (s.settle(0.05, 0.1), cooked(s))[1], 5)
 s.send(b"\x03")
 s.settle()
 s.run("echo loop-over")
