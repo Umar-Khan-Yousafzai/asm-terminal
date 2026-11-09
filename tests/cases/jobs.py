@@ -149,13 +149,14 @@ s.close()
 s = T.Sess()
 s.settle()
 s.send("while true; do :; done\r")
-time.sleep(0.5)
-loop_info = (cooked(s), pstat(s.p.pid))      # ISIG on? shell running?
+# Ctrl+C is a signal only once the line runs (ISIG on); before that it is a
+# key the line editor reads. The macOS runner can take over 0.5 s to get there.
+loop_running = waitfor(lambda: cooked(s), 5)
 s.send(b"\x03")
 s.settle()
 s.run("echo loop-over")
-T.check("ctrl-c stops a loop of builtins", "loop-over" in s.screen().split("\n") and "[130]" in s.screen(),
-        (loop_info, cooked(s), pstat(s.p.pid), s.screen()[-200:]))
+T.check("ctrl-c stops a loop of builtins", loop_running and "loop-over" in s.screen().split("\n") and "[130]" in s.screen(),
+        (loop_running, s.screen()[-200:]))
 s.send("type /dev/zero\r")
 time.sleep(0.5)
 s.send(b"\x03")
