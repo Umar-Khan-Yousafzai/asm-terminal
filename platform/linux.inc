@@ -49,6 +49,8 @@
 %define SYS_POLL            7
 %define SYS_LSEEK           8
 %define SYS_RT_SIGACTION    13
+%define SYS_RT_SIGPROCMASK  14
+%define SIG_UNBLOCK         1
 %define SYS_RT_SIGRETURN    15
 %define SYS_IOCTL           16
 %define SYS_ACCESS          21

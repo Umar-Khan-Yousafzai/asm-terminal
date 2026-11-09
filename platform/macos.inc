@@ -61,6 +61,8 @@
 %define SYS_KILL            MAC_SYS(37)
 %define SYS_PIPE            MAC_SYS(42)
 %define SYS_RT_SIGACTION    MAC_SYS(46)     ; sigaction(sig, act, oact); r10 is ignored
+%define SYS_RT_SIGPROCMASK  MAC_SYS(48)     ; sigprocmask(how, &set32, &old)
+%define SIG_UNBLOCK         2
 %define SYS_SIGALTSTACK     MAC_SYS(53)
 %define SYS_IOCTL           MAC_SYS(54)
 %define SYS_SYMLINK         MAC_SYS(57)
@@ -187,7 +189,10 @@
     lea rcx, [mac_sigtramp]
     mov [%1 + 8], rcx               ; sa_tramp
     mov dword [%1 + 16], 0          ; sa_mask
-    mov dword [%1 + 20], (%3)       ; sa_flags
+    ; SA_SIGINFO (0x40): the handlers ignore the extra arguments, but the
+    ; kernel then hands mac_sigtramp the full context style, which is the
+    ; one Rosetta 2 expects back in sigreturn
+    mov dword [%1 + 20], (%3) | 0x40 ; sa_flags
 %endmacro
 
 ; stack_t: ss_sp, ss_size, ss_flags

@@ -132,7 +132,8 @@ T.check("TERM=dumb: no color, no OSC", re.search(rb"\x1b\[[0-9;]*m", s.vt.raw) i
 s.close()
 
 # ---------------------------------------------------------------- wrapping
-s = T.Sess(cols=40)
+# cwd /: the prompt must fit on the first row for the row checks below
+s = T.Sess(cols=40, cwd="/")
 s.settle()
 s.send("echo " + "a" * 60 + "bcd"); s.settle()
 scr = s.screen()
@@ -143,7 +144,8 @@ s.send("\x1b[H"); s.settle()
 first = [i for i, l in enumerate(s.vt.dump()) if "@" in l][0]
 T.check("Home goes to the first prompt row", s.vt.r == first, (s.vt.r, first))
 s.send("\x1b[F"); s.settle()
-T.check("End goes to the last row", s.vt.r == first + 2, (s.vt.r, first))
+last = [i for i, l in enumerate(s.vt.dump()) if l.endswith("bcd")][-1]
+T.check("End goes to the last row", s.vt.r == last and last > first, (s.vt.r, first, last))
 s.close()
 
 # ---------------------------------------------------------------- keys

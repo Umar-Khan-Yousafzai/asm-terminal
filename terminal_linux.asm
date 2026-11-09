@@ -1356,6 +1356,7 @@ setup_term_signals:
 ; term_signal_handler - rdi = signal number
 section .bss
     term_dfl_act        resb 64     ; all zero: SIG_DFL
+    term_sig_set        resq 1
 section .text
 term_signal_handler:
     push rdi                        ; keeps the stack aligned for the call
@@ -1373,9 +1374,25 @@ term_signal_handler:
     mov edi, eax
     mov rsi, [rsp]                  ; signal number
     mov eax, SYS_KILL
-    SYSCALL                         ; delivered when this handler returns
-    pop rdi
-    ret
+    SYSCALL                         ; pending: the handler blocks it
+    ; Unblock it here rather than wait for the return from the handler, so
+    ; the default action (end the process) happens now
+    mov ecx, [rsp]
+    dec ecx
+    mov eax, 1
+    shl rax, cl
+    mov [term_sig_set], rax
+    mov edi, SIG_UNBLOCK
+    lea rsi, [term_sig_set]
+    xor edx, edx
+    mov r10d, 8
+    mov eax, SYS_RT_SIGPROCMASK
+    SYSCALL
+    ; Still here (the signal was caught again or ignored): leave like sh
+    mov edi, [rsp]
+    add edi, 128
+    mov eax, SYS_EXIT
+    SYSCALL
 
 ; ============================================================================
 ; setup_sigwinch - install SIGWINCH handler so terminal resize is observable

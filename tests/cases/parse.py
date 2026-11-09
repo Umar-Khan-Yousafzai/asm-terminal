@@ -189,7 +189,7 @@ T.check("no stray descriptors reach the child", len(fds) == 3 and sum('fdlist' i
 
 c = T.tmpdir()
 o = lines_of(['for i in 1 2 3 4 5 6 7 8; do echo x > a$i > b$i; done', T.FDLIST + ' $$ | /usr/bin/wc -l'], cwd=c)
-T.check("redirections do not leak descriptors in the shell", o and o[-1].isdigit() and int(o[-1].strip()) < 8, o)
+T.check("redirections do not leak descriptors in the shell", o and o[-1].strip().isdigit() and int(o[-1]) < 8, o)
 
 # ---------------------------------------------------------------- builtin arguments
 c = T.tmpdir()
@@ -258,8 +258,8 @@ for line in ['x=$(/usr/bin/printf %s hi); echo "$x" > cap1.txt',
              'cd ' + c,
              'ls $(/usr/bin/printf %s ' + c + ') > cap5.txt',
              # trace and sandbox need Linux; echo is the builtin stage there
-             ('echo -n sb' if T.MACOS else 'sandbox /usr/bin/printf sb') + ' | /usr/bin/cat > cap6.txt',
-             'echo piped | ' + ('/usr/bin/cat' if T.MACOS else 'trace /usr/bin/cat') + ' > cap7.txt']:
+             ('echo -n sb' if T.MACOS else 'sandbox /usr/bin/printf sb') + ' | /bin/cat > cap6.txt',
+             'echo piped | ' + ('/bin/cat' if T.MACOS else 'trace /bin/cat') + ' > cap7.txt']:
     s.run(line)
 s.run("echo capture-done", maxt=10)   # the last pipeline has finished
 s.close()
@@ -293,7 +293,7 @@ except Exception as ex:
 T.check("builtin stage does not keep a pipe open (reader exits early)", 'line 0 some text' in out and 'after' in out, out[-200:])
 if not T.MACOS:   # trace needs Linux
     try:
-        out, err, st = T.run_script('echo piped | trace /usr/bin/cat\necho after\nexit\n', cwd=c, timeout=10)
+        out, err, st = T.run_script('echo piped | trace /bin/cat\necho after\nexit\n', cwd=c, timeout=10)
     except Exception as ex:
         out = 'HANG %r' % ex
     T.check("builtin stage feeding a builtin that runs a program", 'piped' in out and 'after' in out, out[-200:])
@@ -314,11 +314,11 @@ c = T.tmpdir()
 write(c, 'sp ace.txt', 'tab-one\n'); write(c, "it's.txt", 'tab-two\n'); write(c, 'plain.txt', 'tab-three\n')
 s = T.Sess(cwd=c)
 s.settle()
-s.send('/usr/bin/cat sp\t'); s.settle()
+s.send('/bin/cat sp\t'); s.settle()
 s.send('\r'); s.settle()
-s.send('/usr/bin/cat it\t'); s.settle()
+s.send('/bin/cat it\t'); s.settle()
 s.send('\r'); s.settle()
-s.send('/usr/bin/cat pl\t'); s.settle()
+s.send('/bin/cat pl\t'); s.settle()
 s.send('\r'); s.settle()
 scr = s.screen()
 s.close()
