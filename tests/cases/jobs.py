@@ -1,5 +1,5 @@
 # Job control, signals, exit statuses and exec failures (external commands).
-import os, sys, time, subprocess, signal
+import os, sys, time, subprocess, signal, shutil
 import ptytest as T
 
 
@@ -198,7 +198,7 @@ os.chmod(os.path.join(h, 'badint'), 0o755)
 open(os.path.join(h, 'noexec'), 'w').write('x')
 os.mkdir(os.path.join(h, 'adir'))
 
-o, e, st = sh("/bin/false\nexit\n")
+o, e, st = sh("%s\nexit\n" % shutil.which("false", path="/usr/bin:/bin"))
 T.check("bare exit reports the previous status", st == 1, st)
 o, e, st = sh("/bin/sh -c 'exit 7'\nexit\n")
 T.check("bare exit reports status 7", st == 7, st)

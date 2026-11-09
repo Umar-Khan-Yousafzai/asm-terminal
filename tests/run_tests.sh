@@ -16,6 +16,9 @@ fi
 
 # The shell prints physical paths (getcwd), so temporary folders are named
 # that way too: on macOS /tmp and $TMPDIR are links into /private.
+# macOS: /tmp, not the long per-user $TMPDIR, so that the prompt of the
+# terminal tests (user@host:cwd$) fits on one 80-column row.
+[[ "$(uname -s)" == Darwin ]] && TMPDIR=/tmp
 TMPDIR="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
 export TMPDIR
 PHYS_TMP="$(cd /tmp && pwd -P)"
@@ -244,14 +247,20 @@ run_case "undo copy overwrite"        "cd $UT; copy a.txt b.txt; undo; cat b.txt
 run_case "undo empty"                 "undo"                                      "^undo: nothing to undo$"
 HOME="$TEST_HOME"
 rm -rf "$UT"
-run_case "trace lists programs"       "trace /bin/true"                           "exec +/bin/true"
-run_case "trace shows file writes"    "trace /bin/cp /etc/hostname /tmp/asm_trace_probe" "write +/tmp/asm_trace_probe"
-rm -f /tmp/asm_trace_probe
-SBX="$HERE/../.sbx_probe"; rm -f "$SBX"
-run_case "sandbox blocks writes"      "cd $HERE/..; sandbox touch .sbx_probe; echo st=\$?" "^st=1$"
-run_case "sandbox -w allows cwd"      "cd $HERE/..; sandbox -w touch .sbx_probe; echo st=\$?" "^st=0$"
-rm -f "$SBX"
-run_case "sandbox blocks network"     "sandbox python3 -c 'import socket; socket.socket()'; echo st=\$?" "^st=1$"
+if [[ "$OS" == Darwin ]]; then
+    # they need Linux (ptrace, seccomp, Landlock); tools_*.py check the message
+    run_case "trace says it needs Linux"   "trace /usr/bin/true"   "not available on macOS"
+    run_case "sandbox says it needs Linux" "sandbox /usr/bin/true; echo st=\$?" "^st=126$"
+else
+    run_case "trace lists programs"       "trace /bin/true"                           "exec +/bin/true"
+    run_case "trace shows file writes"    "trace /bin/cp /etc/hostname /tmp/asm_trace_probe" "write +/tmp/asm_trace_probe"
+    rm -f /tmp/asm_trace_probe
+    SBX="$HERE/../.sbx_probe"; rm -f "$SBX"
+    run_case "sandbox blocks writes"      "cd $HERE/..; sandbox touch .sbx_probe; echo st=\$?" "^st=1$"
+    run_case "sandbox -w allows cwd"      "cd $HERE/..; sandbox -w touch .sbx_probe; echo st=\$?" "^st=0$"
+    rm -f "$SBX"
+    run_case "sandbox blocks network"     "sandbox python3 -c 'import socket; socket.socket()'; echo st=\$?" "^st=1$"
+fi
 src=$(mktemp)
 printf 'total=0\nfor n in 1 2 3 4\ndo\n  if [ $((n %% 2)) -eq 0 ]; then\n    total=$((total + n))\n  fi\ndone\necho even-sum=$total\n' > "$src"
 run_case "source runs blocks"         "source $src"                               "^even-sum=6$"

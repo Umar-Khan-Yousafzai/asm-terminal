@@ -57,7 +57,6 @@
 %define SYS_GETPID          MAC_SYS(20)
 %define SYS_GETUID          MAC_SYS(24)
 %define SYS_GETEUID         MAC_SYS(25)
-%define SYS_GETLOGIN        MAC_SYS(49)
 %define SYS_ACCESS          MAC_SYS(33)
 %define SYS_KILL            MAC_SYS(37)
 %define SYS_PIPE            MAC_SYS(42)
@@ -252,6 +251,7 @@
 %define WNOHANG             1
 %define WUNTRACED           2
 %define WCONTINUED          0x10
+%define WSTATUS_CONTINUED   0x137F          ; "stopped" by SIGCONT (19): resumed
 
 ; ----------------------------------------------------------------------------
 ; errno

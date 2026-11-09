@@ -1354,9 +1354,20 @@ setup_term_signals:
     ret
 
 ; term_signal_handler - rdi = signal number
+section .bss
+    term_dfl_act        resb 64     ; all zero: SIG_DFL
+section .text
 term_signal_handler:
     push rdi                        ; keeps the stack aligned for the call
     call restore_terminal
+    ; Back to the default action by hand too: Rosetta 2 does not always
+    ; honour SA_RESETHAND, and the signal sent below would land here again
+    mov edi, [rsp]
+    lea rsi, [term_dfl_act]
+    xor edx, edx
+    mov r10d, 8
+    mov eax, SYS_RT_SIGACTION
+    SYSCALL
     mov eax, SYS_GETPID
     SYSCALL
     mov edi, eax
@@ -6596,6 +6607,11 @@ passwd_find_uid:
 section .data
     passwd_path     db "/etc/passwd", 0
     err_whoami      db "whoami: cannot find a name for the current user.", 10, 0
+%ifdef PLATFORM_MACOS
+    whoami_s_id     db "/usr/bin/id", 0
+    whoami_s_un     db "-un", 0
+    whoami_id_argv  dq whoami_s_id, whoami_s_un, 0
+%endif
 section .bss
     passwd_buf      resb 32768
 section .text
@@ -6648,16 +6664,28 @@ handler_whoami:
 .hw_env:
 %ifdef PLATFORM_MACOS
     ; macOS keeps most accounts in Directory Services, not /etc/passwd:
-    ; the login name of this session comes from the kernel
-    lea rdi, [passwd_buf]
-    mov esi, 256
-    mov eax, SYS_GETLOGIN
-    SYSCALL
-    test rax, rax
-    jnz .hw_user
-    lea rdi, [passwd_buf]
-    cmp byte [rdi], 0
-    jne .hw_print
+    ; ask /usr/bin/id, which reads them for the effective uid
+    lea rdi, [whoami_id_argv]
+    mov esi, 1                      ; quiet
+    call upd_capture
+    test eax, eax
+    jle .hw_user
+    cmp dword [upd_status], 0
+    jne .hw_user
+    lea rdi, [upd_buf]
+    xor ecx, ecx
+.hw_id_end:
+    mov al, [rdi + rcx]
+    test al, al
+    jz .hw_id_cut
+    cmp al, 10
+    je .hw_id_cut
+    inc ecx
+    jmp .hw_id_end
+.hw_id_cut:
+    mov byte [rdi + rcx], 0
+    test ecx, ecx
+    jnz .hw_print
 .hw_user:
 %endif
     lea rdi, [str_user]
@@ -12955,16 +12983,16 @@ job_poll:
     cmp qword [r11 + rbx*8], 0
     je .jp_gone                     ; a single process of the shell's group ended
     mov eax, [rsp]
+    cmp eax, WSTATUS_CONTINUED      ; checked first: on macOS it looks "stopped"
+    je .jp_continued
     mov ecx, eax
     and ecx, 0xFF
     cmp ecx, 0x7F
-    jne .jp_not_stopped
+    jne .jp_again                   ; one stage ended; look for the others
     lea r11, [job_state]
     mov byte [r11 + rbx], JOB_STOPPED
     jmp .jp_again
-.jp_not_stopped:
-    cmp eax, 0xFFFF                 ; continued
-    jne .jp_again                   ; one stage ended; look for the others
+.jp_continued:
     lea r11, [job_state]
     mov byte [r11 + rbx], JOB_RUNNING
     jmp .jp_again

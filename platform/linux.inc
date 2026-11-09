@@ -238,6 +238,7 @@
 %define WNOHANG             1
 %define WUNTRACED           2
 %define WCONTINUED          8
+%define WSTATUS_CONTINUED   0xFFFF          ; wait status of a job resumed by SIGCONT
 
 ; ----------------------------------------------------------------------------
 ; errno values (system calls return them negated)

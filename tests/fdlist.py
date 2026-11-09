@@ -41,7 +41,7 @@ def other(pid):
             except OSError:
                 pass
         return out
-    p = subprocess.run(['lsof', '-n', '-P', '-a', '-p', str(pid), '-d', '0-65535', '-F', 'fn'],
+    p = subprocess.run(['/usr/sbin/lsof', '-n', '-P', '-a', '-p', str(pid), '-d', '0-65535', '-F', 'fn'],
                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     out, fd = [], None
     for line in p.stdout.decode('utf-8', 'replace').splitlines():

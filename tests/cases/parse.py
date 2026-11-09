@@ -144,7 +144,7 @@ o = lines_of(['x=$(false); echo st=$?', 'x=$(exit 3); echo st=$?', 'out=$(/bin/l
               'echo "a   b" `echo c   d`', 'x=`echo hi`; echo $x', 'echo $(calc 2 + 3)'], cwd=c)
 T.check("x=$(cmd) has the status of cmd", o[0] == 'st=1' and o[1] == 'st=3', o)
 T.check("|| after failed substitution", o[2] == 'FAILED' and o[3] == 'caught', o)
-T.check("builtins work in $( ) and with cd/set", o[4] == '[%s]' % c and o[5] == '/tmp' and o[6] == 'hi', o)
+T.check("builtins work in $( ) and with cd/set", o[4] == '[%s]' % c and o[5] == os.path.realpath('/tmp') and o[6] == 'hi', o)
 T.check("nested and quoted substitution", o[7] == 'nested' and o[8] == 'q  r' and o[9] == 'a   b c d', o)
 T.check("backticks and calc in substitution", o[10] == 'hi' and o[11] == '5', o)
 
@@ -172,8 +172,8 @@ c = T.tmpdir()
 o, e, st, _ = sh(['/bin/ls /nonexistent_dir 2>&1 >o2 | /bin/cat', '/bin/ls /nonexistent_dir 2>&1 >o3', '/bin/ls /nonexistent_dir >o4 2>&1',
                   '/bin/ls /nonexistent_dir &> o5', '/bin/echo x 3>f3', 'echo err >&2', 'echo out >&1'], cwd=c)
 T.check("2>&1 before > keeps stderr on the old stdout", read(c, 'o2') == '' and read(c, 'o3') == ''
-        and 'cannot access' in ''.join(o + [e]), (o, e, read(c, 'o2'), read(c, 'o3')))
-T.check(">f 2>&1 sends both to the file", 'cannot access' in read(c, 'o4') and 'cannot access' in read(c, 'o5'), os.listdir(c))
+        and 'nonexistent_dir' in ''.join(o + [e]) and 'No such file' in ''.join(o + [e]), (o, e, read(c, 'o2'), read(c, 'o3')))
+T.check(">f 2>&1 sends both to the file", 'nonexistent_dir' in read(c, 'o4') and 'nonexistent_dir' in read(c, 'o5'), os.listdir(c))
 T.check("N>file for other N goes to sh", 'x' in o and 'x 3' not in o and has(c, 'f3'), o)
 T.check(">&2 writes builtin output to stderr", 'err' in e and 'err' not in o and 'out' in o, (o, e))
 
@@ -261,6 +261,7 @@ for line in ['x=$(/usr/bin/printf %s hi); echo "$x" > cap1.txt',
              ('echo -n sb' if T.MACOS else 'sandbox /usr/bin/printf sb') + ' | /usr/bin/cat > cap6.txt',
              'echo piped | ' + ('/usr/bin/cat' if T.MACOS else 'trace /usr/bin/cat') + ' > cap7.txt']:
     s.run(line)
+s.run("echo capture-done", maxt=10)   # the last pipeline has finished
 s.close()
 T.check("tty: x=$(external) holds only the output", read(c, 'cap1.txt') == 'hi\n', repr(read(c, 'cap1.txt')))
 T.check("tty: $(external) in an argument holds only the output", read(c, 'cap2.txt') == 'hi\n', repr(read(c, 'cap2.txt')))
@@ -290,11 +291,12 @@ try:
 except Exception as ex:
     out = 'HANG %r' % ex
 T.check("builtin stage does not keep a pipe open (reader exits early)", 'line 0 some text' in out and 'after' in out, out[-200:])
-try:
-    out, err, st = T.run_script('echo piped | trace /usr/bin/cat\necho after\nexit\n', cwd=c, timeout=10)
-except Exception as ex:
-    out = 'HANG %r' % ex
-T.check("builtin stage feeding a builtin that runs a program", 'piped' in out and 'after' in out, out[-200:])
+if not T.MACOS:   # trace needs Linux
+    try:
+        out, err, st = T.run_script('echo piped | trace /usr/bin/cat\necho after\nexit\n', cwd=c, timeout=10)
+    except Exception as ex:
+        out = 'HANG %r' % ex
+    T.check("builtin stage feeding a builtin that runs a program", 'piped' in out and 'after' in out, out[-200:])
 
 # ---------------------------------------------------------------- ls and names with blanks
 c = T.tmpdir()
