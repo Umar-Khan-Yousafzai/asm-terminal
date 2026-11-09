@@ -159,7 +159,8 @@ s.run("echo loop-over")
 T.check("ctrl-c stops a loop of builtins", loop_running and "loop-over" in s.screen().split("\n") and "[130]" in s.screen(),
         (loop_running, s.screen()[-200:]))
 s.send("type /dev/zero\r")
-time.sleep(0.5)
+waitfor(lambda: (s.settle(0.05, 0.1), cooked(s))[1], 5)   # see the loop case above
+time.sleep(0.2)
 s.send(b"\x03")
 s.settle()
 s.run("echo type-over")
