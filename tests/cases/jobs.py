@@ -150,10 +150,12 @@ s = T.Sess()
 s.settle()
 s.send("while true; do :; done\r")
 time.sleep(0.5)
+loop_info = (cooked(s), pstat(s.p.pid))      # ISIG on? shell running?
 s.send(b"\x03")
 s.settle()
 s.run("echo loop-over")
-T.check("ctrl-c stops a loop of builtins", "loop-over" in s.screen().split("\n") and "[130]" in s.screen(), s.screen()[-300:])
+T.check("ctrl-c stops a loop of builtins", "loop-over" in s.screen().split("\n") and "[130]" in s.screen(),
+        (loop_info, cooked(s), pstat(s.p.pid), s.screen()[-200:]))
 s.send("type /dev/zero\r")
 time.sleep(0.5)
 s.send(b"\x03")
