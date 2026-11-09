@@ -4,6 +4,34 @@ All notable changes to ASM Terminal. Versions follow [Semantic Versioning](https
 MAJOR for breaking changes, MINOR for new features, PATCH for fixes.
 The version lives in one place: `version.inc`.
 
+## [2.5.0] - 2026-11-09
+
+ASM Terminal runs on macOS. The same sources build a Mach-O x86-64 binary for macOS 11 and later,
+which also runs on Apple Silicon through Rosetta 2. Linux and Windows behave as before.
+
+### Added
+- **macOS build**: `make` on a Mac (NASM from Homebrew, Xcode Command Line Tools), or
+  `make terminal-macos` on Linux with `ld64.lld`. Releases include `asm-terminal-macos-x86_64`, and
+  `update install` on a Mac installs that file, checked with `shasum -a 256`.
+- Everything a kernel defines (system call numbers, flags, error numbers, struct layouts) lives in
+  `platform/linux.inc` and `platform/macos.inc`; macOS calls with another shape go through
+  `platform/macos.asm` (fork, pipe2, getcwd, directory reading, clocks, uname, utimensat, poll,
+  the program's own path, signal return).
+- CI builds and tests on macOS (Intel, and Apple Silicon through Rosetta 2) and checks that the
+  Linux build has no absolute 32-bit addresses (`make check-high`), since Mach-O loads code above
+  4 GiB.
+
+### Changed
+- On macOS, `trace` and `sandbox` say that they need Linux (`sandbox` exits 126 without running the
+  command); `free` shows total and free memory only; `uptime` reads the boot time from the kernel.
+- In a pipeline, `alias`, `unalias`, `cd`, `type`, `jobs`, `fg` and `bg` run as builtins even when
+  a program of that name is on `PATH` (macOS ships them as `sh` scripts in `/usr/bin`).
+
+### Fixed
+- A job resumed with `bg` is listed as Running on macOS, not Stopped.
+- The quit and suspend keys are turned off with the platform's disable value while a command line
+  runs.
+
 ## [2.4.0] - 2026-10-23
 
 The script engine and the builtins lose the limits that 2.3.0 listed: `"$@"`, `. file`, `case`,

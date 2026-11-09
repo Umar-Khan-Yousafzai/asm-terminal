@@ -15,13 +15,7 @@
 ; Included from terminal_linux.asm, after ash/ash_exec.asm.
 ; ============================================================================
 
-%define CLOCK_MONOTONIC     1
-%define RUSAGE_SIZE         144
-%define RU_MAXRSS           32          ; long ru_maxrss (KB) in struct rusage
 %define STATS_MIN_NS        1000000000  ; 1 s
-%define X_OK                1
-%define ESRCH               3
-%define EPERM               1
 %define S_IFMT              0o170000
 %define S_IFREG             0o100000
 
@@ -70,17 +64,8 @@ section .data
     stats_zero          db "0", 0
 
     ; Signal names for kill -NAME (NUL-separated name, then signal byte)
-    bi_signals          db "HUP", 0, 1,  "INT", 0, 2,  "QUIT", 0, 3
-                        db "ILL", 0, 4,  "TRAP", 0, 5, "ABRT", 0, 6
-                        db "BUS", 0, 7,  "FPE", 0, 8,  "KILL", 0, 9
-                        db "USR1", 0, 10, "SEGV", 0, 11, "USR2", 0, 12
-                        db "PIPE", 0, 13, "ALRM", 0, 14, "TERM", 0, 15
-                        db "STKFLT", 0, 16, "CHLD", 0, 17, "CONT", 0, 18
-                        db "STOP", 0, 19, "TSTP", 0, 20, "TTIN", 0, 21
-                        db "TTOU", 0, 22, "URG", 0, 23, "XCPU", 0, 24
-                        db "XFSZ", 0, 25, "VTALRM", 0, 26, "PROF", 0, 27
-                        db "WINCH", 0, 28, "IO", 0, 29, "PWR", 0, 30
-                        db "SYS", 0, 31, 0
+    ; (the names and numbers come from the platform file)
+    bi_signals          SIGNAL_NAME_TABLE
 
 section .bss
     stats_t0            resq 2          ; timespec at command start
@@ -105,7 +90,7 @@ stats_begin:
     mov edi, CLOCK_MONOTONIC
     lea rsi, [stats_t0]
     mov eax, SYS_CLOCK_GETTIME
-    syscall
+    SYSCALL_X clock_gettime
     ret
 
 ; stats_end() - call after it finished; stores stats_ns
@@ -113,7 +98,7 @@ stats_end:
     mov edi, CLOCK_MONOTONIC
     lea rsi, [stats_t1]
     mov eax, SYS_CLOCK_GETTIME
-    syscall
+    SYSCALL_X clock_gettime
     mov rax, [stats_t1]
     sub rax, [stats_t0]
     imul rax, rax, 1000000000
@@ -126,6 +111,9 @@ stats_end:
 ; stats_note_rusage() - fold ash_rusage.ru_maxrss into stats_maxrss_kb
 stats_note_rusage:
     mov rax, [ash_rusage + RU_MAXRSS]
+%if RU_MAXRSS_SHIFT
+    shr rax, RU_MAXRSS_SHIFT        ; this system counts bytes
+%endif
     cmp rax, [stats_maxrss_kb]
     jbe .snr_ret
     mov [stats_maxrss_kb], rax
@@ -274,7 +262,7 @@ handler_exit_code:
     call restore_terminal
     mov edi, ebx
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 .hec_plain:
     call handler_exit               ; does not return
 
@@ -628,13 +616,13 @@ bi_find_in_path:
     lea rdi, [bi_path]
     mov esi, X_OK
     mov eax, SYS_ACCESS
-    syscall
+    SYSCALL
     test rax, rax
     jnz .fc_no
     lea rdi, [bi_path]
     lea rsi, [stat_buf]
     mov eax, SYS_STAT
-    syscall
+    SYSCALL
     test rax, rax
     jnz .fc_no
     mov eax, [stat_buf + STAT_ST_MODE]
@@ -697,7 +685,8 @@ handler_history:
     inc r14d
     test ebx, ebx
     jz .hh_print
-    cmp ebx, [hist_meta_hash + r13 * 4]
+    lea r11, [hist_meta_hash]
+    cmp ebx, [r11 + r13 * 4]
     jne .hh_skip
 .hh_print:
     mov eax, r14d
@@ -705,7 +694,8 @@ handler_history:
     lea rdi, [bi_hist_gap]
     call print_cstring
     imul eax, r13d, HISTORY_ENTRY_SIZE
-    lea rdi, [history_buf + rax]
+    lea r11, [history_buf]
+    lea rdi, [r11 + rax]
     call print_cstring
     mov eax, r13d
     call sm_hist_fail_mark          ; "  [N]" after a command that failed
@@ -727,12 +717,12 @@ handler_history:
     mov esi, O_WRONLY | O_TRUNC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .hh_cleared
     mov edi, eax
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .hh_cleared:
     lea rdi, [bi_msg_hist_cleared]
     call print_cstring
@@ -872,7 +862,8 @@ handler_kill:
 .hk_slot:
     cmp ecx, JOB_MAX
     jge .hk_nojob
-    mov rdi, [job_pids + rcx*8]
+    lea r11, [job_pids]
+    mov rdi, [r11 + rcx*8]
     test rdi, rdi
     jz .hk_slot_next
     inc edx
@@ -883,12 +874,14 @@ handler_kill:
     jmp .hk_slot
 
 .hk_job_found:
-    mov r8, [job_pgids + rcx*8]
+    lea r11, [job_pgids]
+    mov r8, [r11 + rcx*8]
     test r8, r8
     jz .hk_send                     ; shares the shell's group: signal the pid
     mov edi, r8d
     neg edi                         ; the whole job: every stage of a pipeline
-    cmp byte [job_state + rcx], JOB_STOPPED
+    lea r11, [job_state]
+    cmp byte [r11 + rcx], JOB_STOPPED
     jne .hk_send
     cmp r13d, SIGTERM               ; a stopped job only acts on TERM or HUP
     je .hk_wake                     ; once it runs again
@@ -900,7 +893,7 @@ handler_kill:
 .hk_send:
     mov esi, r13d
     mov eax, SYS_KILL
-    syscall
+    SYSCALL
     test rax, rax
     jnz .hk_failed
     test ebx, ebx
@@ -908,7 +901,7 @@ handler_kill:
     mov edi, ebx
     mov esi, SIGCONT
     mov eax, SYS_KILL
-    syscall
+    SYSCALL
     jmp .hk_next
 .hk_failed:
     lea rdi, [bi_msg_kill_esrch]

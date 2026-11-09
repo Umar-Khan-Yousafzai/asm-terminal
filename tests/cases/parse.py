@@ -144,7 +144,7 @@ o = lines_of(['x=$(false); echo st=$?', 'x=$(exit 3); echo st=$?', 'out=$(/bin/l
               'echo "a   b" `echo c   d`', 'x=`echo hi`; echo $x', 'echo $(calc 2 + 3)'], cwd=c)
 T.check("x=$(cmd) has the status of cmd", o[0] == 'st=1' and o[1] == 'st=3', o)
 T.check("|| after failed substitution", o[2] == 'FAILED' and o[3] == 'caught', o)
-T.check("builtins work in $( ) and with cd/set", o[4] == '[%s]' % c and o[5] == '/tmp' and o[6] == 'hi', o)
+T.check("builtins work in $( ) and with cd/set", o[4] == '[%s]' % c and o[5] == os.path.realpath('/tmp') and o[6] == 'hi', o)
 T.check("nested and quoted substitution", o[7] == 'nested' and o[8] == 'q  r' and o[9] == 'a   b c d', o)
 T.check("backticks and calc in substitution", o[10] == 'hi' and o[11] == '5', o)
 
@@ -172,24 +172,24 @@ c = T.tmpdir()
 o, e, st, _ = sh(['/bin/ls /nonexistent_dir 2>&1 >o2 | /bin/cat', '/bin/ls /nonexistent_dir 2>&1 >o3', '/bin/ls /nonexistent_dir >o4 2>&1',
                   '/bin/ls /nonexistent_dir &> o5', '/bin/echo x 3>f3', 'echo err >&2', 'echo out >&1'], cwd=c)
 T.check("2>&1 before > keeps stderr on the old stdout", read(c, 'o2') == '' and read(c, 'o3') == ''
-        and 'cannot access' in ''.join(o + [e]), (o, e, read(c, 'o2'), read(c, 'o3')))
-T.check(">f 2>&1 sends both to the file", 'cannot access' in read(c, 'o4') and 'cannot access' in read(c, 'o5'), os.listdir(c))
+        and 'nonexistent_dir' in ''.join(o + [e]) and 'No such file' in ''.join(o + [e]), (o, e, read(c, 'o2'), read(c, 'o3')))
+T.check(">f 2>&1 sends both to the file", 'nonexistent_dir' in read(c, 'o4') and 'nonexistent_dir' in read(c, 'o5'), os.listdir(c))
 T.check("N>file for other N goes to sh", 'x' in o and 'x 3' not in o and has(c, 'f3'), o)
 T.check(">&2 writes builtin output to stderr", 'err' in e and 'err' not in o and 'out' in o, (o, e))
 
 c = T.tmpdir()
 write(c, 'sc.txt', 'echo from-script\n/bin/echo from-ext\n')
 o = lines_of(['source sc.txt > out.txt', 'echo back', '/bin/true > a1 > a2', 'echo b > f9 > f10',
-              '/bin/ls -l /proc/self/fd > fdlist'], cwd=c)
+              T.FDLIST + ' > fdlist'], cwd=c)
 T.check("source with > keeps the outer redirection", ANSI.sub('', read(c, 'out.txt') or '') == 'from-script\nfrom-ext\n'
         and 'from-script' not in o and 'back' in o, (o, read(c, 'out.txt')))
 T.check("repeated > creates every file", all(has(c, n) for n in ('a1', 'a2', 'f9', 'f10')), os.listdir(c))
 fds = [l for l in (read(c, 'fdlist') or '').split('\n') if '->' in l]
-T.check("no stray descriptors reach the child", len(fds) == 4 and sum('fdlist' in l for l in fds) == 1, fds)
+T.check("no stray descriptors reach the child", len(fds) == 3 and sum('fdlist' in l for l in fds) == 1, fds)
 
 c = T.tmpdir()
-o = lines_of(['for i in 1 2 3 4 5 6 7 8; do echo x > a$i > b$i; done', '/bin/ls /proc/$$/fd | /usr/bin/wc -l'], cwd=c)
-T.check("redirections do not leak descriptors in the shell", o and o[-1].isdigit() and int(o[-1]) < 8, o)
+o = lines_of(['for i in 1 2 3 4 5 6 7 8; do echo x > a$i > b$i; done', T.FDLIST + ' $$ | /usr/bin/wc -l'], cwd=c)
+T.check("redirections do not leak descriptors in the shell", o and o[-1].strip().isdigit() and int(o[-1]) < 8, o)
 
 # ---------------------------------------------------------------- builtin arguments
 c = T.tmpdir()
@@ -257,14 +257,16 @@ for line in ['x=$(/usr/bin/printf %s hi); echo "$x" > cap1.txt',
              'cd $(/usr/bin/dirname /tmp/x); pwd > ' + c + '/cap4.txt',
              'cd ' + c,
              'ls $(/usr/bin/printf %s ' + c + ') > cap5.txt',
-             'sandbox /usr/bin/printf sb | /usr/bin/cat > cap6.txt',
-             'echo piped | trace /usr/bin/cat > cap7.txt']:
+             # trace and sandbox need Linux; echo is the builtin stage there
+             ('echo -n sb' if T.MACOS else 'sandbox /usr/bin/printf sb') + ' | /bin/cat > cap6.txt',
+             'echo piped | ' + ('/bin/cat' if T.MACOS else 'trace /bin/cat') + ' > cap7.txt']:
     s.run(line)
+s.run("echo capture-done", maxt=10)   # the last pipeline has finished
 s.close()
 T.check("tty: x=$(external) holds only the output", read(c, 'cap1.txt') == 'hi\n', repr(read(c, 'cap1.txt')))
 T.check("tty: $(external) in an argument holds only the output", read(c, 'cap2.txt') == 'hi\n', repr(read(c, 'cap2.txt')))
 T.check("tty: backticks hold only the output", read(c, 'cap3.txt') == 'hi\n', repr(read(c, 'cap3.txt')))
-T.check("tty: cd $(dirname) works", (read(c, 'cap4.txt') or '').strip() == '/tmp', repr(read(c, 'cap4.txt')))
+T.check("tty: cd $(dirname) works", (read(c, 'cap4.txt') or '').strip() == os.path.realpath('/tmp'), repr(read(c, 'cap4.txt')))
 T.check("tty: ls $(printf dir) lists the directory", 'esc.bin' in (read(c, 'cap5.txt') or ''), repr(read(c, 'cap5.txt')))
 T.check("tty: a builtin stage leaves the pipe clean", read(c, 'cap6.txt') == 'sb', repr(read(c, 'cap6.txt')))
 T.check("tty: trace stage gets its stdin", 'piped' in (read(c, 'cap7.txt') or '') and '\x1b' not in (read(c, 'cap7.txt') or ''),
@@ -289,11 +291,12 @@ try:
 except Exception as ex:
     out = 'HANG %r' % ex
 T.check("builtin stage does not keep a pipe open (reader exits early)", 'line 0 some text' in out and 'after' in out, out[-200:])
-try:
-    out, err, st = T.run_script('echo piped | trace /usr/bin/cat\necho after\nexit\n', cwd=c, timeout=10)
-except Exception as ex:
-    out = 'HANG %r' % ex
-T.check("builtin stage feeding a builtin that runs a program", 'piped' in out and 'after' in out, out[-200:])
+if not T.MACOS:   # trace needs Linux
+    try:
+        out, err, st = T.run_script('echo piped | trace /bin/cat\necho after\nexit\n', cwd=c, timeout=10)
+    except Exception as ex:
+        out = 'HANG %r' % ex
+    T.check("builtin stage feeding a builtin that runs a program", 'piped' in out and 'after' in out, out[-200:])
 
 # ---------------------------------------------------------------- ls and names with blanks
 c = T.tmpdir()
@@ -311,11 +314,11 @@ c = T.tmpdir()
 write(c, 'sp ace.txt', 'tab-one\n'); write(c, "it's.txt", 'tab-two\n'); write(c, 'plain.txt', 'tab-three\n')
 s = T.Sess(cwd=c)
 s.settle()
-s.send('/usr/bin/cat sp\t'); s.settle()
+s.send('/bin/cat sp\t'); s.settle()
 s.send('\r'); s.settle()
-s.send('/usr/bin/cat it\t'); s.settle()
+s.send('/bin/cat it\t'); s.settle()
 s.send('\r'); s.settle()
-s.send('/usr/bin/cat pl\t'); s.settle()
+s.send('/bin/cat pl\t'); s.settle()
 s.send('\r'); s.settle()
 scr = s.screen()
 s.close()

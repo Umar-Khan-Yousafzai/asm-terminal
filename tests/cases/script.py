@@ -114,7 +114,8 @@ body = '\n'.join('echo p%d_xxxxxxxxxx' % i for i in range(300))
 lines, err, st = run('if false; then\n' + body + '\nfi\necho after')
 T.check("script: a long block with a false condition runs nothing of its body",
         'after' in lines and not any(l.startswith('p') for l in lines), (len(lines), err))
-big = '\n'.join('echo q%d_%s' % (i, 'y' * 40) for i in range(20000))
+# long lines: the same 512 KiB limit is reached with far fewer re-parses of the open block
+big = '\n'.join('echo q%d_%s' % (i, 'y' * 400) for i in range(2000))
 lines, err, st = run('if true; then\n' + big + '\nfi\necho end', timeout=60)
 T.check("script: a block over the pending limit aborts the piped script",
         st == 2 and 'too long' in err and 'end' not in lines and not any(l.startswith('q') for l in lines),

@@ -16,8 +16,8 @@ rel_ok() {   # rel_ok NAME 'shell expression that must succeed'
 rel_upd_setup() {
     local d="$1"
     mkdir -p "$d/bin" "$d/srv" "$d/inst" "$d/home"
-    cp "$BIN" "$d/srv/asm-terminal-linux-x86_64"; printf X >> "$d/srv/asm-terminal-linux-x86_64"
-    (cd "$d/srv" && sha256sum asm-terminal-linux-x86_64 > SHA256SUMS)
+    cp "$BIN" "$d/srv/$ASSET"; printf X >> "$d/srv/$ASSET"
+    (cd "$d/srv" && sha256 "$ASSET" > SHA256SUMS)
     echo '{"tag_name": "v99.0.0"}' > "$d/srv/latest"
     cat > "$d/bin/curl" <<CURL
 #!/bin/bash
@@ -53,7 +53,7 @@ RU=$(mktemp -d)
 rel_upd_setup "$RU"
 rel_out=$(rel_upd_run "$RU" 'update\nupdate install\nupdate install\nupdate\n')
 rel_ok "update: first install succeeds"        '[[ "$rel_out" == *"Updated to v99.0.0"* ]]'
-rel_ok "update: binary replaced"               'cmp -s "$RU/inst/asm" "$RU/srv/asm-terminal-linux-x86_64"'
+rel_ok "update: binary replaced"               'cmp -s "$RU/inst/asm" "$RU/srv/$ASSET"'
 rel_ok "update: 2nd install says already done" '[[ "$rel_out" == *"Already updated to v99.0.0"* ]]'
 rel_ok "update: no stray (deleted) file"       '[[ "$(ls "$RU/inst")" == "asm" ]]'
 rel_ok "update: no .new leftovers"             '! compgen -G "$RU/inst/asm.new*" >/dev/null'
@@ -67,41 +67,41 @@ rm -rf "$RU"
 # wrong checksum, missing SHA256SUMS, odd SHA256SUMS layouts
 RU=$(mktemp -d); rel_upd_setup "$RU"
 GOOD=$(cut -d' ' -f1 "$RU/srv/SHA256SUMS")
-printf '%064d  asm-terminal-linux-x86_64\n' 0 > "$RU/srv/SHA256SUMS"
+printf '%064d  '"$ASSET"'\n' 0 > "$RU/srv/SHA256SUMS"
 rel_out=$(rel_upd_run "$RU" 'update install\n')
 rel_ok "update: wrong checksum refused"        '[[ "$rel_out" == *"Checksum mismatch"* ]] && cmp -s "$RU/inst/asm" "$BIN"'
 rel_ok "update: refused download deleted"      '[[ "$(ls "$RU/inst")" == "asm" ]]'
 rm -f "$RU/srv/SHA256SUMS"
 rel_out=$(rel_upd_run "$RU" 'update install\n')
 rel_ok "update: missing SHA256SUMS refused"    '[[ "$rel_out" == *"Could not get checksums"* ]] && cmp -s "$RU/inst/asm" "$BIN"'
-printf '%s  asm-terminal-linux-x86_64.sig\n' "$GOOD" > "$RU/srv/SHA256SUMS"
+printf '%s  '"$ASSET"'.sig\n' "$GOOD" > "$RU/srv/SHA256SUMS"
 rel_out=$(rel_upd_run "$RU" 'update install\n')
 rel_ok "update: longer name is not our asset"  '[[ "$rel_out" == *"Could not get checksums"* ]] && cmp -s "$RU/inst/asm" "$BIN"'
-printf '%s  asm-terminal-linux-x86_64\r\n' "$GOOD" > "$RU/srv/SHA256SUMS"
+printf '%s  '"$ASSET"'\r\n' "$GOOD" > "$RU/srv/SHA256SUMS"
 rel_out=$(rel_upd_run "$RU" 'update install\n')
 rel_ok "update: CRLF SHA256SUMS accepted"      '[[ "$rel_out" == *"Updated to v99.0.0"* ]]'
 cp "$BIN" "$RU/inst/asm"; rm -f "$RU/home/.asm_update"
-printf '%s *asm-terminal-linux-x86_64' "$GOOD" > "$RU/srv/SHA256SUMS"
+printf '%s *'"$ASSET"'' "$GOOD" > "$RU/srv/SHA256SUMS"
 rel_out=$(rel_upd_run "$RU" 'update install\n')
 rel_ok "update: '*name', no final LF accepted" '[[ "$rel_out" == *"Updated to v99.0.0"* ]]'
 cp "$BIN" "$RU/inst/asm"
-printf '%s  asm-terminal-linux-x86_64\n' "${GOOD^^}" > "$RU/srv/SHA256SUMS"
+printf '%s  '"$ASSET"'\n' "$(tr a-f A-F <<<"$GOOD")" > "$RU/srv/SHA256SUMS"
 rel_out=$(rel_upd_run "$RU" 'update install\n')
 rel_ok "update: upper-case hash accepted"      '[[ "$rel_out" == *"Updated to v99.0.0"* ]]'
 cp "$BIN" "$RU/inst/asm"
-printf '%s  other\n%s  asm-terminal-linux-x86_64\n' "$GOOD" "$GOOD" > "$RU/srv/SHA256SUMS"
+printf '%s  other\n%s  '"$ASSET"'\n' "$GOOD" "$GOOD" > "$RU/srv/SHA256SUMS"
 rel_out=$(rel_upd_run "$RU" 'update install\n')
 rel_ok "update: hash found on a later line"    '[[ "$rel_out" == *"Updated to v99.0.0"* ]]'
 cp "$BIN" "$RU/inst/asm"
-printf 'zz%s  asm-terminal-linux-x86_64\n' "${GOOD:2}" > "$RU/srv/SHA256SUMS"
+printf 'zz%s  '"$ASSET"'\n' "${GOOD:2}" > "$RU/srv/SHA256SUMS"
 rel_out=$(rel_upd_run "$RU" 'update install\n')
 rel_ok "update: non-hex hash refused"          '[[ "$rel_out" == *"Could not get checksums"* ]] && cmp -s "$RU/inst/asm" "$BIN"'
 rm -rf "$RU"
 
-# sha256sum not installed: say so, do not claim tampering
+# the checksum tool (sha256sum, shasum on macOS) not installed: say so, do not claim tampering
 RU=$(mktemp -d); rel_upd_setup "$RU"
 rel_out=$(printf 'update install\nexit\n' | timeout 20 env PATH="$RU/bin" HOME="$RU/home" ASM_NO_UPDATE_CHECK=1 "$RU/inst/asm" 2>&1 | strip_ansi)
-rel_ok "update: missing sha256sum reported"    '[[ "$rel_out" == *"Could not run"*sha256sum* && "$rel_out" != *"Checksum mismatch"* ]] && cmp -s "$RU/inst/asm" "$BIN"'
+rel_ok "update: missing sha256sum reported"    '[[ "$rel_out" == *"Could not run"*"$SHA_TOOL"* && "$rel_out" != *"Checksum mismatch"* ]] && cmp -s "$RU/inst/asm" "$BIN"'
 rm -rf "$RU"
 
 # never downgrade; hostile tags
@@ -211,8 +211,11 @@ ASM_PREFIX="$RT/pre fix" bash "$RT/packaging/linux/uninstall.sh" >/dev/null 2>&1
 rel_ok "uninstall.sh removes our asm link" '[[ ! -L "$RT/pre fix/bin/asm" && ! -e "$RT/pre fix/bin/asm-terminal" ]]'
 rm -rf "$RT"
 
-# install-release.sh against a local file:// mirror
-if command -v curl >/dev/null; then
+# install-release.sh against a local file:// mirror (it installs the Linux build)
+if [[ "$OS" == Darwin ]]; then
+    rel_out=$(ASM_PREFIX="$(mktemp -d)/p" sh "$HERE/../packaging/linux/install-release.sh" 2>&1); rel_st=$?
+    rel_ok "install-release.sh refuses to run on macOS" '[[ $rel_st -ne 0 && "$rel_out" == *"installer is for Linux"* ]]'
+elif command -v curl >/dev/null; then
     RT=$(mktemp -d); rel_tree "$RT"
     mkdir -p "$RT/rel"
     cp "$BIN" "$RT/rel/asm-terminal-linux-x86_64"
@@ -272,7 +275,7 @@ CI="$rel_root/.github/workflows/ci.yml"
 rel_ok "workflows: every action is pinned to a commit SHA" \
     '! grep -hE "^\s*-? *uses: " "$WF" "$CI" | grep -vE "uses: [^@ ]+@[0-9a-f]{40}( |$)"'
 rel_ok "workflows: token is read-only by default" \
-    'grep -qE "^permissions:" "$WF" && sed -n "/^permissions:/{n;p;q}" "$WF" | grep -q "contents: read" && sed -n "/^permissions:/{n;p;q}" "$CI" | grep -q "contents: read"'
+    'grep -qE "^permissions:" "$WF" && sed -n "/^permissions:/{n;p;q;}" "$WF" | grep -q "contents: read" && sed -n "/^permissions:/{n;p;q;}" "$CI" | grep -q "contents: read"'
 rel_ok "release: only the publish job can write" \
     '[[ "$(grep -c "contents: write" "$WF")" == 1 ]] && sed -n "/^  publish:/,\$p" "$WF" | grep -q "contents: write"'
 rel_ok "release: tag and dispatch input never expand inside a script" \

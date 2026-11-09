@@ -17,23 +17,16 @@
 ; Included from terminal_linux.asm, after ash/ash_exec.asm.
 ; ============================================================================
 
-%define SYS_CHMOD           90
-%define SYS_SETSID          112
-%define SYS_ACCESS          21
 %define UPD_BUF_SIZE        16384
 %define UPD_TAG_MAX         32
 %define UPD_CHECK_INTERVAL  86400       ; seconds between background checks
-%define STAT_ST_MTIME       88
-%define UPD_SYS_GETPID      39
-%define UPD_SYS_FSYNC       74
-%define UPD_SYS_UTIMENSAT   280
 %define UPD_SELF_MAX        (MAX_PATH_BUF - 24)  ; room for ".new." + pid
 
 section .data
     upd_cur_version     db ASM_VERSION, 0
     upd_api_url         db "https://api.github.com/repos/Umar-Khan-Yousafzai/asm-terminal/releases/latest", 0
     upd_dl_base         db "https://github.com/Umar-Khan-Yousafzai/asm-terminal/releases/download/", 0
-    upd_asset           db "asm-terminal-linux-x86_64"
+    upd_asset           db UPDATE_ASSET
     upd_asset_end       db 0
     UPD_ASSET_LEN       equ upd_asset_end - upd_asset
     upd_sums_name       db "SHA256SUMS", 0
@@ -79,7 +72,7 @@ section .data
     upd_msg_dlfail      db "Download failed. Nothing was changed.", 10, 0
     upd_msg_nosums      db "Could not get checksums for this release. Nothing was changed.", 10, 0
     upd_msg_badsum      db "Checksum mismatch. The download was deleted and nothing was changed.", 10, 0
-    upd_msg_nosha       db "Could not run 'sha256sum', so the download cannot be checked. Nothing was changed.", 10, 0
+    upd_msg_nosha       db "Could not run '", SHA256_TOOL, "', so the download cannot be checked. Nothing was changed.", 10, 0
     upd_msg_replaced    db "This program was replaced on disk after it started.", 10
                         db "Type 'exit', start the terminal again, then run 'update install'.", 10, 0
     upd_msg_managed     db "This copy belongs to a package manager or an AppImage. Update it there.", 10, 0
@@ -111,7 +104,16 @@ section .data
                         dq upd_s_fsSL, upd_s_maxtime, upd_s_t8
                         dq upd_s_maxsize, upd_s_size_text
                         dq 0, 0                      ; [11] = url
+%ifdef PLATFORM_MACOS
+    upd_s_shasum        db "shasum", 0                ; macOS has no sha256sum
+    upd_s_alg           db "-a", 0
+    upd_s_256           db "256", 0
+    upd_argv_sha        dq upd_s_shasum, upd_s_alg, upd_s_256, 0, 0   ; [3] = file
+%define UPD_SHA_FILE_SLOT 3
+%else
     upd_argv_sha        dq upd_s_sha256sum, 0, 0     ; [1] = file
+%define UPD_SHA_FILE_SLOT 1
+%endif
 
 section .bss
     upd_buf             resb UPD_BUF_SIZE
@@ -284,7 +286,8 @@ upd_install:
     ; The folder name is copied to upd_tmp so upd_self stays whole.
     lea rdi, [upd_self]
     call str_len
-    lea rdi, [upd_self + rax]
+    lea r11, [upd_self]
+    lea rdi, [r11 + rax]
 .ui_find_slash:
     lea rdx, [upd_self]
     cmp rdi, rdx
@@ -307,7 +310,7 @@ upd_install:
     lea rdi, [upd_tmp]
     mov esi, 2                      ; W_OK
     mov eax, SYS_ACCESS
-    syscall
+    SYSCALL
     test rax, rax
     js .ui_noperm_early
 .ui_dir_ok:
@@ -321,13 +324,13 @@ upd_install:
     lea rsi, [upd_new_suffix]
     call upd_stpcpy
     mov rdi, rax
-    mov eax, UPD_SYS_GETPID
-    syscall
+    mov eax, SYS_GETPID
+    SYSCALL
     mov rsi, rax
     call upd_put_uint
     lea rdi, [upd_tmp]
     mov eax, SYS_UNLINK
-    syscall
+    SYSCALL
 
     ; url = base + tag + "/" + asset
     lea rsi, [upd_asset]
@@ -370,7 +373,7 @@ upd_install:
 
     ; Actual hash of what we downloaded
     lea rax, [upd_tmp]
-    mov [upd_argv_sha + 8], rax
+    mov [upd_argv_sha + UPD_SHA_FILE_SLOT * 8], rax
     lea rdi, [upd_argv_sha]
     mov esi, 1
     call upd_capture
@@ -399,25 +402,25 @@ upd_install:
     lea rdi, [upd_tmp]
     mov esi, 0o755
     mov eax, SYS_CHMOD
-    syscall
+    SYSCALL
     lea rdi, [upd_tmp]
     xor esi, esi                    ; O_RDONLY
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .ui_rename
     mov ebx, eax
     mov edi, ebx
-    mov eax, UPD_SYS_FSYNC
-    syscall
+    mov eax, SYS_FSYNC
+    SYSCALL
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .ui_rename:
     lea rdi, [upd_tmp]
     lea rsi, [upd_self]
     mov eax, SYS_RENAME
-    syscall
+    SYSCALL
     test rax, rax
     js .ui_noperm
 
@@ -476,7 +479,7 @@ upd_install:
 .ui_cleanup:
     lea rdi, [upd_tmp]
     mov eax, SYS_UNLINK
-    syscall
+    SYSCALL
     mov rdi, rbx
     call print_cstring
     xor eax, eax
@@ -496,12 +499,13 @@ upd_read_self:
     lea rsi, [upd_self]
     mov edx, UPD_SELF_MAX
     mov eax, SYS_READLINK
-    syscall
+    SYSCALL_X readlink_self
     test rax, rax
     jle .rs_fail
     cmp rax, UPD_SELF_MAX
     jae .rs_fail
-    mov byte [upd_self + rax], 0
+    lea r11, [upd_self]
+    mov byte [r11 + rax], 0
     mov eax, 1
     ret
 .rs_fail:
@@ -706,7 +710,7 @@ update_startup:
     lea rdi, [upd_cache_path]
     lea rsi, [stat_buf]
     mov eax, SYS_STAT
-    syscall
+    SYSCALL
     test rax, rax
     js .us_spawn
     mov r12, [stat_buf + STAT_ST_MTIME]
@@ -714,25 +718,26 @@ update_startup:
     lea rdi, [upd_cache_path]
     xor esi, esi                    ; O_RDONLY
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .us_spawn
     mov ebx, eax
     mov edi, ebx
     lea rsi, [upd_latest]
     mov edx, UPD_TAG_MAX - 1
-    xor eax, eax                    ; SYS_READ
-    syscall
+    SYSNO SYS_READ
+    SYSCALL
     push rax
     push rax
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     pop rax
     pop rax
     test rax, rax
     jle .us_age
-    mov byte [upd_latest + rax], 0
+    lea r11, [upd_latest]
+    mov byte [r11 + rax], 0
     lea rdi, [upd_latest]           ; cut at the first newline
 .us_strip:
     mov al, [rdi]
@@ -768,7 +773,7 @@ update_startup:
     mov edi, CLOCK_REALTIME
     lea rsi, [timespec_buf]
     mov eax, SYS_CLOCK_GETTIME
-    syscall
+    SYSCALL_X clock_gettime
     mov rax, [timespec_buf]
     sub rax, r12
     js .us_spawn                    ; cache dated in the future: refresh it
@@ -778,12 +783,12 @@ update_startup:
 .us_spawn:
     ; Double fork so the checker is reparented to init and never a zombie
     mov eax, SYS_FORK
-    syscall
+    SYSCALL_X fork
     test rax, rax
     js .us_ret
     jnz .us_reap
     mov eax, SYS_FORK
-    syscall
+    SYSCALL_X fork
     test rax, rax
     jnz .us_child_exit              ; middle process exits at once
 
@@ -791,12 +796,12 @@ update_startup:
     ; it) and its tty (the pty must be free to close when the shell exits),
     ; then do a quiet check, refresh the cache and exit
     mov eax, SYS_SETSID
-    syscall
+    SYSCALL
     lea rdi, [upd_dev_null]
     mov esi, O_RDWR
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .us_child_exit
     mov ebx, eax
@@ -805,7 +810,7 @@ update_startup:
     mov edi, ebx
     mov esi, r12d
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     inc r12d
     cmp r12d, 3
     jb .us_detach
@@ -813,7 +818,7 @@ update_startup:
     jbe .us_checked
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .us_checked:
     lea rdi, [upd_argv_check]
     mov esi, 1
@@ -832,7 +837,7 @@ update_startup:
 .us_child_exit:                     ; day before trying again
     xor edi, edi
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 
 .us_reap:
     mov rdi, rax
@@ -840,7 +845,7 @@ update_startup:
     xor edx, edx
     xor r10d, r10d
     mov eax, SYS_WAIT4
-    syscall
+    SYSCALL
 
 .us_ret:
     add rsp, 16
@@ -872,12 +877,12 @@ upd_capture:
     lea rdi, [rsp + 8]
     mov esi, O_CLOEXEC
     mov eax, SYS_PIPE2
-    syscall
+    SYSCALL_X pipe2
     test rax, rax
     js .uc_error
 
     mov eax, SYS_FORK
-    syscall
+    SYSCALL_X fork
     test rax, rax
     js .uc_fork_error
     jz .uc_child
@@ -885,7 +890,7 @@ upd_capture:
 
     mov edi, [rsp + 12]             ; parent keeps only the read end
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
     xor r14d, r14d                  ; bytes stored
 .uc_read:
@@ -893,9 +898,10 @@ upd_capture:
     sub edx, r14d
     jz .uc_drain
     mov edi, [rsp + 8]
-    lea rsi, [upd_buf + r14]
-    xor eax, eax                    ; SYS_READ
-    syscall
+    lea r11, [upd_buf]
+    lea rsi, [r11 + r14]
+    SYSNO SYS_READ
+    SYSCALL
     cmp rax, -EINTR
     je .uc_read
     test rax, rax
@@ -906,17 +912,18 @@ upd_capture:
     mov edi, [rsp + 8]
     lea rsi, [upd_drain]
     mov edx, 4096
-    xor eax, eax
-    syscall
+    SYSNO SYS_READ
+    SYSCALL
     cmp rax, -EINTR
     je .uc_drain
     test rax, rax
     jg .uc_drain
 .uc_read_done:
-    mov byte [upd_buf + r14], 0
+    lea r11, [upd_buf]
+    mov byte [r11 + r14], 0
     mov edi, [rsp + 8]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .uc_wait:
     mov dword [rsp], 0
@@ -925,7 +932,7 @@ upd_capture:
     xor edx, edx
     xor r10d, r10d
     mov eax, SYS_WAIT4
-    syscall
+    SYSCALL
     cmp rax, -EINTR
     je .uc_wait
     mov eax, [rsp]
@@ -945,10 +952,10 @@ upd_capture:
 .uc_fork_error:
     mov edi, [rsp + 8]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov edi, [rsp + 12]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .uc_error:
     mov eax, -1
 .uc_ret:
@@ -964,25 +971,25 @@ upd_capture:
     mov edi, [rsp + 12]
     mov esi, 1
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     lea rdi, [upd_dev_null]
     mov esi, O_RDWR
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .uc_exec
     mov ebx, eax
     mov edi, ebx
     xor esi, esi
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     test r13d, r13d
     jz .uc_exec
     mov edi, ebx
     mov esi, 2
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
 .uc_exec:
     mov rdi, r12
     call ash_exec_argv              ; does not return
@@ -1282,7 +1289,7 @@ upd_write_cache:
     mov esi, O_WRONLY | O_CREAT | O_TRUNC
     mov edx, FILE_MODE_DEFAULT
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .wc_ret
     mov ebx, eax
@@ -1294,12 +1301,12 @@ upd_write_cache:
     mov edi, ebx
     lea rsi, [upd_latest]
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     lea rdi, [upd_latest]
     call str_len_nl_fix
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .wc_ret:
     add rsp, 8
     pop rbx
@@ -1321,20 +1328,20 @@ upd_touch_cache:
     lea rsi, [upd_cache_path]
     xor edx, edx                    ; NULL times = now
     xor r10d, r10d
-    mov eax, UPD_SYS_UTIMENSAT
-    syscall
+    mov eax, SYS_UTIMENSAT
+    SYSCALL_X utimensat
     test rax, rax
     jns .tc_ret
     lea rdi, [upd_cache_path]       ; not there yet: create it empty
     mov esi, O_WRONLY | O_CREAT
     mov edx, FILE_MODE_DEFAULT
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .tc_ret
     mov edi, eax
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .tc_ret:
     add rsp, 8
     pop rbx

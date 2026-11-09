@@ -1,6 +1,8 @@
 import os, sys, subprocess, ctypes, struct, tempfile, mmap
 import ptytest as T
 
+T.linux_only("sandbox")   # needs seccomp and Landlock
+
 # Escape attempts run inside "sandbox"; each prints name=RESULT. The victim
 # directory must lie outside /tmp, which the sandbox may write to.
 

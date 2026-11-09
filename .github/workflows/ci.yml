@@ -22,7 +22,7 @@ jobs:
       - name: Install NASM
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y nasm
+          sudo apt-get install -y nasm lld
 
       - name: Verify toolchain
         run: |
@@ -47,6 +47,14 @@ jobs:
           fi
           ls -la terminal
 
+      - name: No absolute 32-bit addresses (Mach-O loads code above 4 GiB)
+        run: make check-high
+
+      - name: Cross-build the macOS binary
+        run: |
+          make terminal-macos LD64="$(command -v ld64.lld || ls /usr/bin/ld64.lld-* | head -1)"
+          file terminal-macos
+
       - name: Shell scripts parse
         run: |
           for f in packaging/*/*.sh packaging/linux/asm-terminal-launch; do bash -n "$f"; done
@@ -64,6 +72,63 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: asm-terminal-linux-x86_64
+          path: terminal
+          if-no-files-found: error
+
+  build-macos:
+    name: Build + tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15-intel runs the binary natively, macos-15 (Apple Silicon)
+        # through Rosetta 2
+        os: [ macos-15-intel, macos-15 ]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install NASM and GNU coreutils (timeout, sha256sum for the tests)
+        run: brew install nasm coreutils
+
+      - name: Rosetta 2 (Apple Silicon)
+        if: runner.arch == 'ARM64'
+        run: /usr/bin/pgrep -q oahd || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Build macOS binary
+        run: |
+          make clean
+          make
+          file terminal
+          otool -L terminal
+
+      - name: Smoke test
+        run: |
+          out=$(printf 'echo hello mac\nver\nexit 3\n' | ./terminal 2>&1) || st=$?
+          echo "$out"
+          grep -q "hello mac" <<<"$out"
+          grep -q "macOS" <<<"$out"
+          test "${st:-0}" = 3
+
+      - name: Run test harness
+        run: |
+          # The runner's long generated host name wraps the 80-column prompt
+          # the terminal tests draw on
+          sudo scutil --set HostName asm-ci
+          sudo hostname asm-ci
+          # Expected outputs are GNU's (wc padding, ls messages)
+          gnubin="$(brew --prefix coreutils)/libexec/gnubin"
+          export PATH="$gnubin:$PATH"
+          export ASM_TEST_PATH="$gnubin:/usr/bin:/bin"
+          bash tests/run_tests.sh
+
+      - name: Upload binary artifact
+        if: matrix.os == 'macos-15-intel'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asm-terminal-macos-x86_64
           path: terminal
           if-no-files-found: error
 

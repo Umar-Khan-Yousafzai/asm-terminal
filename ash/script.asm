@@ -95,9 +95,6 @@
 %define F_WCAP              72          ; dword: bytes available for that list
 %define F_ARENA             80          ; qword: arena mark to release when the loop ends
 
-%define ASH_SYS_LSTAT       6
-%define ASH_SYS_ACCESS      21
-%define ASH_SYS_GETPID      39
 %define ASH_S_IFMT          0o170000
 %define ASH_S_IFREG         0o100000
 %define ASH_S_IFDIR         0o040000
@@ -294,7 +291,7 @@ ash_feed_line:
     jne .fl_finish
     mov edi, 2
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 .fl_finish:
     mov byte [ash_cont], 0
     mov dword [ash_pending_len], 0
@@ -2832,7 +2829,7 @@ ash_sh_run:
 .sr_fork:
     call jc_prepare
     mov eax, SYS_FORK
-    syscall
+    SYSCALL_X fork
     test rax, rax
     js .sr_fail
     jz .sr_child
@@ -3095,11 +3092,11 @@ ash_capture:
     lea rdi, [rbp - 56]
     mov esi, O_CLOEXEC
     mov eax, SYS_PIPE2
-    syscall
+    SYSCALL_X pipe2
     test rax, rax
     js .ac_error
     mov eax, SYS_FORK
-    syscall
+    SYSCALL_X fork
     test rax, rax
     js .ac_fork_error
     jz .ac_child
@@ -3107,7 +3104,7 @@ ash_capture:
 
     mov edi, [rbp - 52]             ; the parent keeps only the read end
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .ac_read:
     mov edx, r14d
     dec edx
@@ -3115,8 +3112,8 @@ ash_capture:
     jle .ac_drain
     mov edi, [rbp - 56]
     lea rsi, [r13 + r15]
-    xor eax, eax                    ; SYS_READ
-    syscall
+    SYSNO SYS_READ
+    SYSCALL
     cmp rax, -EINTR
     je .ac_read
     test rax, rax
@@ -3127,8 +3124,8 @@ ash_capture:
     mov edi, [rbp - 56]
     lea rsi, [ash_cap_drain]
     mov edx, 4096
-    xor eax, eax
-    syscall
+    SYSNO SYS_READ
+    SYSCALL
     cmp rax, -EINTR
     je .ac_drain
     test rax, rax
@@ -3139,7 +3136,7 @@ ash_capture:
     mov byte [r13 + r15], 0
     mov edi, [rbp - 56]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .ac_wait:
     mov dword [rbp - 48], 0
     mov edi, ebx
@@ -3147,7 +3144,7 @@ ash_capture:
     xor edx, edx
     xor r10d, r10d
     mov eax, SYS_WAIT4
-    syscall
+    SYSCALL
     cmp rax, -EINTR
     je .ac_wait
     mov eax, [rbp - 48]
@@ -3170,10 +3167,10 @@ ash_capture:
 .ac_fork_error:
     mov edi, [rbp - 56]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov edi, [rbp - 52]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     lea rdi, [ash_msg_fork]
     call ash_write_err
 .ac_error:
@@ -3195,18 +3192,18 @@ ash_capture:
     mov edi, [rbp - 52]
     mov esi, 1
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     lea rdi, [ash_dev_null]
     mov esi, O_RDONLY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .ac_exec
     mov edi, eax
     xor esi, esi
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
 .ac_exec:
     mov rdi, r12
     call ash_exec_argv              ; does not return
@@ -6058,16 +6055,16 @@ ash_test_unary:
     mov esi, 1
 .tu_access:
     mov rdi, rbx
-    mov eax, ASH_SYS_ACCESS
-    syscall
+    mov eax, SYS_ACCESS
+    SYSCALL
     test rax, rax
     jz .tu_true
     jmp .tu_false
 .tu_lstat:
     mov rdi, rbx
     lea rsi, [stat_buf]
-    mov eax, ASH_SYS_LSTAT
-    syscall
+    mov eax, SYS_LSTAT
+    SYSCALL
     test rax, rax
     jnz .tu_false
     mov eax, [stat_buf + STAT_ST_MODE]
@@ -6079,7 +6076,7 @@ ash_test_unary:
     mov rdi, rbx
     lea rsi, [stat_buf]
     mov eax, SYS_STAT
-    syscall
+    SYSCALL
     test rax, rax
     jnz .tu_false
     cmp r12b, 'e'

@@ -61,7 +61,7 @@ sm_cwd_hash:
     lea rdi, [sm_cwd_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     mov edx, 1
     test rax, rax
     jle .h_ret
@@ -141,21 +141,25 @@ sm_suggest:
     inc r14d
     cmp r13d, 2
     je .g_text
-    cmp byte [hist_meta_stat + r15], 0
+    lea r11, [hist_meta_stat]
+    cmp byte [r11 + r15], 0
     jne .g_entry
     test r13d, r13d
     jnz .g_text
-    mov eax, [hist_meta_hash + r15 * 4]
+    lea r11, [hist_meta_hash]
+    mov eax, [r11 + r15 * 4]
     cmp eax, [sm_cwd_hash_now]
     jne .g_entry
 .g_text:
     imul eax, r15d, HISTORY_ENTRY_SIZE
-    lea rbx, [history_buf + rax]        ; rbx = entry
+    lea r11, [history_buf]
+    lea rbx, [r11 + rax]        ; rbx = entry
     xor ecx, ecx
 .g_cmp:
     cmp ecx, r12d
     jae .g_tail
-    mov al, [line_buf + rcx]
+    lea r11, [line_buf]
+    mov al, [r11 + rcx]
     cmp al, [rbx + rcx]
     jne .g_entry
     inc ecx
@@ -247,7 +251,8 @@ sm_accept:
     cmp edx, [line_cursor]
     jne .a_none
     mov rsi, [sugg_ptr]
-    lea rdi, [line_buf + rdx]
+    lea r11, [line_buf]
+    lea rdi, [r11 + rdx]
     add [line_len], ecx
 .a_copy:
     mov al, [rsi]
@@ -304,8 +309,10 @@ sm_close_menu:
 
 ; sm_note_clear(eax = slot) - history_add: a new entry starts unknown
 sm_note_clear:
-    mov dword [hist_meta_hash + rax * 4], 0
-    mov byte [hist_meta_stat + rax], 0
+    lea r11, [hist_meta_hash]
+    mov dword [r11 + rax * 4], 0
+    lea r11, [hist_meta_stat]
+    mov byte [r11 + rax], 0
     ret
 
 ; sm_before_run - main loop, after history_add: remember the folder
@@ -332,7 +339,8 @@ sm_after_run:
     call sm_slot
     mov ebx, eax
     mov edx, [sm_run_hash]
-    mov [hist_meta_hash + rbx * 4], edx
+    lea r11, [hist_meta_hash]
+    mov [r11 + rbx * 4], edx
     mov eax, [last_exit_status]
     test eax, eax
     jz .r_stat
@@ -340,7 +348,8 @@ sm_after_run:
     jbe .r_stat
     mov eax, 255
 .r_stat:
-    mov [hist_meta_stat + rbx], al
+    lea r11, [hist_meta_stat]
+    mov [r11 + rbx], al
     cmp byte [interactive_mode], 0
     je .r_ret
     cmp byte [history_file_path], 0
@@ -352,10 +361,10 @@ sm_after_run:
     mov rbx, rax
     sub rbx, rsi                        ; bytes
     lea rdi, [history_file_path]
-    mov esi, O_WRONLY | O_APPEND | 0x80000
+    mov esi, O_WRONLY | O_APPEND | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .r_ret
     mov edi, eax
@@ -363,10 +372,10 @@ sm_after_run:
     lea rsi, [sm_meta_line]
     mov rdx, rbx
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     pop rdi
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .r_ret:
     pop rbx
     ret
@@ -377,20 +386,23 @@ sm_fmt_meta:
     mov dword [rdi], '#asm'
     mov byte [rdi + 4], ':'
     add rdi, 5
-    mov edx, [hist_meta_hash + r8 * 4]
+    lea r11, [hist_meta_hash]
+    mov edx, [r11 + r8 * 4]
     mov ecx, 28
 .f_hex:
     mov eax, edx
     shr eax, cl
     and eax, 15
-    mov al, [sm_hex + rax]
+    lea r11, [sm_hex]
+    mov al, [r11 + rax]
     mov [rdi], al
     inc rdi
     sub ecx, 4
     jns .f_hex
     mov byte [rdi], ':'
     inc rdi
-    movzx eax, byte [hist_meta_stat + r8]
+    lea r11, [hist_meta_stat]
+    movzx eax, byte [r11 + r8]
     cmp eax, 100
     jb .f_tens
     xor edx, edx
@@ -421,8 +433,10 @@ sm_fmt_meta:
 
 ; sm_has_meta(eax = slot) -> eax != 0 when the slot carries a note
 sm_has_meta:
-    mov ecx, [hist_meta_hash + rax * 4]
-    movzx eax, byte [hist_meta_stat + rax]
+    lea r11, [hist_meta_hash]
+    mov ecx, [r11 + rax * 4]
+    lea r11, [hist_meta_stat]
+    movzx eax, byte [r11 + rax]
     or eax, ecx
     ret
 
@@ -475,8 +489,10 @@ sm_load_meta:
     push rdx
     call sm_slot
     pop rdx
-    mov [hist_meta_hash + rax * 4], edx
-    mov [hist_meta_stat + rax], r8b
+    lea r11, [hist_meta_hash]
+    mov [r11 + rax * 4], edx
+    lea r11, [hist_meta_stat]
+    mov [r11 + rax], r8b
 .l_yes:
     mov eax, 1
     ret
@@ -487,7 +503,8 @@ sm_load_meta:
 ; sm_hist_fail_mark(eax = slot) - `history`: "  [N]" after a failed command
 sm_hist_fail_mark:
     push rbx
-    movzx ebx, byte [hist_meta_stat + rax]
+    lea r11, [hist_meta_stat]
+    movzx ebx, byte [r11 + rax]
     test ebx, ebx
     jz .k_ret
     cmp byte [color_enabled], 0
@@ -536,10 +553,10 @@ sm_tab_menu:
 
     mov byte [tab_menu_shown], 0
     lea rdi, [find_pattern]
-    mov esi, O_RDONLY | O_DIRECTORY | 0x80000
+    mov esi, O_RDONLY | O_DIRECTORY | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .t_ret
     mov [rsp + 24], eax
@@ -553,7 +570,7 @@ sm_tab_menu:
     lea rsi, [dirent_buf]
     mov edx, DIRENT_BUF_SIZE
     mov eax, SYS_GETDENTS64
-    syscall
+    SYSCALL_X getdents64
     test rax, rax
     jle .t_closed
     mov r14d, eax
@@ -561,7 +578,8 @@ sm_tab_menu:
 .t_entry:
     cmp r12d, r14d
     jae .t_read
-    lea rbx, [dirent_buf + r12]
+    lea r11, [dirent_buf]
+    lea rbx, [r11 + r12]
     movzx eax, word [rbx + DIRENT_D_RECLEN]
     add r12d, eax
     lea r9, [rbx + DIRENT_D_NAME]
@@ -576,7 +594,8 @@ sm_tab_menu:
 .t_pfx:
     ; same test as tab_complete: case-insensitive prefix, no control bytes
     mov r8d, [tab_name_off]
-    lea r8, [tab_name_prefix + r8]
+    lea r11, [tab_name_prefix]
+    lea r8, [r11 + r8]
     mov ecx, [tab_name_prefix_len]
     sub ecx, [tab_name_off]
     xor edx, edx
@@ -650,7 +669,7 @@ sm_tab_menu:
 .t_closed:
     mov edi, [rsp + 24]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     cmp dword [rsp], 2
     jb .t_ret                           ; one match: no menu
 

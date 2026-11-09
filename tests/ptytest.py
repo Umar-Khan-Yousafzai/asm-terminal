@@ -15,12 +15,17 @@ and counts the `ok` / `not ok` lines that check() prints.
 import os, pty, sys, time, select, fcntl, termios, struct, subprocess, re, tempfile, shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+MACOS = sys.platform == 'darwin'
+# PATH of the shells under test; run_tests.sh puts GNU tools first on macOS
+# because the expected outputs are GNU's
+TEST_PATH = os.environ.get('ASM_TEST_PATH') or '/usr/bin:/bin'
 BIN = os.environ.get("BIN") or os.path.join(HERE, "..", "terminal")
 _tmp = []
 
 
 def tmpdir():
-    d = tempfile.mkdtemp(prefix="asmt-")
+    # The shell prints physical paths: on macOS $TMPDIR is under /private
+    d = os.path.realpath(tempfile.mkdtemp(prefix="asmt-"))
     _tmp.append(d)
     return d
 
@@ -29,6 +34,70 @@ def cleanup():
     for d in _tmp:
         shutil.rmtree(d, ignore_errors=True)
     del _tmp[:]
+
+
+# A command for the shell under test that lists the descriptors it was given
+# ("N -> target" lines); `FDLIST + ' PID'` lists another process's
+FDLIST = "%s %s" % (sys.executable, os.path.join(HERE, "fdlist.py"))
+
+
+def fds_of(pid):
+    """Open descriptors of process pid, as a list of "N -> target" lines."""
+    p = subprocess.run([sys.executable, os.path.join(HERE, "fdlist.py"), str(pid)],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return p.stdout.decode('utf-8', 'replace').splitlines()
+
+
+def proc_stat(pid):
+    """(state, ppid, pgrp) of a process, or None when it is gone or a zombie."""
+    if MACOS:
+        p = subprocess.run(['ps', '-o', 'stat=,ppid=,pgid=', '-p', str(pid)],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        f = p.stdout.decode().split()
+        if len(f) < 3 or f[0].startswith('Z'):
+            return None
+        return f[0][0], int(f[1]), int(f[2])
+    try:
+        st = open('/proc/%d/stat' % pid).read()
+    except OSError:
+        return None
+    rest = st[st.rindex(')') + 2:].split()
+    if rest[0] == 'Z':
+        return None
+    return rest[0], int(rest[1]), int(rest[2])
+
+
+def find_procs(tag):
+    """Pids of live processes whose argv contains the exact word `tag`."""
+    out = []
+    if MACOS:
+        p = subprocess.run(['ps', '-axww', '-o', 'pid=,args='], stdout=subprocess.PIPE)
+        for line in p.stdout.decode('utf-8', 'replace').splitlines():
+            f = line.split()
+            if len(f) > 1 and tag in f[1:] and proc_stat(int(f[0])):
+                out.append(int(f[0]))
+        return sorted(out)
+    for d in os.listdir('/proc'):
+        if not d.isdigit():
+            continue
+        try:
+            argv = open('/proc/%s/cmdline' % d, 'rb').read().split(b'\0')
+        except OSError:
+            continue
+        if tag.encode() in argv and proc_stat(int(d)):
+            out.append(int(d))
+    return sorted(out)
+
+
+def linux_only(feature):
+    """On macOS, check that FEATURE says it needs Linux, then end the file."""
+    if not MACOS:
+        return
+    out, err, st = run_script('%s /usr/bin/true\nexit\n' % feature)
+    check('%s says it needs Linux on macOS' % feature,
+          'not available on macOS' in out + err, out + err)
+    cleanup()
+    sys.exit(0)
 
 
 def check(name, cond, detail=""):
@@ -176,7 +245,7 @@ class Sess:
     def __init__(s, argv=None, env=None, cwd=None, rows=24, cols=80, home=None):
         s.vt = VT(rows, cols)
         s.home = home or tmpdir()
-        e = {'PATH': '/usr/bin:/bin', 'HOME': s.home, 'TERM': 'xterm', 'ASM_NO_UPDATE_CHECK': '1'}
+        e = {'PATH': TEST_PATH, 'HOME': s.home, 'TERM': 'xterm', 'ASM_NO_UPDATE_CHECK': '1'}
         if env:
             e.update(env)
         s.master, s.slave = pty.openpty()
@@ -241,7 +310,7 @@ class Sess:
 def run_script(text, env=None, cwd=None, timeout=20, home=None):
     """Feed text to the shell on a pipe (non-interactive). Returns (stdout, stderr, status)."""
     h = home or tmpdir()
-    e = {'PATH': '/usr/bin:/bin', 'HOME': h, 'ASM_NO_UPDATE_CHECK': '1'}
+    e = {'PATH': TEST_PATH, 'HOME': h, 'ASM_NO_UPDATE_CHECK': '1'}
     if env:
         e.update(env)
     p = subprocess.run([BIN], input=text.encode() if isinstance(text, str) else text,

@@ -9,74 +9,14 @@ default rel
 %include "version.inc"
 
 ; ============================================================================
-; Linux syscall numbers
+; Platform layer: system call numbers, flags, errno values and structure
+; layouts, plus the SYSCALL macros. Build with -DPLATFORM_MACOS for macOS.
 ; ============================================================================
-%define SYS_READ            0
-%define SYS_WRITE           1
-%define SYS_OPEN            2
-%define SYS_CLOSE           3
-%define SYS_STAT            4
-%define SYS_FSTAT           5
-%define SYS_LSEEK           8
-%define SYS_RT_SIGACTION    13
-%define SYS_RT_SIGRETURN    15
-%define SYS_IOCTL           16
-%define SYS_PIPE            22
-%define SYS_DUP2            33
-%define SYS_FORK            57
-%define SYS_EXECVE          59
-%define SYS_EXIT            60
-%define SYS_WAIT4           61
-%define SYS_KILL            62
-%define SYS_UNAME           63
-%define SYS_GETCWD          79
-%define SYS_CHDIR           80
-%define SYS_RENAME          82
-%define SYS_MKDIR           83
-%define SYS_RMDIR           84
-%define SYS_UNLINK          87
-%define SYS_READLINK        89
-%define SYS_GETUID          102
-%define SYS_GETEUID         107
-%define SYS_GETDENTS64      217
-%define SYS_CLOCK_GETTIME   228
-%define SYS_NEWFSTATAT      262
-
-; ============================================================================
-; Terminal / file / signal constants
-; ============================================================================
-; ioctl request codes
-%define TCGETS              0x5401
-%define TCSETS              0x5402
-%define TIOCGWINSZ          0x5413
-
-; termios c_lflag bits
-%define ICANON              0x0002
-%define ECHO_FLAG           0x0008
-%define ISIG                0x0001
-
-; termios structure offsets
-%define TERMIOS_C_LFLAG     12      ; offset of c_lflag in struct termios
-%define TERMIOS_C_CC        17      ; offset of c_cc array
-%define VMIN_INDEX          6       ; c_cc[6] = VMIN
-%define VTIME_INDEX         5       ; c_cc[5] = VTIME
-
-; Signal constants
-%define SIGINT              2
-%define SIGCONT             18
-%define SIGTSTP             20
-%define SIGHUP              1
-%define SIGTERM             15
-%define SA_RESTORER         0x04000000
-%define SA_RESTART          0x10000000
-
-; File open flags
-%define O_RDONLY            0
-%define O_WRONLY            1
-%define O_RDWR              2
-%define O_CREAT             0x40
-%define O_TRUNC             0x200
-%define O_APPEND            0x400
+%ifdef PLATFORM_MACOS
+%include "platform/macos.inc"
+%else
+%include "platform/linux.inc"
+%endif
 
 ; File mode bits
 %define S_IRUSR             0o400
@@ -86,24 +26,9 @@ default rel
 %define FILE_MODE_DEFAULT   0o644   ; rw-r--r--
 %define DIR_MODE_DEFAULT    0o755   ; rwxr-xr-x
 
-; dirent64 structure offsets
-%define DIRENT64_D_INO      0       ; 8 bytes
-%define DIRENT64_D_OFF      8       ; 8 bytes
-%define DIRENT64_D_RECLEN   16      ; 2 bytes
-%define DIRENT64_D_TYPE     18      ; 1 byte
-%define DIRENT64_D_NAME     19      ; variable
-
 ; d_type values
 %define DT_DIR              4
 %define DT_REG              8
-
-; stat structure offsets (x86-64 Linux)
-%define STAT_ST_MODE        24      ; offset of st_mode
-%define STAT_ST_SIZE        48      ; offset of st_size
-%define STAT_ST_UID         28      ; offset of st_uid
-
-; Clock IDs
-%define CLOCK_REALTIME      0
 
 ; File descriptors
 %define STDIN_FD            0
@@ -133,11 +58,6 @@ default rel
     call print_cstring
 %endmacro
 
-%macro SYSCALL_N 1
-    mov eax, %1
-    syscall
-%endmacro
-
 %define HISTORY_COUNT       500
 %define HISTORY_ENTRY_SIZE  512
 %define ALIAS_COUNT         32
@@ -160,7 +80,6 @@ default rel
 %define VK_DELETE           0x2E
 
 ; ---- Additional constants needed by part 2 ----
-%define O_DIRECTORY         0x10000
 %define DIRENT_BUF_SIZE     8192
 %define DIRENT_D_INO        DIRENT64_D_INO
 %define DIRENT_D_OFF        DIRENT64_D_OFF
@@ -172,7 +91,6 @@ default rel
 %define ENV_OVERLAY_SIZE    512
 %define ENV_OVERLAY_COUNT   256
 %define MERGED_ENVP_MAX     8192    ; env slots handed to a child, NULL included
-%define AT_FDCWD            -100
 %define S_IFDIR             0o040000
 
 ; Timezone used when neither $ASM_TZ nor $TZ is usable: PKT = UTC+5 = 18000 seconds
@@ -229,12 +147,12 @@ section .data
     welcome_len     equ $ - welcome_msg - 1
 
 
-    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/Linux] - developed by Umer Farooq Khan", 10, 0
+    ver_msg         db "ASM Terminal v", ASM_VERSION, " [x86-64 NASM/", PLATFORM_NAME, "] - developed by Umer Farooq Khan", 10, 0
     ver_len         equ $ - ver_msg - 1
     about_msg       db 10
                     db "  ASM Terminal v", ASM_VERSION, " with ASH (Assembly Shell)", 10
                     db "  A terminal shell written entirely in x86-64 assembly (NASM).", 10
-                    db "  No libc, no runtime: raw Linux syscalls only.", 10
+                    db "  No libc, no runtime: raw ", PLATFORM_NAME, " syscalls only.", 10
                     db 10
                     db "  Developed by: Umer Farooq Khan", 10
                     db "  GitHub:       https://github.com/Umar-Khan-Yousafzai", 10
@@ -678,14 +596,14 @@ section .data
 section .bss
 
     ; Terminal state
-    orig_termios        resb 60     ; saved original terminal settings
-    raw_termios         resb 60     ; modified raw mode terminal settings
+    orig_termios        resb TERMIOS_SIZE     ; saved original terminal settings
+    raw_termios         resb TERMIOS_SIZE     ; modified raw mode terminal settings
 
     ; Environment pointer from kernel stack
     saved_envp          resq 1
 
     ; Signal handling
-    sigaction_buf       resb 32     ; struct sigaction for rt_sigaction
+    sigaction_buf       resb SIGACTION_SIZE     ; struct sigaction for rt_sigaction
     ctrl_c_flag         resb 1
 
     ; Key input
@@ -712,7 +630,7 @@ section .bss
     find_pattern        resb MAX_PATH_BUF
 
     ; File stat
-    stat_buf            resb 144    ; struct stat
+    stat_buf            resb STAT_SIZE    ; struct stat
 
     ; Exec support
     exec_argv           resq 4      ; argv array for execve
@@ -758,11 +676,11 @@ section .bss
     ls_perms_buf        resb 16            ; rendered "drwxr-xr-x" + NUL
     interactive_mode    resb 1             ; 1 = stdin & stdout are tty
     color_enabled       resb 1             ; 1 = ANSI/color permitted
-    termios_probe_buf   resb 60             ; scratch for ioctl probe
+    termios_probe_buf   resb TERMIOS_SIZE             ; scratch for ioctl probe
     winch_pending       resb 1             ; set by SIGWINCH handler
     term_rows           resw 1             ; cached from TIOCGWINSZ
     term_cols           resw 1             ; cached from TIOCGWINSZ
-    winch_sigaction_buf resb 32            ; sigaction struct for SIGWINCH
+    winch_sigaction_buf resb SIGACTION_SIZE            ; sigaction struct for SIGWINCH
     merged_envp         resq MERGED_ENVP_MAX ; argv-style envp for child
     merged_envp_count   resd 1
     git_scratch_path    resb 4096          ; for walking up looking for .git
@@ -868,6 +786,7 @@ section .bss
 section .text
     global _start
 
+%ifdef PLATFORM_LINUX
 ; ============================================================================
 ; _start - ELF entry point
 ; Parse kernel stack for argc, argv, envp. Save envp, align stack, call main.
@@ -901,7 +820,8 @@ _start:
     ; Exit with return code from main (eax)
     mov edi, eax
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
+%endif ; the macOS entry point is in platform/macos.asm
 
 ; ============================================================================
 ; main - Initialize terminal and run command loop
@@ -1044,7 +964,7 @@ main:
     call ash_feed_eof               ; run or report an unfinished block
     mov edi, [last_exit_status]
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 
 section .bss
     osc_enabled         resb 1      ; 1 = OSC 7 / OSC 133 marks may be sent
@@ -1069,7 +989,7 @@ init_io_modes:
     mov edi, STDIN_FD
     mov esi, TCGETS
     lea rdx, [termios_probe_buf]
-    syscall
+    SYSCALL
     test rax, rax
     js .iom_done                    ; stdin not a tty
 
@@ -1078,7 +998,7 @@ init_io_modes:
     mov edi, 1
     mov esi, TCGETS
     lea rdx, [termios_probe_buf]
-    syscall
+    SYSCALL
     test rax, rax
     js .iom_done                    ; stdout not a tty
 
@@ -1159,8 +1079,8 @@ read_line_plain:
     xor edi, edi
     lea rsi, [key_buf]
     mov edx, 1
-    syscall
-    cmp rax, -4                      ; EINTR: read again
+    SYSCALL
+    cmp rax, -EINTR                      ; read again
     je .rlp_next
     test rax, rax
     jle .rlp_eof
@@ -1192,7 +1112,7 @@ read_line_plain:
     mov edi, STDERR_FD
     lea rsi, [rlp_msg_long]
     mov edx, rlp_msg_long_len
-    syscall
+    SYSCALL
     mov dword [last_exit_status], 1
     mov byte [rbx], 0
     mov eax, 1
@@ -1242,7 +1162,7 @@ setup_raw_mode:
     mov edi, STDIN_FD
     mov esi, TCGETS
     lea rdx, [orig_termios]
-    syscall
+    SYSCALL
     test rax, rax
     js .srm_ret                     ; cannot read the tty: leave it alone
     mov byte [termios_saved], 1
@@ -1251,7 +1171,7 @@ setup_raw_mode:
     ; Copy orig_termios to raw_termios
     lea rsi, [orig_termios]
     lea rdi, [raw_termios]
-    mov ecx, 60
+    mov ecx, TERMIOS_SIZE
 .copy_termios:
     mov al, [rsi]
     mov [rdi], al
@@ -1260,7 +1180,7 @@ setup_raw_mode:
     dec ecx
     jnz .copy_termios
 
-    ; Clear ICANON, ECHO, and ISIG in c_lflag (offset 12 in termios)
+    ; Clear ICANON, ECHO, and ISIG in c_lflag
     ; Clearing ISIG prevents Ctrl+Z (SIGTSTP) from suspending the shell
     ; and Ctrl+C (SIGINT) from being handled at kernel level — we handle
     ; Ctrl+C in software via read_key, and Ctrl+Z is now consumed as a
@@ -1268,11 +1188,10 @@ setup_raw_mode:
     ; background.
     lea rax, [raw_termios]
     mov edx, [rax + TERMIOS_C_LFLAG]
-    and edx, ~(ICANON | ECHO_FLAG | ISIG)  ; clear ICANON, ECHO, ISIG
+    and edx, ~RAW_LFLAG_CLEAR       ; clear ICANON, ECHO, ISIG
     mov [rax + TERMIOS_C_LFLAG], edx
 
     ; Set VMIN=1 (minimum 1 char for read), VTIME=0 (no timeout)
-    ; c_cc is at offset 17, VMIN = c_cc[6], VTIME = c_cc[5]
     mov byte [rax + TERMIOS_C_CC + VMIN_INDEX], 1
     mov byte [rax + TERMIOS_C_CC + VTIME_INDEX], 0
 
@@ -1281,7 +1200,7 @@ setup_raw_mode:
     mov edi, STDIN_FD
     mov esi, TCSETS
     lea rdx, [raw_termios]
-    syscall
+    SYSCALL
     mov byte [raw_active], 1
 
     ; Enable bracketed paste mode so pasted content is wrapped in
@@ -1308,7 +1227,7 @@ term_write:
     mov rsi, rdi
     mov edi, 1
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     ret
 
 ; ============================================================================
@@ -1344,7 +1263,7 @@ restore_terminal:
     mov edi, STDIN_FD
     mov esi, TCSETS
     lea rdx, [orig_termios]
-    syscall
+    SYSCALL
 
 .rt_ret:
     leave
@@ -1360,18 +1279,8 @@ setup_sigint:
     mov rbp, rsp
     sub rsp, 16
 
-    ; Fill sigaction_buf:
-    ;   offset 0:  sa_handler  (8 bytes) = sigint_handler
-    ;   offset 8:  sa_flags    (8 bytes) = SA_RESTORER | SA_RESTART
-    ;   offset 16: sa_restorer (8 bytes) = sig_restorer
-    ;   offset 24: sa_mask     (8 bytes) = 0 (empty mask)
     lea rax, [sigaction_buf]
-    lea rcx, [sigint_handler]
-    mov [rax], rcx                                  ; sa_handler
-    mov qword [rax + 8], SA_RESTORER | SA_RESTART   ; sa_flags
-    lea rcx, [sig_restorer]
-    mov [rax + 16], rcx                             ; sa_restorer
-    mov qword [rax + 24], 0                         ; sa_mask (empty)
+    SIGACT_FILL rax, sigint_handler, SA_RESTORER | SA_RESTART
 
     ; rt_sigaction(SIGINT, &sigaction_buf, NULL, sigsetsize=8)
     mov eax, SYS_RT_SIGACTION
@@ -1379,7 +1288,7 @@ setup_sigint:
     lea rsi, [sigaction_buf]
     xor edx, edx               ; old_act = NULL
     mov r10d, 8                 ; sigsetsize = 8
-    syscall
+    SYSCALL
 
     leave
     ret
@@ -1399,10 +1308,10 @@ sigint_handler:
 ; signals run on their own stack so a stack overflow can still be reported.
 ; ============================================================================
 section .data
-term_sig_list   db SIGHUP, 3, 4, 7, 8, 11, SIGTERM, 0   ; HUP QUIT ILL BUS FPE SEGV TERM
+term_sig_list   db SIGHUP, SIGQUIT, SIGILL, SIGBUS, SIGFPE, SIGSEGV, SIGTERM, 0
 section .bss
-    term_sigaction_buf  resb 32
-    term_altstack_desc  resb 24         ; stack_t: sp, flags, size
+    term_sigaction_buf  resb SIGACTION_SIZE
+    term_altstack_desc  resb STACK_T_SIZE         ; stack_t: sp, flags, size
     term_altstack       resb 16384
 section .text
 setup_term_signals:
@@ -1415,22 +1324,16 @@ setup_term_signals:
     lea rax, [term_altstack_desc]
     lea rcx, [term_altstack]
     mov [rax], rcx                  ; ss_sp
-    mov qword [rax + 8], 0          ; ss_flags
-    mov qword [rax + 16], 16384     ; ss_size
-    mov eax, 131                    ; SYS_sigaltstack
+    mov qword [rax + STACK_T_FLAGS], 0
+    mov qword [rax + STACK_T_SIZE_OFF], 16384
+    mov eax, SYS_SIGALTSTACK
     lea rdi, [term_altstack_desc]
     xor esi, esi
-    syscall
+    SYSCALL
 
     ; One-shot handler (SA_RESETHAND) on the alternate stack (SA_ONSTACK)
     lea rax, [term_sigaction_buf]
-    lea rcx, [term_signal_handler]
-    mov [rax], rcx                  ; sa_handler
-    mov ecx, SA_RESTORER | 0x80000000 | 0x08000000
-    mov [rax + 8], rcx              ; sa_flags
-    lea rcx, [sig_restorer]
-    mov [rax + 16], rcx             ; sa_restorer
-    mov qword [rax + 24], 0         ; sa_mask
+    SIGACT_FILL rax, term_signal_handler, SA_RESTORER | SA_RESETHAND | SA_ONSTACK
 
     lea rbx, [term_sig_list]
 .sts_loop:
@@ -1441,7 +1344,7 @@ setup_term_signals:
     lea rsi, [term_sigaction_buf]
     xor edx, edx
     mov r10d, 8
-    syscall
+    SYSCALL
     inc rbx
     jmp .sts_loop
 .sts_done:
@@ -1451,17 +1354,45 @@ setup_term_signals:
     ret
 
 ; term_signal_handler - rdi = signal number
+section .bss
+    term_dfl_act        resb 64     ; all zero: SIG_DFL
+    term_sig_set        resq 1
+section .text
 term_signal_handler:
     push rdi                        ; keeps the stack aligned for the call
     call restore_terminal
-    mov eax, 39                     ; SYS_getpid
-    syscall
+    ; Back to the default action by hand too: Rosetta 2 does not always
+    ; honour SA_RESETHAND, and the signal sent below would land here again
+    mov edi, [rsp]
+    lea rsi, [term_dfl_act]
+    xor edx, edx
+    mov r10d, 8
+    mov eax, SYS_RT_SIGACTION
+    SYSCALL
+    mov eax, SYS_GETPID
+    SYSCALL
     mov edi, eax
     mov rsi, [rsp]                  ; signal number
     mov eax, SYS_KILL
-    syscall                         ; delivered when this handler returns
-    pop rdi
-    ret
+    SYSCALL                         ; pending: the handler blocks it
+    ; Unblock it here rather than wait for the return from the handler, so
+    ; the default action (end the process) happens now
+    mov ecx, [rsp]
+    dec ecx
+    mov eax, 1
+    shl rax, cl
+    mov [term_sig_set], rax
+    mov edi, SIG_UNBLOCK
+    lea rsi, [term_sig_set]
+    xor edx, edx
+    mov r10d, 8
+    mov eax, SYS_RT_SIGPROCMASK
+    SYSCALL
+    ; Still here (the signal was caught again or ignored): leave like sh
+    mov edi, [rsp]
+    add edi, 128
+    mov eax, SYS_EXIT
+    SYSCALL
 
 ; ============================================================================
 ; setup_sigwinch - install SIGWINCH handler so terminal resize is observable
@@ -1472,19 +1403,14 @@ setup_sigwinch:
     sub rsp, 16
 
     lea rax, [winch_sigaction_buf]
-    lea rcx, [sigwinch_handler]
-    mov [rax], rcx
-    mov qword [rax + 8], SA_RESTORER | SA_RESTART
-    lea rcx, [sig_restorer]
-    mov [rax + 16], rcx
-    mov qword [rax + 24], 0
+    SIGACT_FILL rax, sigwinch_handler, SA_RESTORER | SA_RESTART
 
     mov eax, SYS_RT_SIGACTION
-    mov edi, 28                     ; SIGWINCH
+    mov edi, SIGWINCH
     lea rsi, [winch_sigaction_buf]
     xor edx, edx
     mov r10d, 8
-    syscall
+    SYSCALL
 
     ; Prime the rows/cols cache
     call update_term_size
@@ -1513,7 +1439,7 @@ update_term_size:
     mov edi, 1                      ; STDOUT
     mov esi, TIOCGWINSZ
     lea rdx, [winsize_buf]
-    syscall
+    SYSCALL
     test rax, rax
     js .uts_done
 
@@ -1531,9 +1457,11 @@ update_term_size:
 ; Required by SA_RESTORER flag. Calls rt_sigreturn to properly return
 ; from the signal handler.
 ; ============================================================================
+%ifdef PLATFORM_LINUX
 sig_restorer:
     mov eax, SYS_RT_SIGRETURN
-    syscall
+    SYSCALL
+%endif
 
 ; ============================================================================
 ; read_key - Read a single key from stdin, decoding escape sequences
@@ -1574,8 +1502,8 @@ rk_getc:
     mov edi, STDIN_FD
     lea rsi, [key_buf]
     mov edx, 1
-    syscall
-    cmp rax, -4                     ; EINTR: read again
+    SYSCALL
+    cmp rax, -EINTR                     ; read again
     je .rkg_read
     cmp rax, 1
     jne .rkg_eof
@@ -1594,11 +1522,11 @@ rk_getc_wait:
     sub rsp, 16
     mov dword [rsp], STDIN_FD       ; struct pollfd { fd, events, revents }
     mov dword [rsp + 4], 1          ; POLLIN
-    mov eax, 7                      ; SYS_poll
+    mov eax, SYS_POLL
     mov rdi, rsp
     mov esi, 1
     mov edx, 100
-    syscall
+    SYSCALL_X poll
     add rsp, 16
     cmp rax, 1
     jge rk_getc                     ; ready, or hung up (rk_getc sees the EOF)
@@ -1673,7 +1601,7 @@ read_key:
     call restore_terminal
     mov edi, 1
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 
 ; --- UTF-8: collect lead byte + continuation bytes into key_ubuf ---
 .rk_utf8:
@@ -2008,7 +1936,8 @@ read_line:
 .rl_ins:
     xor ecx, ecx
 .rl_ins_copy:
-    movzx eax, byte [key_ubuf + rcx]
+    lea r11, [key_ubuf]
+    movzx eax, byte [r11 + rcx]
     lea r9, [rdx + rcx]
     mov [rdi + r9], al
     inc ecx
@@ -2231,7 +2160,7 @@ read_line:
     call restore_terminal
     mov edi, [last_exit_status]     ; leave with the last status, like exit
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 .rl_cd_block:
     ; EOF inside an unfinished if/while/for: report it and fall back to the
     ; primary prompt instead of closing the shell
@@ -2396,7 +2325,7 @@ ob_flush:
 .obf_again:
     mov edi, 1
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     test rax, rax
     jle .obf_done
     add rsi, rax
@@ -3032,10 +2961,10 @@ tab_complete:
 .tc_scan_dir:
     ; open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     lea rdi, [find_pattern]
-    mov esi, O_RDONLY | O_DIRECTORY | 0x80000
+    mov esi, O_RDONLY | O_DIRECTORY | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .tc_giveup
     mov ebx, eax                    ; ebx = directory fd
@@ -3046,7 +2975,7 @@ tab_complete:
     lea rsi, [dirent_buf]
     mov edx, DIRENT_BUF_SIZE
     mov eax, SYS_GETDENTS64
-    syscall
+    SYSCALL_X getdents64
     test rax, rax
     jle .tc_dir_end                 ; end of directory (or a read error)
     mov r14d, eax                   ; bytes in dirent_buf
@@ -3123,7 +3052,7 @@ tab_complete:
 .tc_dir_end:
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     cmp dword [tab_cycle_idx], 0
     je .tc_giveup                   ; nothing matches at all
     mov dword [tab_cycle_idx], 0    ; past the last match: start over
@@ -3133,7 +3062,7 @@ tab_complete:
     ; rsi = the chosen entry. The dirent data stays valid after the close.
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     inc dword [tab_cycle_idx]
     lea r9, [rsi + DIRENT_D_NAME]
     movzx r10d, byte [rsi + DIRENT_D_TYPE]
@@ -3350,10 +3279,6 @@ section .bss
 section .text
 
 %define EV_MARK             0x01
-%define EV_SYS_PIPE2        293
-%define EV_SYS_FCNTL        72
-%define EV_F_DUPFD_CLOEXEC  1030
-%define EV_O_CLOEXEC        0x80000
 %define EV_CAP_SIZE         LINE_MAX
 
 dispatch_command:
@@ -3642,7 +3567,7 @@ dc_bg_builtin:
 .bb_exit:
     mov edi, [last_exit_status]
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 .bb_ret:
     add rsp, 56
     pop rbx
@@ -4220,8 +4145,8 @@ expand_env_vars:
     jmp .ev_emit_num
 .ev_pid:
     inc r12
-    mov eax, 39                     ; getpid
-    syscall
+    mov eax, SYS_GETPID
+    SYSCALL
     mov rsi, rax
 .ev_emit_num:
     lea rdi, [ash_num_buf]
@@ -4729,14 +4654,14 @@ ev_capture:
     mov dword [ev_subst_status], 1
 
     lea rdi, [rsp + 8]
-    mov esi, EV_O_CLOEXEC
-    mov eax, EV_SYS_PIPE2
-    syscall
+    mov esi, O_CLOEXEC
+    mov eax, SYS_PIPE2
+    SYSCALL_X pipe2
     test rax, rax
     js .cap_ret
 
     mov eax, SYS_FORK
-    syscall
+    SYSCALL_X fork
     test rax, rax
     js .cap_fork_error
     jz .cap_child
@@ -4744,7 +4669,7 @@ ev_capture:
 
     mov edi, [rsp + 12]             ; the parent keeps only the read end
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
     xor r13d, r13d                  ; bytes stored
 .cap_read:
@@ -4752,10 +4677,11 @@ ev_capture:
     sub edx, r13d
     jz .cap_drain
     mov edi, [rsp + 8]
-    lea rsi, [ev_cap_buf + r13]
-    xor eax, eax                    ; SYS_READ
-    syscall
-    cmp rax, -4                     ; EINTR
+    lea r11, [ev_cap_buf]
+    lea rsi, [r11 + r13]
+    SYSNO SYS_READ
+    SYSCALL
+    cmp rax, -EINTR
     je .cap_read
     test rax, rax
     jle .cap_read_done
@@ -4765,17 +4691,18 @@ ev_capture:
     mov edi, [rsp + 8]
     lea rsi, [ev_inner_buf]         ; the command text is no longer needed
     mov edx, MAX_INPUT
-    xor eax, eax
-    syscall
-    cmp rax, -4
+    SYSNO SYS_READ
+    SYSCALL
+    cmp rax, -EINTR
     je .cap_drain
     test rax, rax
     jg .cap_drain
 .cap_read_done:
-    mov byte [ev_cap_buf + r13], 0
+    lea r11, [ev_cap_buf]
+    mov byte [r11 + r13], 0
     mov edi, [rsp + 8]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .cap_wait:
     mov dword [rsp], 0
@@ -4784,8 +4711,8 @@ ev_capture:
     xor edx, edx
     xor r10d, r10d
     mov eax, SYS_WAIT4
-    syscall
-    cmp rax, -4
+    SYSCALL
+    cmp rax, -EINTR
     je .cap_wait
     mov eax, [rsp]
     mov edx, eax
@@ -4801,19 +4728,21 @@ ev_capture:
 .cap_strip:                         ; trailing newlines are not part of the value
     test r13d, r13d
     jz .cap_ret
-    cmp byte [ev_cap_buf + r13 - 1], 10
+    lea r11, [ev_cap_buf]
+    cmp byte [r11 + r13 - 1], 10
     jne .cap_ret
     dec r13d
-    mov byte [ev_cap_buf + r13], 0
+    lea r11, [ev_cap_buf]
+    mov byte [r11 + r13], 0
     jmp .cap_strip
 
 .cap_fork_error:
     mov edi, [rsp + 8]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov edi, [rsp + 12]
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .cap_ret:
     lea rax, [ev_cap_buf]
     add rsp, 24
@@ -4827,18 +4756,18 @@ ev_capture:
     mov edi, [rsp + 12]
     mov esi, 1
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     lea rdi, [ev_dev_null]
     xor esi, esi
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .cap_child_run
     mov edi, eax
     xor esi, esi
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
 .cap_child_run:
     ; Output goes to a pipe: no terminal handling, no colour, and no
     ; redirection of the shell's own (it would bypass the pipe).
@@ -4856,7 +4785,7 @@ ev_capture:
     call ash_eval
     mov edi, [last_exit_status]
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 
 ; ============================================================================
 ; check_alias - If first word matches an alias, expand it.
@@ -4916,7 +4845,8 @@ check_alias:
     lea rdi, [rbx + ALIAS_NAME_SIZE]
     call str_len
     mov r12d, eax
-    lea rdi, [input_buf + r13]
+    lea r11, [input_buf]
+    lea rdi, [r11 + r13]
     call str_len
     add eax, r12d
     cmp eax, LINE_MAX - 1
@@ -5315,17 +5245,17 @@ apply_redirections:
     je .ap_dup
 
     mov rdi, [r12 + 8]
-    mov esi, O_WRONLY | O_CREAT | O_TRUNC | EV_O_CLOEXEC
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
     cmp eax, 1
     je .ap_open
-    mov esi, O_WRONLY | O_CREAT | O_APPEND | EV_O_CLOEXEC
+    mov esi, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC
     cmp eax, 2
     je .ap_open
-    mov esi, O_RDONLY | EV_O_CLOEXEC
+    mov esi, O_RDONLY | O_CLOEXEC
 .ap_open:
     mov edx, PERM_0644
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .ap_open_err
     mov r14d, eax
@@ -5337,7 +5267,7 @@ apply_redirections:
     je .ap_set_err
     mov edi, r14d                   ; another descriptor: the file is only created
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     jmp .ap_adv
 
 .ap_set_out:
@@ -5355,10 +5285,10 @@ apply_redirections:
     mov edi, r14d
     mov esi, 2
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     mov edi, r14d
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     jmp .ap_adv
 
 .ap_dup:
@@ -5372,10 +5302,10 @@ apply_redirections:
     cmp r14d, 2                     ; ">&2": stdout becomes a copy of stderr
     jne .ap_adv
     mov edi, 2
-    mov esi, EV_F_DUPFD_CLOEXEC
+    mov esi, F_DUPFD_CLOEXEC
     mov edx, 10
-    mov eax, EV_SYS_FCNTL
-    syscall
+    mov eax, SYS_FCNTL
+    SYSCALL
     test rax, rax
     js .ap_adv
     mov r14d, eax
@@ -5391,7 +5321,7 @@ apply_redirections:
 .ap_dup_err_do:
     mov esi, 2
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
 
 .ap_adv:
     inc ebx
@@ -5430,7 +5360,7 @@ apply_redirections:
 .ap_co_close:
     mov edi, eax
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .ap_co_ret:
     ret
 .ap_close_in:
@@ -5444,7 +5374,7 @@ apply_redirections:
 .ap_ci_close:
     mov edi, eax
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .ap_ci_ret:
     ret
 ; Keep the real stderr (once per command) before it is replaced
@@ -5452,10 +5382,10 @@ apply_redirections:
     cmp dword [redir_err_saved], 0
     jne .ap_se_ret
     mov edi, 2
-    mov esi, EV_F_DUPFD_CLOEXEC
+    mov esi, F_DUPFD_CLOEXEC
     mov edx, 10
-    mov eax, EV_SYS_FCNTL
-    syscall
+    mov eax, SYS_FCNTL
+    SYSCALL
     test rax, rax
     js .ap_se_ret
     inc eax
@@ -5519,7 +5449,7 @@ restore_redirection:
 .rr_close_out:
     mov edi, eax
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .rr_stdin:
     cmp byte [redir_stdin_active], 0
     je .rr_restore
@@ -5531,7 +5461,7 @@ restore_redirection:
 .rr_close_in:
     mov edi, eax
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .rr_restore:
     mov eax, [rbx + 16]
@@ -5549,12 +5479,12 @@ restore_redirection:
     dec edi                         ; put the real stderr back on fd 2
     mov esi, 2
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     mov eax, [redir_err_saved]
     dec eax
     mov edi, eax
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 .rr_err_done:
     mov eax, [rbx]
     mov [redir_err_saved], eax
@@ -5595,7 +5525,7 @@ handler_exit:
     ; exit with the status of the last command (like sh)
     mov edi, [prev_exit_status]
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
     ; Does not return
 
 ; ---------- handler_ver ----------
@@ -5636,7 +5566,7 @@ handler_date:
     xor edi, edi
     lea rsi, [timespec_buf]
     mov eax, SYS_CLOCK_GETTIME
-    syscall
+    SYSCALL_X clock_gettime
 
     ; Add the timezone offset ($ASM_TZ, $TZ or the build default)
     call resolve_tz_offset
@@ -6436,12 +6366,12 @@ change_dir:
     lea rdi, [file_path_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     mov r12d, eax                   ; r12d <= 0: old directory unknown
 
     mov rdi, rbx
     mov eax, SYS_CHDIR
-    syscall
+    SYSCALL
     test rax, rax
     js .cdr_ret                     ; eax = -errno
 
@@ -6459,7 +6389,7 @@ change_dir:
     lea rdi, [path_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     test rax, rax
     jle .cdr_ok
     lea rdi, [str_pwd]
@@ -6582,7 +6512,7 @@ handler_cd:
     lea rdi, [path_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     lea rdi, [path_buf]
     call print_cstring
     call print_newline
@@ -6604,7 +6534,7 @@ handler_pwd:
     lea rdi, [path_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     test rax, rax
     jle .hpw_err
 
@@ -6694,6 +6624,11 @@ passwd_find_uid:
 section .data
     passwd_path     db "/etc/passwd", 0
     err_whoami      db "whoami: cannot find a name for the current user.", 10, 0
+%ifdef PLATFORM_MACOS
+    whoami_s_id     db "/usr/bin/id", 0
+    whoami_s_un     db "-un", 0
+    whoami_id_argv  dq whoami_s_id, whoami_s_un, 0
+%endif
 section .bss
     passwd_buf      resb 32768
 section .text
@@ -6709,14 +6644,14 @@ handler_whoami:
     sub rsp, 16
 
     mov eax, SYS_GETEUID
-    syscall
+    SYSCALL
     mov ebx, eax                    ; ebx = uid
 
     lea rdi, [passwd_path]
     xor esi, esi                    ; O_RDONLY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .hw_env
     mov r12d, eax                   ; r12d = fd
@@ -6725,12 +6660,12 @@ handler_whoami:
     lea rsi, [passwd_buf]
     mov edx, 32768
     mov eax, SYS_READ
-    syscall
+    SYSCALL
     mov [rbp - 24], eax             ; bytes read (or -errno)
 
     mov edi, r12d
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
     mov esi, [rbp - 24]
     test esi, esi
@@ -6744,6 +6679,32 @@ handler_whoami:
     jmp .hw_print
 
 .hw_env:
+%ifdef PLATFORM_MACOS
+    ; macOS keeps most accounts in Directory Services, not /etc/passwd:
+    ; ask /usr/bin/id, which reads them for the effective uid
+    lea rdi, [whoami_id_argv]
+    mov esi, 1                      ; quiet
+    call upd_capture
+    test eax, eax
+    jle .hw_user
+    cmp dword [upd_status], 0
+    jne .hw_user
+    lea rdi, [upd_buf]
+    xor ecx, ecx
+.hw_id_end:
+    mov al, [rdi + rcx]
+    test al, al
+    jz .hw_id_cut
+    cmp al, 10
+    je .hw_id_cut
+    inc ecx
+    jmp .hw_id_end
+.hw_id_cut:
+    mov byte [rdi + rcx], 0
+    test ecx, ecx
+    jnz .hw_print
+.hw_user:
+%endif
     lea rdi, [str_user]
     call getenv_internal
     test rax, rax
@@ -6792,7 +6753,7 @@ handler_dir:
     lea rdi, [path_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     lea r15, [path_buf]
     lea rbx, [str_dot]
 
@@ -6803,7 +6764,7 @@ handler_dir:
     mov esi, O_RDONLY | O_DIRECTORY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .hd_open_fail
     mov r12d, eax                   ; r12d = directory fd
@@ -6822,7 +6783,7 @@ handler_dir:
     lea rsi, [dirent_buf]
     mov edx, DIRENT_BUF_SIZE
     mov eax, SYS_GETDENTS64
-    syscall
+    SYSCALL_X getdents64
     test rax, rax
     jle .hd_close                   ; done or error
 
@@ -6862,7 +6823,7 @@ handler_dir:
     lea rdx, [stat_buf]
     xor r10d, r10d                  ; flags = 0
     mov eax, SYS_NEWFSTATAT
-    syscall
+    SYSCALL
     test rax, rax
     js .hd_size_unknown
 
@@ -6901,7 +6862,7 @@ handler_dir:
 .hd_close:
     mov edi, r12d
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .hd_done:
     call print_newline
@@ -6926,10 +6887,6 @@ handler_dir:
 ; open_intr(rdi = path, esi = flags) -> rax = fd or -errno (read-only opens)
 ; Like open(2), but a FIFO whose writer has not arrived yet does not hold the
 ; shell until one does: the wait is cut short by Ctrl+C (-EINTR).
-%define O_NONBLOCK          0x800
-%define F_SETFL             4
-%define SYS_POLL            7
-%define SYS_FCNTL           72
 
 open_intr:
     push rbp
@@ -6940,14 +6897,14 @@ open_intr:
     or esi, O_NONBLOCK
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .oi_ret
     mov ebx, eax
     mov edi, ebx
     lea rsi, [stat_buf]
     mov eax, SYS_FSTAT
-    syscall
+    SYSCALL
     test rax, rax
     js .oi_blocking
     mov eax, [stat_buf + STAT_ST_MODE]
@@ -6963,7 +6920,7 @@ open_intr:
     mov esi, 1
     mov edx, 100                    ; look at Ctrl+C every 100 ms
     mov eax, SYS_POLL
-    syscall
+    SYSCALL_X poll
     test rax, rax
     jle .oi_poll                    ; timeout or a signal
 .oi_blocking:
@@ -6971,14 +6928,14 @@ open_intr:
     mov esi, F_SETFL
     xor edx, edx
     mov eax, SYS_FCNTL
-    syscall
+    SYSCALL
     mov eax, ebx
     jmp .oi_ret
 .oi_intr:
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
-    mov rax, -4                     ; -EINTR
+    SYSCALL
+    mov rax, -EINTR
 .oi_ret:
     add rsp, 16
     pop rbx
@@ -7031,7 +6988,7 @@ handler_type:
     lea rsi, [io_buf]
     mov edx, IO_BUF_SIZE
     mov eax, SYS_READ
-    syscall
+    SYSCALL
     test rax, rax
     jz .hty_close                   ; EOF
     js .hty_read_err
@@ -7045,14 +7002,14 @@ handler_type:
 .hty_close:
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     jmp .hty_done
 
 .hty_read_err:
     mov r12d, eax
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov edi, r12d
     neg edi                         ; EISDIR for a directory, EIO ...
     call print_last_error
@@ -7062,7 +7019,7 @@ handler_type:
     mov byte [ctrl_c_flag], 0
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov dword [last_exit_status], 130
     jmp .hty_done
 
@@ -7164,7 +7121,7 @@ handler_mkdir:
     mov rdi, rbx
     mov esi, PERM_0755
     mov eax, SYS_MKDIR
-    syscall
+    SYSCALL
     test rax, rax
     jns .hmk_done
     neg eax
@@ -7192,10 +7149,10 @@ handler_mkdir:
     mov rdi, r13
     mov esi, PERM_0755
     mov eax, SYS_MKDIR
-    syscall
+    SYSCALL
     test rax, rax
     jns .hmk_restore_slash
-    cmp eax, -17
+    cmp eax, -EEXIST
     jne .hmk_rec_err
 .hmk_restore_slash:
     mov byte [r13 + r14], '/'
@@ -7212,16 +7169,16 @@ handler_mkdir:
     mov rdi, r13
     mov esi, PERM_0755
     mov eax, SYS_MKDIR
-    syscall
+    SYSCALL
     test rax, rax
     jns .hmk_done
-    cmp eax, -17
+    cmp eax, -EEXIST
     jne .hmk_rec_err
     ; The name already exists: fine for -p only if it is a directory
     mov rdi, r13
     lea rsi, [stat_buf]
     mov eax, SYS_STAT
-    syscall
+    SYSCALL
     test rax, rax
     js .hmk_exists
     mov eax, [stat_buf + STAT_ST_MODE]
@@ -7229,7 +7186,7 @@ handler_mkdir:
     cmp eax, S_IFDIR
     je .hmk_done
 .hmk_exists:
-    mov eax, -17
+    mov eax, -EEXIST
 .hmk_rec_err:
     neg eax
     mov edi, eax
@@ -7263,7 +7220,7 @@ handler_rmdir:
 
     ; rmdir(path)
     mov eax, SYS_RMDIR
-    syscall
+    SYSCALL
     test rax, rax
     jns .hrd_done
 
@@ -7294,7 +7251,7 @@ handler_del:
 
     ; unlink(path)
     mov eax, SYS_UNLINK
-    syscall
+    SYSCALL
     test rax, rax
     jns .hdl_done
 
@@ -7372,7 +7329,7 @@ handler_rename:
     mov rdi, rax                    ; old path
     mov rsi, rdx                    ; new path
     mov eax, SYS_RENAME
-    syscall
+    SYSCALL
     test rax, rax
     jns .hmv_done
 
@@ -7540,7 +7497,7 @@ handler_pushd:
     add rdi, rax
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     test rax, rax
     jle .hpd_nocwd                  ; current directory was removed
 
@@ -7845,10 +7802,6 @@ handler_unalias:
 ; Supports background execution with trailing '&'.
 ; Captures exit status in last_exit_status.
 ; ============================================================================
-%define WNOHANG  1
-%define WUNTRACED  2
-%define WCONTINUED 8
-%define EINTR      4
 %define JOB_RUNNING 1                   ; job_state values
 %define JOB_STOPPED 2
 
@@ -7927,7 +7880,7 @@ execute_external:
 
     ; fork()
     mov eax, SYS_FORK
-    syscall
+    SYSCALL_X fork
     test rax, rax
     js .ee_fork_error               ; fork failed
     jnz .ee_parent                  ; parent: rax = child PID
@@ -7947,11 +7900,11 @@ execute_external:
     mov edi, [redir_stdout_fd]
     mov esi, 1                      ; stdout
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     cmp edi, 1                      ; the original must not leak into the command
     je .ee_child_check_in
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .ee_child_check_in:
     cmp byte [redir_stdin_active], 0
@@ -7960,11 +7913,11 @@ execute_external:
     mov edi, [redir_stdin_fd]
     xor esi, esi                    ; stdin
     mov eax, SYS_DUP2
-    syscall
+    SYSCALL
     test edi, edi
     jz .ee_child_exec
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .ee_child_exec:
     test r14d, r14d                 ; a background builtin runs in this child
@@ -7992,12 +7945,12 @@ execute_external:
     lea rsi, [exec_argv]
     lea rdx, [merged_envp]
     mov eax, SYS_EXECVE
-    syscall
+    SYSCALL
 
     ; If execve returns, it failed -- exit child
     mov edi, 1
     mov eax, SYS_EXIT
-    syscall
+    SYSCALL
 
     ; ====== PARENT PROCESS ======
 .ee_parent:
@@ -8095,7 +8048,7 @@ print_string_len:
     mov rsi, rdi                    ; buffer
     mov edi, 1                      ; stdout fd
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     jmp .psl_done
 
 .psl_file:
@@ -8104,7 +8057,7 @@ print_string_len:
     mov rsi, rdi
     mov edi, [redir_stdout_fd]
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     jmp .psl_done
 
 .psl_collect:
@@ -8125,7 +8078,7 @@ print_string_len:
     mov rsi, rdi
     mov edi, 1
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     jmp .psl_done
 .psl_append:
     mov r8d, esi
@@ -8194,7 +8147,7 @@ report_error_len:
     mov rsi, rdi
     mov edi, STDERR_FD
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
 .rel_ret:
     ret
 
@@ -8548,7 +8501,7 @@ print_ansi_num:
     mov rsi, r12
     mov edi, 1
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
 
     add rsp, 16
     pop r12
@@ -9146,7 +9099,7 @@ read_script_file:
     mov esi, O_RDONLY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .rsf_noopen
     mov ebx, eax                    ; ebx = fd
@@ -9158,13 +9111,13 @@ read_script_file:
     mov edi, ebx
     lea rsi, [stat_buf]
     mov eax, SYS_FSTAT
-    syscall
+    SYSCALL
     test rax, rax
     js .rsf_untrusted
     test dword [stat_buf + STAT_ST_MODE], S_IWOTH
     jnz .rsf_untrusted
     mov eax, SYS_GETEUID
-    syscall
+    SYSCALL
     mov ecx, [stat_buf + STAT_ST_UID]
     test ecx, ecx
     jz .rsf_start                   ; root's file
@@ -9180,8 +9133,8 @@ read_script_file:
     mov edx, SCRIPT_FILE_MAX + 1
     sub edx, r12d                   ; one byte more than allowed shows it is too big
     mov eax, SYS_READ
-    syscall
-    cmp rax, -4                     ; EINTR
+    SYSCALL
+    cmp rax, -EINTR
     je .rsf_read
     test rax, rax
     js .rsf_error
@@ -9214,7 +9167,7 @@ read_script_file:
 .rsf_close:
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov eax, r12d
     jmp .rsf_ret
 
@@ -9289,7 +9242,7 @@ run_autoexec:
     lea rsi, [module_path]
     mov edx, MAX_PATH_BUF - 16      ; room for "/autoexec.txt"
     mov eax, SYS_READLINK
-    syscall
+    SYSCALL_X readlink_self
     test rax, rax
     js .ra_done                     ; readlink failed
 
@@ -9413,23 +9366,23 @@ load_history:
     mov esi, O_RDONLY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .lh_done                     ; file doesn't exist, OK
     mov ebx, eax                    ; fd
 
     ; The commands typed here may hold passwords: keep the file private
-    mov eax, 91                     ; SYS_fchmod
+    mov eax, SYS_FCHMOD
     mov edi, ebx
     mov esi, 0o600
-    syscall
+    SYSCALL
 
     ; Size of the file, then where to start reading
     mov eax, SYS_LSEEK
     mov edi, ebx
     xor esi, esi
     mov edx, 2                      ; SEEK_END
-    syscall
+    SYSCALL
     mov r14, rax                    ; r14 = file size
     mov qword [rbp - 56], 0         ; 1 = we start in the middle of the file
     xor r12d, r12d                  ; total bytes read
@@ -9446,7 +9399,7 @@ load_history:
     mov eax, SYS_LSEEK
     mov edi, ebx
     xor edx, edx                    ; SEEK_SET
-    syscall
+    SYSCALL
 
     ; Read file in a loop into a 256KB buffer (handles multi-chunk files).
     lea rax, [history_read_buf]
@@ -9459,7 +9412,7 @@ load_history:
     mov rsi, [rbp - 48]
     mov edx, eax
     mov eax, SYS_READ
-    syscall
+    SYSCALL
     test rax, rax
     jle .lh_read_done               ; EOF or error
     add r12d, eax
@@ -9470,7 +9423,7 @@ load_history:
     ; Close file
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
     ; Null-terminate
     test r12d, r12d
@@ -9610,7 +9563,7 @@ history_rewrite:
     mov esi, O_WRONLY | O_CREAT | O_TRUNC
     mov edx, 0o600
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .hr_done
     mov ebx, eax
@@ -9620,22 +9573,22 @@ history_rewrite:
     mov r13, rdx                    ; bytes to write
     mov edi, ebx
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
     mov r12, rax
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     cmp r12, r13
     jne .hr_discard
     lea rdi, [history_tmp_path]
     lea rsi, [history_file_path]
     mov eax, SYS_RENAME
-    syscall
+    SYSCALL
     jmp .hr_done
 .hr_discard:
     lea rdi, [history_tmp_path]
     mov eax, SYS_UNLINK
-    syscall
+    SYSCALL
 
 .hr_done:
     add rsp, 8
@@ -9665,10 +9618,10 @@ history_save_entry:
     je .hse_done
 
     ; Open file for append (create if needed), O_CLOEXEC
-    mov esi, O_WRONLY | O_CREAT | O_APPEND | 0x80000
+    mov esi, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC
     mov edx, 0o600
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .hse_done
     mov ebx, eax                    ; fd
@@ -9682,19 +9635,19 @@ history_save_entry:
     mov edi, ebx
     mov rsi, r12
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
 
     ; Write newline
     mov edi, ebx
     lea rsi, [newline]
     mov edx, 1
     mov eax, SYS_WRITE
-    syscall
+    SYSCALL
 
     ; Close file
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
 .hse_done:
     add rsp, 16
@@ -10300,8 +10253,6 @@ print_ls_perms:
 ; ls_flags: bit 0 = -l, bit 1 = -a, bit 2 = colour, bit 3 = sanitise names.
 ; Status: 0, 1 if a path could not be read, 2 for a bad option.
 ; ============================================================================
-%define AT_SYMLINK_NOFOLLOW 0x100
-%define SYS_READLINKAT      267
 %define LS_POOL_SIZE        262144
 %define LS_MAX_ENTRIES      16384
 %define LS_MAX_PATHS        4096
@@ -10415,7 +10366,7 @@ handler_ls:
     lea rdx, [stat_buf]
     xor r10d, r10d
     mov eax, SYS_NEWFSTATAT
-    syscall
+    SYSCALL
     test rax, rax
     jns .ls_have_stat
 
@@ -10425,7 +10376,7 @@ handler_ls:
     lea rdx, [stat_buf]
     mov r10d, AT_SYMLINK_NOFOLLOW
     mov eax, SYS_NEWFSTATAT
-    syscall
+    SYSCALL
     test rax, rax
     jns .ls_file_operand
     neg eax
@@ -10516,7 +10467,7 @@ ls_output_flags:
     mov edi, STDOUT_FD
     mov esi, TCGETS
     lea rdx, [termios_probe_buf]
-    syscall
+    SYSCALL
     test rax, rax
     js .lof_done
     or byte [ls_flags], 8
@@ -10539,7 +10490,7 @@ ls_list_dir:
     mov esi, O_RDONLY | O_DIRECTORY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     jns .lld_opened
     mov [err_subject], rdi
@@ -10560,7 +10511,7 @@ ls_list_dir:
     lea rsi, [dirent_buf]
     mov edx, DIRENT_BUF_SIZE
     mov eax, SYS_GETDENTS64
-    syscall
+    SYSCALL_X getdents64
     test rax, rax
     jle .lld_collected              ; 0 = done, negative = error
 
@@ -10644,7 +10595,7 @@ ls_list_dir:
 .lld_close:
     mov edi, r12d
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     xor eax, eax
     test r15d, r15d
     jz .lld_ret
@@ -10765,7 +10716,7 @@ ls_print_entry:
     lea rdx, [stat_buf]
     mov r10d, AT_SYMLINK_NOFOLLOW
     mov eax, SYS_NEWFSTATAT
-    syscall
+    SYSCALL
     test rax, rax
     jns .lpe_have
 
@@ -10851,7 +10802,7 @@ ls_print_entry:
     lea rdx, [ls_link_buf]
     mov r10d, 4096
     mov eax, SYS_READLINKAT
-    syscall
+    SYSCALL
     test rax, rax
     jle .lpe_newline
     lea rdi, [ls_link_buf]
@@ -10958,7 +10909,7 @@ handler_grep:
     mov esi, O_RDONLY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .grep_file_err
     mov ebx, eax                    ; ebx = file descriptor
@@ -10975,7 +10926,7 @@ handler_grep:
     lea rsi, [io_buf]
     mov edx, IO_BUF_SIZE
     mov eax, SYS_READ
-    syscall
+    SYSCALL
     test rax, rax
     jz .grep_flush_last
     js .grep_read_err
@@ -10987,7 +10938,8 @@ handler_grep:
     cmp ecx, r13d
     jge .grep_read_chunk
 
-    movzx eax, byte [io_buf + rcx]
+    lea r11, [io_buf]
+    movzx eax, byte [r11 + rcx]
     cmp al, 10
     je .grep_end_line
     test al, al
@@ -10996,7 +10948,8 @@ handler_grep:
 .grep_store:
     cmp r15d, GREP_LINE_MAX - 1
     jge .grep_cut_byte
-    mov [grep_line_buf + r15], al
+    lea r11, [grep_line_buf]
+    mov [r11 + r15], al
     inc r15d
     jmp .grep_skip_byte
 
@@ -11016,7 +10969,8 @@ handler_grep:
     jmp .grep_scan_byte
 
 .grep_end_line:
-    mov byte [grep_line_buf + r15], 0
+    lea r11, [grep_line_buf]
+    mov byte [r11 + r15], 0
 
     mov [rbp - 80], ecx
     mov [rbp - 84], r13d
@@ -11044,7 +10998,8 @@ handler_grep:
 .grep_flush_last:
     test r15d, r15d
     jz .grep_close
-    mov byte [grep_line_buf + r15], 0
+    lea r11, [grep_line_buf]
+    mov byte [r11 + r15], 0
 
     lea rdi, [grep_line_buf]
     mov esi, r15d
@@ -11060,7 +11015,7 @@ handler_grep:
 .grep_close:
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov eax, [rbp - 88]
     cmp dword [rbp - 92], 0         ; a cut line makes the result unreliable
     je .grep_set_status
@@ -11083,7 +11038,7 @@ handler_grep:
     mov byte [ctrl_c_flag], 0
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov dword [last_exit_status], 130
     jmp .grep_done
 
@@ -11092,7 +11047,7 @@ handler_grep:
     mov r12d, eax
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     mov edi, r12d
     neg edi
     call print_last_error
@@ -11280,11 +11235,12 @@ handler_uptime:
     push r14
     sub rsp, 32
 
+%ifdef PLATFORM_LINUX
     lea rdi, [proc_uptime]
     mov esi, O_RDONLY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .uptime_err
     mov ebx, eax
@@ -11293,12 +11249,12 @@ handler_uptime:
     lea rsi, [read_buffer]
     mov edx, 256
     mov eax, SYS_READ
-    syscall
+    SYSCALL
     mov r12d, eax
 
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
     lea rdi, [read_buffer]
     xor eax, eax
@@ -11322,6 +11278,11 @@ handler_uptime:
     add eax, edx
     inc rdi
     jmp .uptime_parse
+%else
+    call plat_uptime_seconds        ; eax = seconds since boot, or -1
+    cmp eax, -1
+    je .uptime_err
+%endif
 
 .uptime_parse_done:
     mov r12d, eax
@@ -11395,8 +11356,10 @@ handler_uptime:
     ret
 
 
+%ifdef PLATFORM_LINUX
 ; ============================================================================
 ; handler_free - Display memory info from /proc/meminfo
+; (platform/macos.asm has the macOS one)
 ; ============================================================================
 handler_free:
     push rbp
@@ -11410,7 +11373,7 @@ handler_free:
     mov esi, O_RDONLY
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .free_err
     mov ebx, eax
@@ -11419,12 +11382,12 @@ handler_free:
     lea rsi, [read_buffer]
     mov edx, READ_BUF_SIZE
     mov eax, SYS_READ
-    syscall
+    SYSCALL
     mov r12d, eax
 
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
     test r12d, r12d
     jle .free_done
@@ -11471,6 +11434,7 @@ handler_free:
     mov esi, err_file_len
     call report_error_len
     jmp .free_done
+%endif
 
 
 ; ============================================================================
@@ -12072,7 +12036,7 @@ init_prompt_cache:
 .ipc_hostname:
     lea rdi, [uname_buf]
     mov eax, SYS_UNAME
-    syscall
+    SYSCALL_X uname
     test rax, rax
     js .ipc_default_host
 
@@ -12223,12 +12187,13 @@ build_prompt_line:
     mov r12d, [current_theme]
     mov eax, r12d
     imul eax, THEME_ENTRY_SIZE
-    lea rbx, [theme_table + rax]
+    lea r11, [theme_table]
+    lea rbx, [r11 + rax]
 
     lea rdi, [path_buf]
     mov esi, MAX_PATH_BUF
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     test rax, rax
     jg .bpl_have_cwd
     mov word [path_buf], 0x003F     ; "?" when the directory is gone
@@ -12310,7 +12275,7 @@ read_git_branch:
     lea rdi, [git_scratch_path]
     mov esi, 4000
     mov eax, SYS_GETCWD
-    syscall
+    SYSCALL_X getcwd
     test rax, rax
     jle .rgb_done
 
@@ -12321,25 +12286,27 @@ read_git_branch:
 
 .rgb_try_here:
     ; Append "/.git/HEAD" at offset r12
-    lea rdi, [git_scratch_path + r12]
+    lea r11, [git_scratch_path]
+    lea rdi, [r11 + r12]
     lea rsi, [str_git_head]
     call str_copy
 
     ; Open the candidate file (O_RDONLY | O_CLOEXEC)
     lea rdi, [git_scratch_path]
-    mov esi, 0x80000
+    mov esi, O_RDONLY | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     jns .rgb_opened
-    cmp rax, -20                    ; ENOTDIR: ".git" is a file here
+    cmp rax, -ENOTDIR               ; ".git" is a file here
     je .rgb_gitfile
-    cmp rax, -2                     ; ENOENT: not in this directory
+    cmp rax, -ENOENT                ; not in this directory
     jne .rgb_done                   ; anything else (EACCES...): give up
 
     ; Not here - truncate git_scratch_path at last '/' and retry
-    mov byte [git_scratch_path + r12], 0
+    lea r11, [git_scratch_path]
+    mov byte [r11 + r12], 0
     mov r13d, r12d
     test r13d, r13d
     jz .rgb_done
@@ -12347,7 +12314,8 @@ read_git_branch:
 .rgb_trunc:
     cmp r13d, 0
     jl .rgb_done
-    cmp byte [git_scratch_path + r13], '/'
+    lea r11, [git_scratch_path]
+    cmp byte [r11 + r13], '/'
     je .rgb_trunc_hit
     dec r13d
     jmp .rgb_trunc
@@ -12355,18 +12323,20 @@ read_git_branch:
     ; don't slice off the leading '/' root itself
     test r13d, r13d
     jz .rgb_done
-    mov byte [git_scratch_path + r13], 0
+    lea r11, [git_scratch_path]
+    mov byte [r11 + r13], 0
     mov r12d, r13d
     jmp .rgb_try_here
 
 .rgb_gitfile:
     ; "<dir>/.git" is a plain file: read "gitdir: PATH" from it
-    mov byte [git_scratch_path + r12 + 5], 0
+    lea r11, [git_scratch_path]
+    mov byte [r11 + r12 + 5], 0
     lea rdi, [git_scratch_path]
-    mov esi, 0x80000
+    mov esi, O_RDONLY | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .rgb_done
     mov ebx, eax
@@ -12374,14 +12344,15 @@ read_git_branch:
     lea rsi, [git_head_buf]
     mov edx, 500
     mov eax, SYS_READ
-    syscall
+    SYSCALL
     mov r14d, eax
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     test r14d, r14d
     jle .rgb_done
-    mov byte [git_head_buf + r14], 0
+    lea r11, [git_head_buf]
+    mov byte [r11 + r14], 0
     lea rdi, [git_head_buf]
     lea rsi, [str_gitdir_prefix]
     call str_startswith
@@ -12427,10 +12398,10 @@ read_git_branch:
     lea rsi, [str_head_name]
     call str_copy
     lea rdi, [git_scratch_path]
-    mov esi, 0x80000
+    mov esi, O_RDONLY | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .rgb_done
 
@@ -12440,15 +12411,16 @@ read_git_branch:
     lea rsi, [git_head_buf]
     mov edx, 511
     mov eax, SYS_READ
-    syscall
+    SYSCALL
     mov r14d, eax
     mov edi, ebx
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
 
     test r14d, r14d
     jle .rgb_done
-    mov byte [git_head_buf + r14], 0
+    lea r11, [git_head_buf]
+    mov byte [r11 + r14], 0
 
     ; "ref: refs/heads/NAME" shows NAME; any other ref shows its last path
     ; component; a bare SHA (detached HEAD) shows its first 8 characters.
@@ -12743,7 +12715,8 @@ job_slots_free:
 .jsf_loop:
     cmp ecx, JOB_MAX
     jge .jsf_done
-    cmp qword [job_pids + rcx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rcx*8], 0
     jne .jsf_next
     inc eax
 .jsf_next:
@@ -12774,21 +12747,26 @@ job_add:
 .ja_find:
     cmp ebx, JOB_MAX
     jge .ja_full
-    cmp qword [job_pids + rbx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rbx*8], 0
     je .ja_found
     inc ebx
     jmp .ja_find
 .ja_found:
     mov eax, r12d
-    mov [job_pids + rbx*8], rax
+    lea r11, [job_pids]
+    mov [r11 + rbx*8], rax
     mov eax, r13d
-    mov [job_pgids + rbx*8], rax
+    lea r11, [job_pgids]
+    mov [r11 + rbx*8], rax
     mov eax, r14d
-    mov [job_state + rbx], al
+    lea r11, [job_state]
+    mov [r11 + rbx], al
 
     mov eax, ebx
     imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
+    lea r11, [job_cmds]
+    lea rdi, [r11 + rax]
     lea rsi, [input_buf]
     test r15, r15
     cmovnz rsi, r15
@@ -12821,11 +12799,15 @@ job_add:
 
 ; job_free(edi = slot) - forget a job
 job_free:
-    cmp qword [job_pids + rdi*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rdi*8], 0
     je .jf_ret
-    mov qword [job_pids + rdi*8], 0
-    mov qword [job_pgids + rdi*8], 0
-    mov byte [job_state + rdi], 0
+    lea r11, [job_pids]
+    mov qword [r11 + rdi*8], 0
+    lea r11, [job_pgids]
+    mov qword [r11 + rdi*8], 0
+    lea r11, [job_state]
+    mov byte [r11 + rdi], 0
     dec dword [job_count]
 .jf_ret:
     ret
@@ -12835,7 +12817,8 @@ job_ordinal:
     xor eax, eax
     xor ecx, ecx
 .jo_loop:
-    cmp qword [job_pids + rcx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rcx*8], 0
     je .jo_next
     inc eax
 .jo_next:
@@ -12854,7 +12837,8 @@ job_find:
 .jfind_loop:
     cmp ecx, JOB_MAX
     jge .jfind_none
-    cmp qword [job_pids + rcx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rcx*8], 0
     je .jfind_next
     inc eax
     cmp eax, edi
@@ -12877,7 +12861,8 @@ job_last_number:
 .jln_loop:
     cmp ecx, JOB_MAX
     jge .jln_done
-    cmp qword [job_pids + rcx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rcx*8], 0
     je .jln_next
     inc eax
 .jln_next:
@@ -12934,18 +12919,21 @@ job_print_line:
     call print_cstring
     lea rdi, [jobs_pid_label]
     call print_cstring
-    mov rax, [job_pids + rbx*8]
+    lea r11, [job_pids]
+    mov rax, [r11 + rbx*8]
     mov eax, eax
     call print_number
     lea rdi, [jobs_running_msg]
-    cmp byte [job_state + rbx], JOB_STOPPED
+    lea r11, [job_state]
+    cmp byte [r11 + rbx], JOB_STOPPED
     jne .jpl_state
     lea rdi, [jobs_stopped_msg]
 .jpl_state:
     call print_cstring
     mov eax, ebx
     imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
+    lea r11, [job_cmds]
+    lea rdi, [r11 + rax]
     call print_cstring
     call print_newline
 
@@ -12985,11 +12973,13 @@ job_poll:
     sub rsp, 16                     ; [rsp] = wait status
 
     mov ebx, edi
-    mov r12, [job_pids + rbx*8]
+    lea r11, [job_pids]
+    mov r12, [r11 + rbx*8]
 .jp_again:
     mov edi, r12d
     mov edx, WNOHANG
-    mov r8, [job_pgids + rbx*8]
+    lea r11, [job_pgids]
+    mov r8, [r11 + rbx*8]
     test r8, r8
     jz .jp_do
     mov edi, r8d
@@ -13000,25 +12990,28 @@ job_poll:
     mov rsi, rsp
     xor r10d, r10d
     mov eax, SYS_WAIT4
-    syscall
+    SYSCALL
     cmp rax, -EINTR
     je .jp_again
     test rax, rax
     jz .jp_alive
     js .jp_gone                     ; nothing of the job is left
-    cmp qword [job_pgids + rbx*8], 0
+    lea r11, [job_pgids]
+    cmp qword [r11 + rbx*8], 0
     je .jp_gone                     ; a single process of the shell's group ended
     mov eax, [rsp]
+    cmp eax, WSTATUS_CONTINUED      ; checked first: on macOS it looks "stopped"
+    je .jp_continued
     mov ecx, eax
     and ecx, 0xFF
     cmp ecx, 0x7F
-    jne .jp_not_stopped
-    mov byte [job_state + rbx], JOB_STOPPED
-    jmp .jp_again
-.jp_not_stopped:
-    cmp eax, 0xFFFF                 ; continued
     jne .jp_again                   ; one stage ended; look for the others
-    mov byte [job_state + rbx], JOB_RUNNING
+    lea r11, [job_state]
+    mov byte [r11 + rbx], JOB_STOPPED
+    jmp .jp_again
+.jp_continued:
+    lea r11, [job_state]
+    mov byte [r11 + rbx], JOB_RUNNING
     jmp .jp_again
 .jp_alive:
     xor eax, eax
@@ -13056,7 +13049,8 @@ handler_jobs:
 .hj_loop:
     cmp ebx, JOB_MAX
     jge .hj_done
-    cmp qword [job_pids + rbx*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + rbx*8], 0
     je .hj_next
     mov edi, ebx
     call job_print_line
@@ -13091,7 +13085,8 @@ reap_finished_jobs:
 .rfj_loop:
     cmp r12d, JOB_MAX
     jge .rfj_done
-    cmp qword [job_pids + r12*8], 0
+    lea r11, [job_pids]
+    cmp qword [r11 + r12*8], 0
     je .rfj_next
     mov edi, r12d
     call job_poll
@@ -13138,13 +13133,17 @@ handler_fg:
     ; Print the command
     mov eax, r12d
     imul eax, JOB_CMD_SIZE
-    lea rdi, [job_cmds + rax]
+    lea r11, [job_cmds]
+    lea rdi, [r11 + rax]
     call print_cstring
     call print_newline
 
-    mov rbx, [job_pids + r12*8]     ; rbx = pid that gives the status
-    mov r13, [job_pgids + r12*8]    ; r13 = its process group, 0 if shared
-    mov byte [job_state + r12], JOB_RUNNING
+    lea r11, [job_pids]
+    mov rbx, [r11 + r12*8]     ; rbx = pid that gives the status
+    lea r11, [job_pgids]
+    mov r13, [r11 + r12*8]    ; r13 = its process group, 0 if shared
+    lea r11, [job_state]
+    mov byte [r11 + r12], JOB_RUNNING
     xor r14d, r14d                  ; r14d = exit status
 
     call restore_terminal
@@ -13158,7 +13157,7 @@ handler_fg:
     neg edi
     mov esi, SIGCONT
     mov eax, SYS_KILL
-    syscall
+    SYSCALL
 .hfg_wait:
     mov dword [rsp], 0
     mov edi, r13d
@@ -13167,7 +13166,7 @@ handler_fg:
     mov edx, WUNTRACED
     xor r10d, r10d
     mov eax, SYS_WAIT4
-    syscall
+    SYSCALL
     cmp rax, -EINTR
     je .hfg_wait
     test rax, rax
@@ -13185,7 +13184,8 @@ handler_fg:
 
 .hfg_stopped:
     mov [last_exit_status], eax
-    mov byte [job_state + r12], JOB_STOPPED
+    lea r11, [job_state]
+    mov byte [r11 + r12], JOB_STOPPED
     call jc_reclaim
     mov edi, r12d
     call job_notify_stopped
@@ -13204,7 +13204,7 @@ handler_fg:
     mov edi, ebx
     mov esi, SIGCONT
     mov eax, SYS_KILL
-    syscall
+    SYSCALL
 .hfg_plain_wait:
     mov dword [rsp], 0
     mov edi, ebx
@@ -13212,7 +13212,7 @@ handler_fg:
     xor edx, edx
     xor r10d, r10d
     mov eax, SYS_WAIT4
-    syscall
+    SYSCALL
     cmp rax, -EINTR
     je .hfg_plain_wait
     mov eax, [rsp]
@@ -13276,8 +13276,10 @@ handler_bg:
     js .hbg_nojob
     mov r12d, eax                   ; r12d = slot
 
-    mov rdi, [job_pids + r12*8]
-    mov r8, [job_pgids + r12*8]
+    lea r11, [job_pids]
+    mov rdi, [r11 + r12*8]
+    lea r11, [job_pgids]
+    mov r8, [r11 + r12*8]
     test r8, r8
     jz .hbg_signal
     mov edi, r8d
@@ -13285,10 +13287,11 @@ handler_bg:
 .hbg_signal:
     mov esi, SIGCONT
     mov eax, SYS_KILL
-    syscall
+    SYSCALL
     test rax, rax
     jnz .hbg_nojob
-    mov byte [job_state + r12], JOB_RUNNING
+    lea r11, [job_state]
+    mov byte [r11 + r12], JOB_RUNNING
 
     lea rdi, [bg_resumed_msg]
     call print_cstring
@@ -13493,19 +13496,19 @@ print_last_error:
 
 .ple_lookup:
     ; Look up errno in our small table
-    cmp ebx, 2
+    cmp ebx, ENOENT
     je .ple_enoent
-    cmp ebx, 13
+    cmp ebx, EACCES
     je .ple_eacces
-    cmp ebx, 17
+    cmp ebx, EEXIST
     je .ple_eexist
-    cmp ebx, 20
+    cmp ebx, ENOTDIR
     je .ple_enotdir
-    cmp ebx, 21
+    cmp ebx, EISDIR
     je .ple_eisdir
-    cmp ebx, 22
+    cmp ebx, EINVAL
     je .ple_einval
-    cmp ebx, 39
+    cmp ebx, ENOTEMPTY
     je .ple_enotempty
 
     ; Unknown errno -- print "errno <number>"
@@ -13589,3 +13592,7 @@ align 1
 %include "ash/highlight.asm"
 %include "ash/help.asm"
 %include "ash/smart.asm"
+
+%ifdef PLATFORM_MACOS
+%include "platform/macos.asm"
+%endif

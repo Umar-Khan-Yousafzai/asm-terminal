@@ -62,7 +62,7 @@ section .bss
     glob_has            resb 1          ; the word has an unquoted * ? [
     glob_toolong        resb 1          ; the word's pattern did not fit
     alignb 8
-    glob_stat           resb 144
+    glob_stat           resb STAT_SIZE
     glob_pat            resb GLOB_PAT_MAX + 16
     glob_path           resb GLOB_PATH_MAX + 8
     glob_pool           resb GLOB_POOL_SIZE
@@ -535,7 +535,7 @@ glob_path_stat:
     lea rsi, [glob_path]
     lea rdx, [glob_stat]
     mov eax, SYS_NEWFSTATAT
-    syscall
+    SYSCALL
     ret
 
 ; glob_emit_path - add glob_path to the output as one word
@@ -602,7 +602,8 @@ glob_level:
     cmp byte [glob_err], 0
     jne .gl_ret
     mov r13d, [glob_plen]
-    mov r12, [glob_comps + rbx * 8]
+    lea r11, [glob_comps]
+    mov r12, [r11 + rbx * 8]
     mov eax, [glob_ncomp]
     dec eax
     xor r14d, r14d
@@ -665,10 +666,10 @@ glob_level:
     jne .gl_open
     lea rdi, [str_dot]
 .gl_open:
-    mov esi, O_RDONLY | O_DIRECTORY | 0x80000
+    mov esi, O_RDONLY | O_DIRECTORY | O_CLOEXEC
     xor edx, edx
     mov eax, SYS_OPEN
-    syscall
+    SYSCALL
     test rax, rax
     js .gl_ret
     mov r15d, eax                   ; directory descriptor
@@ -696,7 +697,7 @@ glob_level:
     lea rsi, [glob_dents]
     mov edx, GLOB_DENTS
     mov eax, SYS_GETDENTS64
-    syscall
+    SYSCALL_X getdents64
     test rax, rax
     jle .gl_read_done
     lea rcx, [glob_dents]
@@ -709,10 +710,10 @@ glob_level:
     mov rsi, [rbp - 64]
     cmp rsi, [rbp - 72]
     jae .gl_read
-    movzx eax, word [rsi + 16]
+    movzx eax, word [rsi + DIRENT64_D_RECLEN]
     lea rdx, [rsi + rax]
     mov [rbp - 64], rdx
-    lea rsi, [rsi + 19]             ; d_name
+    lea rsi, [rsi + DIRENT64_D_NAME]
     mov [rbp - 80], rsi
     cmp byte [rsi], '.'
     jne .gl_try
@@ -740,7 +741,7 @@ glob_level:
 .gl_read_done:
     mov edi, r15d
     mov eax, SYS_CLOSE
-    syscall
+    SYSCALL
     cmp byte [glob_err], 0
     jne .gl_release
 
@@ -754,7 +755,8 @@ glob_level:
     jae .gl_release
     cmp byte [glob_err], 0
     jne .gl_release
-    mov rdi, [glob_ptrs + r14 * 8]
+    lea r11, [glob_ptrs]
+    mov rdi, [r11 + r14 * 8]
     xor esi, esi
     call glob_append
     test eax, eax
@@ -1202,7 +1204,8 @@ glob_multi:
     call str_copy
     lea rdi, [glob_out_buf]
     call str_len
-    lea rdi, [glob_out_buf + rax]
+    lea r11, [glob_out_buf]
+    lea rdi, [r11 + rax]
     mov byte [rdi], ' '
     inc rdi
 .gm_each_name:
@@ -1232,7 +1235,7 @@ glob_multi:
     mov rdi, r13
     mov eax, SYS_STAT
     lea rsi, [glob_stat]
-    syscall
+    SYSCALL
     test rax, rax
     js .gm_notdir
     mov eax, [glob_stat + STAT_ST_MODE]

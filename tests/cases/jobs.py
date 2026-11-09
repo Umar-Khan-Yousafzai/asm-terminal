@@ -1,33 +1,14 @@
 # Job control, signals, exit statuses and exec failures (external commands).
-import os, sys, time, subprocess, signal
+import os, sys, time, subprocess, signal, shutil
 import ptytest as T
 
 
-def pstat(pid):
-    """(state, ppid, pgrp) of a process, or None when it is gone."""
-    try:
-        st = open('/proc/%d/stat' % pid).read()
-    except OSError:
-        return None
-    rest = st[st.rindex(')') + 2:].split()
-    if rest[0] == 'Z':
-        return None
-    return rest[0], int(rest[1]), int(rest[2])
+pstat = T.proc_stat     # (state, ppid, pgrp) or None
 
 
 def find(tag, under=None):
     """Pids of live processes whose argv contains the exact word `tag`."""
-    out = []
-    for d in os.listdir('/proc'):
-        if not d.isdigit():
-            continue
-        try:
-            argv = open('/proc/%s/cmdline' % d, 'rb').read().split(b'\0')
-        except OSError:
-            continue
-        if tag.encode() in argv and pstat(int(d)):
-            out.append(int(d))
-    return sorted(out)
+    return T.find_procs(tag)
 
 
 def waitfor(fn, t=3.0):
@@ -168,13 +149,18 @@ s.close()
 s = T.Sess()
 s.settle()
 s.send("while true; do :; done\r")
-time.sleep(0.5)
+# Ctrl+C is a signal only once the line runs (ISIG on); before that it is a
+# key the line editor reads. Keep reading the screen meanwhile: the macOS pty
+# buffer is small, and a full one blocks the shell's echo of the line.
+loop_running = waitfor(lambda: (s.settle(0.05, 0.1), cooked(s))[1], 5)
 s.send(b"\x03")
 s.settle()
 s.run("echo loop-over")
-T.check("ctrl-c stops a loop of builtins", "loop-over" in s.screen().split("\n") and "[130]" in s.screen(), s.screen())
+T.check("ctrl-c stops a loop of builtins", loop_running and "loop-over" in s.screen().split("\n") and "[130]" in s.screen(),
+        (loop_running, s.screen()[-200:]))
 s.send("type /dev/zero\r")
-time.sleep(0.5)
+waitfor(lambda: (s.settle(0.05, 0.1), cooked(s))[1], 5)   # see the loop case above
+time.sleep(0.2)
 s.send(b"\x03")
 s.settle()
 s.run("echo type-over")
@@ -217,7 +203,7 @@ os.chmod(os.path.join(h, 'badint'), 0o755)
 open(os.path.join(h, 'noexec'), 'w').write('x')
 os.mkdir(os.path.join(h, 'adir'))
 
-o, e, st = sh("/bin/false\nexit\n")
+o, e, st = sh("%s\nexit\n" % shutil.which("false", path="/usr/bin:/bin"))
 T.check("bare exit reports the previous status", st == 1, st)
 o, e, st = sh("/bin/sh -c 'exit 7'\nexit\n")
 T.check("bare exit reports status 7", st == 7, st)
@@ -265,7 +251,7 @@ T.check("2>&1 before > keeps stderr on the pipe", any("nonexistent_xx" in l for 
 o, e, st = sh("/bin/ls /nonexistent_xx >/dev/null 2>&1 | /bin/cat\necho end\nexit\n", cwd=d)
 T.check("> before 2>&1 sends stderr to the file", not any("nonexistent_xx" in l for l in o), o)
 open(os.path.join(d, 'in.txt'), 'w').write('in')
-sh("/bin/ls -l /proc/self/fd > out.txt\n/bin/ls -l /proc/self/fd < in.txt > out2.txt\nexit\n", cwd=d)
+sh("%s > out.txt\n%s < in.txt > out2.txt\nexit\n" % (T.FDLIST, T.FDLIST), cwd=d)
 fds = open(os.path.join(d, 'out.txt')).read() + open(os.path.join(d, 'out2.txt')).read()
 T.check("redirect source descriptor is not inherited", 'out.txt' in fds and fds.count('out.txt') == 1 and 'out2.txt' in fds
         and fds.count('out2.txt') == 1 and fds.count('in.txt') == 1, fds)
